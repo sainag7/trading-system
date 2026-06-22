@@ -1,0 +1,19 @@
+# Core
+claude-agent-sdk>=0.1.0      # multi-agent orchestration on Claude
+anthropic>=0.40.0            # underlying Messages API (structured outputs)
+pyyaml>=6.0                  # config.yaml
+python-dotenv>=1.0           # load .env
+
+# Market data
+requests>=2.31               # Alpha Vantage / FRED HTTP
+yfinance>=0.2.40             # fallback price/fundamental data
+pandas>=2.0                  # data wrangling
+
+# Storage / dashboard
+# (sqlite3 is in the Python stdlib — no dependency needed)
+streamlit>=1.30              # dashboard/app.py
+plotly>=5.18                 # dashboard charts
+
+# Testing
+pytest>=8.0                  # risk layer unit tests
+freezegun>=1.4               # deterministic time in tests (daily limits)

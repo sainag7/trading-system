@@ -1,0 +1,193 @@
+# =============================================================================
+# Swing-Trading System Configuration
+# =============================================================================
+# Strategy: multi-week to multi-month swing trades, concentrated 5-15 name
+# portfolio of US equities, evaluated once per day (no intraday / HFT).
+#
+# Everything in this file is user-editable. The values under `risk:` are HARD
+# limits enforced deterministically in risk/guardrails.py (no LLM involved).
+# If you loosen them, you are accepting more risk. Read README.md first.
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Run mode. CLI flag --mode overrides this value.
+#   recommend : research + advice ONLY; trades nothing, simulates nothing (DEFAULT)
+#   paper     : execute nothing real; simulate fills + track P&L over time
+#   preview   : print/notify planned orders, require explicit confirmation
+#   live      : place real orders through the Robinhood Trading MCP
+# ----------------------------------------------------------------------------
+mode: recommend
+
+# ----------------------------------------------------------------------------
+# GLOBAL KILL SWITCH
+# If true (or if the file at kill_switch_file exists), the orchestrator halts
+# ALL trading before any order is placed, in every mode. Flip this to stop the
+# system instantly without editing code.
+# ----------------------------------------------------------------------------
+kill_switch: false
+kill_switch_file: "KILL_SWITCH"   # presence of this file == kill switch ON
+
+# ----------------------------------------------------------------------------
+# HARD RISK LIMITS  (enforced by risk/guardrails.py — never bypassed)
+# ----------------------------------------------------------------------------
+risk:
+  max_positions: 15                  # max number of concurrent open positions
+  max_position_pct: 0.15             # no single name > 15% of account equity
+  max_sector_pct: 0.40               # no single sector > 40% of account equity
+  per_trade_max_usd: 500             # max notional $ per individual order
+  daily_max_trades: 5                # max executed orders per calendar day
+  min_cash_reserve_pct: 0.10         # always keep >= 10% of equity in cash
+  max_account_drawdown_halt_pct: 0.15  # halt if account down >15% from peak
+  min_trade_usd: 50                  # don't bother with orders smaller than this
+  allow_fractional_shares: true      # Robinhood supports fractional equity
+  no_trade_list: []                  # tickers to NEVER touch (buys blocked)
+
+# ----------------------------------------------------------------------------
+# Strategy / scoring parameters (used by the analysis & decision agents)
+# ----------------------------------------------------------------------------
+strategy:
+  holding_period_days_min: 14        # swing horizon: ~2 weeks ...
+  holding_period_days_max: 120       # ... to ~4 months
+  target_portfolio_size: 10          # aim for ~10 names (within 5-15 band)
+  min_score_to_buy: 65               # 0-100 composite score required to open
+  min_score_to_add: 70               # higher bar to add to a winner
+  trim_below_score: 45               # consider trimming when score decays
+  exit_below_score: 35               # thesis-break exit threshold
+  # Default per-position exit rules (decision agent may tighten, never loosen)
+  default_stop_loss_pct: 0.08        # 8% below entry
+  default_take_profit_pct: 0.20      # 20% above entry
+  max_holding_days: 120              # time-based exit if thesis hasn't played out
+
+# ----------------------------------------------------------------------------
+# Analysis scoring. The analysis agent blends three deterministic 0-100
+# sub-scores into a composite. Swing trading leans more technical than
+# long-term investing. Weights are renormalised automatically if they don't
+# sum to 1.0.
+# ----------------------------------------------------------------------------
+analysis:
+  weights:
+    technical: 0.40        # trend / momentum / volatility / location
+    fundamental: 0.35      # growth / profitability / valuation / balance sheet
+    sentiment: 0.25        # aggregate news sentiment
+
+# ----------------------------------------------------------------------------
+# Universe / watchlist. The research agent only ever looks at these tickers.
+# Keep it focused; a wide universe burns the Alpha Vantage free-tier quota.
+# ----------------------------------------------------------------------------
+universe:
+  - AAPL
+  - MSFT
+  - NVDA
+  - GOOGL
+  - AMZN
+  - META
+  - JPM
+  - V
+  - UNH
+  - XOM
+  - CAT
+  - COST
+
+# Optional sector map override. If a ticker isn't listed here the data provider
+# fills it in from fundamentals; this map guarantees correct sector grouping
+# for the max_sector_pct guardrail even when the API is unavailable.
+sectors:
+  AAPL: Technology
+  MSFT: Technology
+  NVDA: Technology
+  GOOGL: Communication Services
+  AMZN: Consumer Discretionary
+  META: Communication Services
+  JPM: Financials
+  V: Financials
+  UNH: Health Care
+  XOM: Energy
+  CAT: Industrials
+  COST: Consumer Staples
+
+# ----------------------------------------------------------------------------
+# Dynamic discovery (screener). Before researching the fixed universe above, an
+# optional lightweight step scans FREE sources (yfinance screeners, Yahoo
+# trending, Reddit) for trending/most-active names, pre-filters them with
+# yfinance only (NO Alpha Vantage quota cost), and appends the top few to the
+# universe FOR THAT RUN ONLY. It is additive: if it fails or finds nothing the
+# system silently researches just the fixed universe.
+# ----------------------------------------------------------------------------
+discovery:
+  dynamic_discovery: true     # master on/off toggle
+  max_discovered: 5           # cap appended per run
+  min_avg_volume: 500000      # pre-filter: require > this avg daily volume
+  min_price: 2                # pre-filter: price band (avoid penny stocks ...)
+  max_price: 500              #             ... and very high-priced names
+  use_yfinance_screeners: true   # yfinance most_actives / day_gainers
+  use_yahoo_trending: true       # Yahoo Finance trending endpoint
+  use_reddit: true               # r/wallstreetbets + r/stocks hot.json mentions
+
+# ----------------------------------------------------------------------------
+# LLM model selection for each agent (Claude Agent SDK).
+# Cheaper/faster models for high-volume gathering, stronger model for the
+# final capital-allocation decision.
+# ----------------------------------------------------------------------------
+# Fast preset: Haiku for the high-volume / supporting agents, Sonnet for the
+# final capital-allocation decision. Bump decision to claude-opus-4-8 if you want
+# maximum reasoning depth on the one decision call (slower).
+models:
+  research_agent: "claude-haiku-4-5-20251001"
+  analysis_agent: "claude-haiku-4-5-20251001"
+  decision_agent: "claude-sonnet-4-6"
+  monitor_agent: "claude-haiku-4-5-20251001"
+
+# ----------------------------------------------------------------------------
+# Research performance. The per-ticker numbers (technicals/fundamentals/news
+# sentiment) are computed deterministically; the per-ticker LLM enrichment only
+# adds free-text notes. Leaving it OFF removes one LLM call per ticker (the main
+# speedup) — news still drives recommendations via the deterministic sentiment
+# score and the analysis step. Tickers are researched concurrently.
+# ----------------------------------------------------------------------------
+research:
+  llm_enrichment: false       # per-ticker LLM notes (off = much faster)
+  concurrency: 5              # how many tickers to research in parallel
+
+# ----------------------------------------------------------------------------
+# Data providers & caching (protects the Alpha Vantage 25 req/day free tier)
+# ----------------------------------------------------------------------------
+data:
+  cache_dir: ".cache"
+  cache_ttl_minutes: 1440            # reuse cached data for 24h (daily cadence)
+  alphavantage:
+    daily_request_budget: 25         # free-tier hard cap; provider self-throttles
+    min_seconds_between_calls: 13    # ~5 calls/min on free tier
+  use_yfinance_fallback: true        # fall back to yfinance when AV quota is spent
+  use_fred: true                     # macro context (rates, etc.) when configured
+
+# ----------------------------------------------------------------------------
+# Execution (Robinhood Trading MCP). OAuth is handled by the MCP server itself;
+# no API key/secret is ever stored in this repo.
+# ----------------------------------------------------------------------------
+execution:
+  mcp_url: "https://agent.robinhood.com/mcp/trading"
+  order_type: "limit"                # limit | market  (limit recommended)
+  limit_slippage_pct: 0.005          # place limit 0.5% above ask (buy) / below bid (sell)
+  max_order_retries: 2               # retries for *submission* errors only, never blind re-fills
+  retry_backoff_seconds: 5
+
+# ----------------------------------------------------------------------------
+# Paper-trading simulator (used only in `paper` mode). The simulated account
+# persists to this state file so positions/P&L carry across runs.
+# ----------------------------------------------------------------------------
+paper:
+  starting_cash: 10000.0
+  state_file: "storage/paper_account.json"
+
+# ----------------------------------------------------------------------------
+# Storage / audit
+# ----------------------------------------------------------------------------
+storage:
+  db_path: "storage/trading.db"
+
+# ----------------------------------------------------------------------------
+# Notifications (preview mode confirmations, halts, fills). Optional.
+# ----------------------------------------------------------------------------
+notifications:
+  enabled: false
+  channel: "stdout"                  # stdout | (extend with slack/email/etc.)

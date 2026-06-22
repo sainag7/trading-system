@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Caches & data
+.cache/
+*.db
+*.db-journal
+storage/*.db
+storage/*.db-journal
+
+# Kill switch artifact (operator-created, should not be committed)
+KILL_SWITCH
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
