@@ -173,7 +173,7 @@ def _build_fundamentals(fund: dict) -> dict:
         "revenue_ttm", "revenue_growth_yoy", "eps_ttm", "eps_growth_yoy",
         "gross_margin", "operating_margin", "profit_margin", "pe_ratio",
         "ps_ratio", "debt_to_equity", "free_cash_flow", "next_earnings_date",
-        "market_cap", "beta", "industry",
+        "market_cap", "beta", "industry", "name", "description",
     )
     out = {k: fund.get(k) for k in keys}
     out["sector"] = fund.get("sector", "Unknown")

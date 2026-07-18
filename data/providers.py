@@ -387,7 +387,7 @@ class DataProvider:
         "gross_margin", "operating_margin", "profit_margin", "pe_ratio",
         "ps_ratio", "debt_to_equity", "free_cash_flow", "next_earnings_date",
         "market_cap", "beta", "analyst_target", "week52_high", "week52_low",
-        "industry",
+        "industry", "name", "description",
     )
 
     def get_fundamentals(self, ticker: str) -> dict:
@@ -447,6 +447,11 @@ class DataProvider:
         out = {
             "sector": info.get("sector"),
             "industry": info.get("industry"),
+            # Company identity/summary — sourced from the provider so downstream
+            # narrative never has to reach for model memory (anti-hallucination).
+            "name": info.get("shortName") or info.get("longName"),
+            "description": (str(info.get("longBusinessSummary"))[:600]
+                            if info.get("longBusinessSummary") else None),
             "revenue_ttm": _to_float(info.get("totalRevenue")),
             "revenue_growth_yoy": _pct(info.get("revenueGrowth")),
             "eps_ttm": _to_float(info.get("trailingEps")),
@@ -496,6 +501,9 @@ class DataProvider:
         return {
             "sector": data.get("Sector"),
             "industry": data.get("Industry"),
+            "name": data.get("Name"),
+            "description": (str(data.get("Description"))[:600]
+                            if data.get("Description") else None),
             "revenue_ttm": revenue,
             "revenue_growth_yoy": _pct(data.get("QuarterlyRevenueGrowthYOY")),
             "eps_ttm": _to_float(data.get("EPS")),

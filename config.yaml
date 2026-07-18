@@ -11,12 +11,20 @@
 
 # ----------------------------------------------------------------------------
 # Run mode. CLI flag --mode overrides this value.
-#   recommend : research + advice ONLY; trades nothing, simulates nothing (DEFAULT)
-#   paper     : execute nothing real; simulate fills + track P&L over time
+#   recommend : research + advice ONLY; trades nothing (DEFAULT)
+#   explain   : deep-research briefing for ONE ticker (--ticker required);
+#               read-only, trades nothing
 #   preview   : print/notify planned orders, require explicit confirmation
 #   live      : place real orders through the Robinhood Trading MCP
 # ----------------------------------------------------------------------------
 mode: recommend
+
+# ----------------------------------------------------------------------------
+# Strategy profile. CLI flag --profile overrides this value. Orthogonal to
+# `mode` (e.g. `--profile momentum --mode recommend`). See strategy_profiles:
+# below for what each profile changes.
+# ----------------------------------------------------------------------------
+profile: swing
 
 # ----------------------------------------------------------------------------
 # GLOBAL KILL SWITCH
@@ -57,6 +65,42 @@ strategy:
   default_stop_loss_pct: 0.08        # 8% below entry
   default_take_profit_pct: 0.20      # 20% above entry
   max_holding_days: 120              # time-based exit if thesis hasn't played out
+
+# ----------------------------------------------------------------------------
+# STRATEGY PROFILES. The base config above IS the `swing` profile. Selecting a
+# profile (via `profile:` above or the --profile CLI flag) overlays ONLY the
+# keys listed here onto strategy / analysis / discovery for that run.
+#
+# Profiles may TIGHTEN per-position exits (smaller stop/target, shorter
+# time-stop); the hard `risk:` limits above are NEVER touched by a profile and
+# always apply unchanged.
+# ----------------------------------------------------------------------------
+strategy_profiles:
+  swing: {}                          # base config unchanged (the default)
+
+  # Short-horizon momentum / quick-profit ideas: names likely to move over the
+  # next few days to ~2 weeks. Leans on the discovery screener + technicals,
+  # down-weights slow fundamentals, and exits fast (tight stop, small target,
+  # short time-stop). Daily-cadence data — this is NOT intraday day-trading.
+  momentum:
+    strategy:
+      holding_period_days_min: 2     # horizon: a few days ...
+      holding_period_days_max: 10    # ... to ~2 trading weeks
+      target_portfolio_size: 5       # fewer, faster names
+      min_score_to_buy: 70           # demand stronger setups for fast trades
+      min_score_to_add: 75
+      trim_below_score: 50           # cut laggards sooner
+      exit_below_score: 40
+      default_stop_loss_pct: 0.05    # tighter stop (tightens, never loosens)
+      default_take_profit_pct: 0.08  # smaller, faster profit target
+      max_holding_days: 10           # time-stop: out if the move hasn't happened
+    analysis:
+      weights:
+        technical: 0.65              # momentum lives in the technicals
+        fundamental: 0.10            # slow fundamentals matter little at this horizon
+        sentiment: 0.25              # fresh news still moves names fast
+    discovery:
+      max_discovered: 10             # lean harder on the momentum screener
 
 # ----------------------------------------------------------------------------
 # Analysis scoring. The analysis agent blends three deterministic 0-100
@@ -136,6 +180,9 @@ models:
   analysis_agent: "claude-haiku-4-5-20251001"
   decision_agent: "claude-sonnet-4-6"
   monitor_agent: "claude-haiku-4-5-20251001"
+  # Deep-research briefings (--mode explain): one read-heavy call per run.
+  # Bump to claude-opus-4-8 for maximum depth (slower).
+  explain_agent: "claude-sonnet-4-6"
 
 # ----------------------------------------------------------------------------
 # Research performance. The per-ticker numbers (technicals/fundamentals/news
@@ -172,12 +219,11 @@ execution:
   retry_backoff_seconds: 5
 
 # ----------------------------------------------------------------------------
-# Paper-trading simulator (used only in `paper` mode). The simulated account
-# persists to this state file so positions/P&L carry across runs.
+# Recommend mode: when no real account is connected, recommendations are sized
+# against this hypothetical cash so target $ amounts are meaningful.
 # ----------------------------------------------------------------------------
-paper:
-  starting_cash: 10000.0
-  state_file: "storage/paper_account.json"
+recommend:
+  hypothetical_cash: 10000.0
 
 # ----------------------------------------------------------------------------
 # Storage / audit

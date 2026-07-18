@@ -1,18 +1,13 @@
 """Execution layer.
 
-Two brokers behind one interface:
-
-  * :class:`PaperBroker` — a fully-functional **simulated** broker. It keeps a
-    persistent JSON portfolio, marks positions to market via the data provider,
-    and fills orders at the reference/limit price. ``paper`` mode uses this and
-    needs no network/account, so the whole pipeline runs offline.
+One broker:
 
   * :class:`RobinhoodMCPBroker` — talks to the official **Robinhood Trading
     MCP** (https://agent.robinhood.com/mcp/trading) through the Claude Agent
     SDK. OAuth is handled by the MCP server; no API key/secret lives in this
-    repo. Used to read the account in every mode (when configured) and to place
-    real orders in ``live`` mode. Every MCP request and response is written to
-    the audit log.
+    repo. Used to read the account (when configured) and to place real orders
+    in ``live`` mode. Every MCP request and response is written to the audit
+    log.
 
 The :class:`Executor` ties a broker + run mode + the audit DB together and is the
 ONLY component that ever sends an order. Safety properties:
@@ -32,9 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
 from risk.guardrails import AccountState, Position, Side
@@ -48,89 +41,6 @@ class OrderResult:
     fill_price: float = 0.0
     broker_order_id: str | None = None
     detail: dict = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Paper broker (simulated, persistent)
-# ---------------------------------------------------------------------------
-class PaperBroker:
-    """A simulated broker with a JSON-persisted portfolio."""
-
-    def __init__(self, starting_cash: float, state_path: str | Path, provider=None,
-                 sectors: dict[str, str] | None = None):
-        self.path = Path(state_path)
-        self.provider = provider
-        self.sectors = {k.upper(): v for k, v in (sectors or {}).items()}
-        if self.path.exists():
-            self.state = json.loads(self.path.read_text())
-        else:
-            self.state = {"cash": float(starting_cash), "positions": {}}
-            self._save()
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.state, indent=2))
-
-    def _price(self, ticker: str, fallback: float = 0.0) -> float:
-        if self.provider:
-            q = self.provider.get_quote(ticker)
-            if q and q.get("price"):
-                return float(q["price"])
-        pos = self.state["positions"].get(ticker)
-        if pos and pos.get("avg_cost"):
-            return float(pos["avg_cost"])
-        return fallback
-
-    def get_account(self, peak_equity: float = 0.0) -> AccountState:
-        positions: dict[str, Position] = {}
-        invested = 0.0
-        for t, p in self.state["positions"].items():
-            price = self._price(t, p.get("avg_cost", 0.0))
-            mv = p["shares"] * price
-            invested += mv
-            positions[t] = Position(
-                ticker=t, shares=p["shares"], avg_cost=p.get("avg_cost", 0.0),
-                market_value=mv, sector=p.get("sector", self.sectors.get(t, "Unknown")),
-            )
-        cash = self.state["cash"]
-        equity = cash + invested
-        return AccountState(
-            equity=equity, cash=cash, buying_power=cash,
-            peak_equity=max(peak_equity, equity), positions=positions,
-        )
-
-    def place_order(self, *, ticker: str, side: Side, qty: float, limit_price: float,
-                    sector: str = "Unknown") -> OrderResult:
-        """Simulate an immediate fill at the limit/reference price."""
-        price = limit_price or self._price(ticker)
-        if price <= 0 or qty <= 0:
-            return OrderResult(ok=False, status="rejected",
-                               detail={"reason": "invalid price/qty in paper fill"})
-        positions = self.state["positions"]
-        if side == Side.BUY:
-            cost = qty * price
-            self.state["cash"] -= cost
-            pos = positions.get(ticker)
-            if pos:
-                new_sh = pos["shares"] + qty
-                pos["avg_cost"] = (pos["shares"] * pos["avg_cost"] + cost) / new_sh
-                pos["shares"] = new_sh
-            else:
-                positions[ticker] = {"shares": qty, "avg_cost": price,
-                                     "sector": sector or self.sectors.get(ticker, "Unknown")}
-        else:  # SELL
-            pos = positions.get(ticker)
-            if not pos or pos["shares"] < qty - 1e-9:
-                return OrderResult(ok=False, status="rejected",
-                                   detail={"reason": "paper: insufficient shares to sell"})
-            pos["shares"] -= qty
-            self.state["cash"] += qty * price
-            if pos["shares"] <= 1e-9:
-                positions.pop(ticker, None)
-        self._save()
-        return OrderResult(ok=True, status="simulated", filled_qty=qty, fill_price=price,
-                           broker_order_id=f"PAPER-{ticker}-{side.value}",
-                           detail={"simulated": True})
 
 
 # ---------------------------------------------------------------------------
@@ -328,18 +238,6 @@ class Executor:
             self.db.update_order_status(order_row, "duplicate", detail={"client_order_id": client_oid})
             return OrderResult(ok=False, status="duplicate",
                                detail={"reason": "already submitted", "client_order_id": client_oid})
-
-        # ----- PAPER: simulate, never touch the real broker ----------------
-        if self.mode == "paper":
-            res = self.broker.place_order(ticker=ticker, side=side, qty=qty,
-                                          limit_price=limit_price, sector=sector)
-            self._record_order_fill(order_row, res, ticker=ticker, side=side, simulated=True)
-            self.db.finish_trade(trade_id, res.status, broker_order_id=res.broker_order_id,
-                                 price=res.fill_price or limit_price, qty=res.filled_qty or qty,
-                                 simulated=True, detail=res.detail)
-            self.db.audit(self.run_id, "INFO", "order_simulated",
-                          {"ticker": ticker, "side": side.value, "qty": qty, "price": res.fill_price})
-            return res
 
         # ----- PREVIEW: confirm, then place live ---------------------------
         if self.mode == "preview":

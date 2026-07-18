@@ -10,7 +10,9 @@ Run modes (``--mode`` overrides config.yaml; default ``recommend``):
     recommend  research + advice ONLY; places nothing and writes no fills/trades/
                plans. Reads the real account read-only if connected, else a
                hypothetical book. Use this to judge the agents' decisions.
-    paper      execute nothing real; simulate fills, log everything, track P&L
+    explain    deep-research briefing for ONE ticker (--ticker NVDA). Read-only:
+               no discovery, no decision agent, no orders. Report persisted to
+               SQLite and viewable in the dashboard's Deep dive tab.
     preview    print planned orders, require explicit confirmation, then place live
     live       place real orders via the Robinhood Trading MCP (within guardrails)
 
@@ -25,9 +27,15 @@ Hard safety properties enforced here:
     layer.
   * Every agent input/output, decision, order and fill is written to SQLite.
 
+Strategy profiles (``--profile``, orthogonal to ``--mode``; default ``swing``):
+overlay short-horizon parameter sets from config.yaml ``strategy_profiles:`` —
+e.g. ``momentum`` for days-to-~2-weeks quick-profit ideas. Profiles only adjust
+soft strategy/analysis/discovery parameters; hard risk limits never change.
+
 Usage:
     python orchestrator.py --mode recommend
-    python orchestrator.py --mode paper
+    python orchestrator.py --profile momentum --mode recommend
+    python orchestrator.py --mode explain --ticker NVDA
     python orchestrator.py --mode preview
     python orchestrator.py --mode live --yes      # skip the extra live warning
 """
@@ -44,13 +52,13 @@ from data.providers import build_provider
 from risk.guardrails import (
     AccountState, OrderIntent, Side, validate_batch,
 )
-from execution.executor import Executor, PaperBroker, RobinhoodMCPBroker
+from execution.executor import Executor, RobinhoodMCPBroker
 from execution.notifier import Notifier
 from agents.research_agent import run_research
 from agents.analysis_agent import run_analysis
 from agents.decision_agent import run_decision
 from agents.monitor_agent import run_monitor
-from agents import llm
+from agents import explain_agent, llm
 
 
 def _now_run_id() -> str:
@@ -103,13 +111,6 @@ class Orchestrator:
 
     # -- broker selection --------------------------------------------------
     def _build_broker(self):
-        if self.mode == "paper":
-            paper = self.cfg.paper
-            return PaperBroker(
-                starting_cash=paper.get("starting_cash", 10000.0),
-                state_path=self.cfg.path.parent / paper.get("state_file", "storage/paper_account.json"),
-                provider=self.provider, sectors=self.cfg.sectors,
-            )
         # preview/live read from (and place to) the real Robinhood MCP.
         ex = self.cfg.execution
         return RobinhoodMCPBroker(
@@ -120,22 +121,22 @@ class Orchestrator:
 
     async def _read_account(self, broker) -> AccountState | None:
         peak = self.db.get_peak_equity(fallback=0.0)
-        if isinstance(broker, PaperBroker):
-            return broker.get_account(peak_equity=peak)
-        acct = await broker.get_account(peak_equity=peak, sectors=self.cfg.sectors)
-        return acct
+        return await broker.get_account(peak_equity=peak, sectors=self.cfg.sectors)
 
     # -- recommend-mode account (read-only; never trades) ------------------
     def _hypothetical_account(self) -> AccountState:
-        """A clean book sized from paper.starting_cash, so recommendation sizing
-        is meaningful when no real account is connected."""
-        cash = float(self.cfg.paper.get("starting_cash", 10000.0))
+        """A clean book sized from recommend.hypothetical_cash, so recommendation
+        sizing is meaningful when no real account is connected."""
+        cash = float(self.cfg.recommend.get("hypothetical_cash", 10000.0))
         return AccountState(equity=cash, cash=cash, buying_power=cash,
                             peak_equity=cash, positions={})
 
     async def _recommend_account(self) -> AccountState:
         """Use the real Robinhood account READ-ONLY when a token is configured and
-        the read succeeds; otherwise recommend against a hypothetical book."""
+        the read succeeds; otherwise recommend against a hypothetical book.
+        Sets ``self._account_is_real`` so hypothetical numbers are never
+        snapshotted into the P&L/positions tables (keeps the dashboard real)."""
+        self._account_is_real = False
         if self.cfg.env("ROBINHOOD_MCP_TOKEN"):
             broker = RobinhoodMCPBroker(
                 mcp_url=self.cfg.execution.get("mcp_url"),
@@ -147,6 +148,7 @@ class Orchestrator:
                 peak_equity=self.db.get_peak_equity(fallback=0.0), sectors=self.cfg.sectors)
             if acct is not None:
                 print("   (using your live Robinhood holdings, read-only)")
+                self._account_is_real = True
                 return acct
             self.db.audit(self.run_id, "WARN",
                           "recommend_real_read_failed_fallback_hypothetical", {})
@@ -157,7 +159,8 @@ class Orchestrator:
     async def run_cycle(self) -> None:
         cfg = self.cfg
         db = self.db
-        db.start_run(self.run_id, self.mode, notes=f"backend={llm.backend_name()}")
+        db.start_run(self.run_id, self.mode,
+                     notes=f"backend={llm.backend_name()} profile={self.cfg.profile}")
         self._banner()
 
         # 0) KILL SWITCH gate (before anything trades). Recommend mode never
@@ -170,6 +173,7 @@ class Orchestrator:
 
         # Recommend mode reads no broker it could trade through; it uses the real
         # account read-only when connected, else a hypothetical book.
+        self._account_is_real = True
         if self.mode == "recommend":
             broker = None
             account = await self._recommend_account()
@@ -182,13 +186,15 @@ class Orchestrator:
             db.finish_run(self.run_id)
             return
 
-        # Snapshot account state up front.
-        db.snapshot_positions(self.run_id, account.positions)
-        db.snapshot_pnl(
-            self.run_id, equity=account.equity, cash=account.cash,
-            buying_power=account.buying_power, peak_equity=account.peak_equity,
-            drawdown_pct=account.drawdown_pct() * 100,
-        )
+        # Snapshot account state up front — REAL accounts only. A hypothetical
+        # recommend book must never pollute the P&L/positions tables/dashboard.
+        if self._account_is_real:
+            db.snapshot_positions(self.run_id, account.positions)
+            db.snapshot_pnl(
+                self.run_id, equity=account.equity, cash=account.cash,
+                buying_power=account.buying_power, peak_equity=account.peak_equity,
+                drawdown_pct=account.drawdown_pct() * 100,
+            )
         print(f"\n📊 Account: equity ${account.equity:,.2f} | cash ${account.cash:,.2f} | "
               f"positions {account.open_position_count()} | drawdown {account.drawdown_pct()*100:.2f}%")
 
@@ -311,6 +317,194 @@ class Orchestrator:
         db.finish_run(self.run_id)
         print(f"\n✅ Cycle complete (run_id={self.run_id}, mode={self.mode}).")
 
+    # =====================================================================
+    # EXPLAIN MODE — single-ticker deep research. READ-ONLY: no discovery,
+    # no decision agent, no order intents, no guardrail/executor path.
+    # =====================================================================
+    async def run_explain(self, ticker: str) -> None:
+        cfg, db = self.cfg, self.db
+        db.start_run(self.run_id, "explain",
+                     notes=f"backend={llm.backend_name()} ticker={ticker}")
+        self._banner()
+        print(f"\n🔎 Deep research: {ticker} "
+              "(read-only — nothing is traded, no orders are planned)")
+
+        # Research + analysis for exactly this ticker (watchlist not required —
+        # sector/fundamentals resolve via the provider, not config `universe`).
+        research_list = await run_research(
+            [ticker], self.provider,
+            cfg.models.get("research_agent", "claude-haiku-4-5-20251001"),
+            db=db, run_id=self.run_id,
+            llm_enrichment=cfg.research.get("llm_enrichment", False), concurrency=1,
+        )
+        research = research_list[0]
+        analysis_items = await run_analysis(
+            research_list, cfg.models.get("analysis_agent", "claude-haiku-4-5-20251001"),
+            cfg.strategy, weights=cfg.analysis.get("weights"), db=db, run_id=self.run_id,
+        )
+        analysis = analysis_items[0] if analysis_items else {}
+
+        position = await self._position_context(ticker)
+        series = await asyncio.to_thread(self.provider.get_daily_series, ticker, 260)
+        payload = explain_agent.build_payload(
+            ticker, research, analysis, series or [], cfg.strategy, position,
+            profile=cfg.profile)
+        report = await explain_agent.run_explain(
+            payload, cfg.models.get("explain_agent", "claude-sonnet-4-6"),
+            db=db, run_id=self.run_id,
+        )
+
+        self._print_degraded_warning(
+            llm.backend_name() == "offline",
+            (research.get("technicals") or {}).get("price") is None,
+            "parts of this briefing")
+        self._print_explain(report)
+        db.finish_run(self.run_id)
+        print(f"\n✅ Report saved (run_id={self.run_id}). Re-read it any time in the "
+              "dashboard's Deep dive tab.")
+
+    async def _position_context(self, ticker: str) -> dict | None:
+        """READ-ONLY position context: real holdings (if connected) + stored plan."""
+        position: dict | None = None
+        if self.cfg.env("ROBINHOOD_MCP_TOKEN"):
+            broker = RobinhoodMCPBroker(
+                mcp_url=self.cfg.execution.get("mcp_url"),
+                model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
+                token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
+                audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
+            )
+            acct = await broker.get_account(
+                peak_equity=self.db.get_peak_equity(fallback=0.0), sectors=self.cfg.sectors)
+            if acct is not None:
+                held = acct.positions.get(ticker)
+                if held and held.shares > 0:
+                    price = self._ref_price(ticker, None)
+                    position = {
+                        "held": True, "shares": round(held.shares, 6),
+                        "avg_cost": round(held.avg_cost, 2),
+                        "market_value": round(held.market_value, 2),
+                        "unrealized_pnl_pct": (round((price / held.avg_cost - 1) * 100, 2)
+                                               if price and held.avg_cost else None),
+                    }
+                else:
+                    position = {"held": False}
+        plan = self.db.get_trade_plans().get(ticker)
+        if plan:
+            position = {**(position or {"held": None}), "trade_plan": {
+                k: plan.get(k) for k in
+                ("entry_date", "entry_price", "stop_loss", "take_profit",
+                 "max_hold_until", "thesis")}}
+        return position
+
+    def _print_explain(self, report: dict) -> None:
+        snap = report.get("snapshot", {}) or {}
+        name = snap.get("name") or ""
+        print("\n" + "─" * 70)
+        print(f"🔎 DEEP RESEARCH — {report.get('ticker')}"
+              + (f"  ({name})" if name else "")
+              + f"  ·  as of {report.get('as_of', '—')}")
+        print("─" * 70)
+        price = snap.get("price")
+        mcap = snap.get("market_cap")
+        print(f"  {snap.get('sector', 'Unknown')}"
+              + (f" · ${price:,.2f}" if isinstance(price, (int, float)) else "")
+              + (f" · mkt cap ${mcap/1e9:,.1f}B" if isinstance(mcap, (int, float)) else ""))
+
+        v = report.get("verdict") or {}
+        if v.get("action"):
+            icons = {"buy": "🟢", "add": "🔵", "hold": "⚪", "watch": "👁",
+                     "trim": "🟠", "sell": "🔴", "avoid": "⛔"}
+            print(f"\n  🎯 VERDICT: {icons.get(v['action'], '•')} "
+                  f"{str(v['action']).upper()}  (confidence {v.get('confidence', '—')}, "
+                  f"{v.get('profile', 'swing')} profile)")
+            if v.get("rationale"):
+                print(f"     {v['rationale']}")
+            for reason in (v.get("reasons") or [])[:4]:
+                print(f"     • {reason}")
+            plan = v.get("suggested_plan")
+            if plan:
+                print(f"     suggested plan: stop ${plan.get('stop')} / target "
+                      f"${plan.get('target')} / by {plan.get('max_hold_until')} "
+                      f"(informational only)")
+
+        if snap.get("summary"):
+            print(f"\n  📌 {snap['summary']}")
+
+        pa = report.get("price_action", {}) or {}
+        rets = pa.get("returns", {}) or {}
+        def fp(v):  # noqa: E731
+            return f"{v:+.1f}%" if isinstance(v, (int, float)) else "—"
+        print(f"\n  📈 Returns: 1d {fp(rets.get('d1'))} · 5d {fp(rets.get('d5'))} · "
+              f"1m {fp(rets.get('m1'))} · 3m {fp(rets.get('m3'))} · YTD {fp(rets.get('ytd'))}")
+        if pa.get("summary"):
+            print(f"     {pa['summary']}")
+
+        wim = report.get("why_it_moved", {}) or {}
+        print(f"\n  📰 Why it moved: {wim.get('summary', '—')}")
+        for d in (wim.get("drivers") or []):
+            print(f"     • {d.get('claim', '')}  — “{d.get('headline', '')}”"
+                  + (f" ({d.get('date')})" if d.get("date") else ""))
+
+        e = report.get("earnings", {}) or {}
+        if e.get("next_date"):
+            flag = "  ⚠️ EVENT RISK inside the swing horizon" if e.get("event_risk") else ""
+            print(f"\n  🗓  Earnings: {e['next_date']}"
+                  + (f" (in ~{e['days_until']}d)" if e.get("days_until") is not None else "")
+                  + flag)
+        else:
+            print("\n  🗓  Earnings: date unavailable")
+        if e.get("note"):
+            print(f"     {e['note']}")
+
+        f = report.get("fundamentals", {}) or {}
+        def fv(k, label, money=False):  # noqa: E731
+            v = f.get(k)
+            if not isinstance(v, (int, float)):
+                return f"{label} n/a"
+            return f"{label} {'$' + format(v, ',.0f') if money else round(v, 2)}"
+        print("\n  🧾 " + " · ".join([
+            fv("pe_ratio", "P/E"), fv("ps_ratio", "P/S"),
+            fv("eps_growth_yoy", "EPS growth%"), fv("debt_to_equity", "D/E"),
+            fv("free_cash_flow", "FCF", money=True)]))
+        if f.get("note"):
+            print(f"     {f['note']}")
+
+        scenarios = report.get("scenarios") or []
+        if scenarios:
+            print("\n  🔮 Scenarios (conditional levels — NOT a forecast):")
+            for s in scenarios:
+                tl = s.get("target_level")
+                print(f"     • {str(s.get('name', '')).upper():4} if {s.get('condition', '?')}"
+                      + (f" → toward ${tl:,.2f}" if isinstance(tl, (int, float)) else ""))
+                if s.get("narrative"):
+                    print(f"        {s['narrative']}")
+                print(f"        confirm: {s.get('confirm', '—')} | "
+                      f"invalidate: {s.get('invalidate', '—')}")
+
+        if report.get("risks"):
+            print("\n  ⚠️  Key risks:")
+            for r in report["risks"][:6]:
+                print(f"     • {r}")
+        if report.get("watch_next"):
+            print("\n  👀 Watch next:")
+            for w in report["watch_next"][:5]:
+                print(f"     • {w}")
+
+        pos = report.get("position")
+        if pos is None:
+            print("\n  💼 Your position: no account connected (read-only check skipped)")
+        elif pos.get("held"):
+            print(f"\n  💼 Your position: {pos.get('shares')} sh @ ${pos.get('avg_cost')} "
+                  f"(unrealized {fp(pos.get('unrealized_pnl_pct'))})")
+        elif pos.get("held") is False:
+            print("\n  💼 Your position: not currently held")
+        if isinstance(pos, dict) and pos.get("trade_plan"):
+            tp = pos["trade_plan"]
+            print(f"     stored plan: stop ${tp.get('stop_loss')} / target "
+                  f"${tp.get('take_profit')} / by {tp.get('max_hold_until')}")
+
+        print(f"\n  {report.get('disclaimer', '')}")
+
     # -- execution ---------------------------------------------------------
     async def _execute(self, broker, approved, start_account: AccountState) -> None:
         if self.mode == "live" and not self.assume_yes:
@@ -320,7 +514,7 @@ class Orchestrator:
             broker=broker, mode=self.mode, db=self.db, run_id=self.run_id,
             exec_cfg=self.cfg.execution, kill_switch_check=self.kill_switch_active,
         )
-        verb = {"paper": "Simulating", "preview": "Previewing", "live": "PLACING LIVE"}[self.mode]
+        verb = {"preview": "Previewing", "live": "PLACING LIVE"}[self.mode]
         print(f"\n💸 {verb} {len(approved)} order(s):")
         for res in approved:
             intent = res.intent
@@ -364,6 +558,22 @@ class Orchestrator:
               + (f" | ⚠️ {summary['needs_review']} need review" if summary['needs_review'] else ""))
         self.notifier.send_digest(self.run_id, self.mode, summary, account)
 
+    # -- degraded-run warning (shared by recommend + explain) ---------------
+    @staticmethod
+    def _print_degraded_warning(backend_offline: bool, no_data: bool,
+                                noun: str, extra: str = "") -> None:
+        if not (backend_offline or no_data):
+            return
+        print(f"\n⚠️  DEGRADED RUN — {noun} are placeholders:")
+        if backend_offline:
+            print("     • LLM backend offline → `pip install -r requirements.txt` "
+                  "and set ANTHROPIC_API_KEY in .env")
+        if no_data:
+            print("     • No market data → install yfinance (no key) or set "
+                  "ALPHAVANTAGE_API_KEY in .env")
+        if extra:
+            print(f"     {extra}")
+
     # -- recommendation report (recommend mode) ---------------------------
     def _print_recommendations(self, decision: dict, monitor_out: dict, results: list) -> None:
         """Readable advice digest. The full ranked view lives in the dashboard."""
@@ -372,18 +582,11 @@ class Orchestrator:
 
         # Warn loudly when the run is degraded (no LLM and/or no market data), so
         # an all-"pass" / score-50 result is never a mystery.
-        backend = llm.backend_name()
         scores = [o.get("_score") for o in orders if o.get("_score") is not None]
         no_data = bool(scores) and all(s == 50 for s in scores)
-        if backend == "offline" or no_data:
-            print("\n⚠️  DEGRADED RUN — recommendations are placeholders:")
-            if backend == "offline":
-                print("     • LLM backend offline → `pip install -r requirements.txt` "
-                      "and set ANTHROPIC_API_KEY in .env")
-            if no_data:
-                print("     • No market data → install yfinance (no key) or set "
-                      "ALPHAVANTAGE_API_KEY in .env")
-            print("     Every score defaults to ~50 (below the buy threshold), so all show PASS.")
+        self._print_degraded_warning(
+            llm.backend_name() == "offline", no_data, "recommendations",
+            extra="Every score defaults to ~50 (below the buy threshold), so all show PASS.")
 
         actionable = [o for o in orders if str(o.get("action", "")).lower() in ("buy", "add", "trim")]
         holds = [o for o in orders if str(o.get("action", "")).lower() == "hold"]
@@ -391,7 +594,7 @@ class Orchestrator:
         exits = monitor_out.get("exits", []) or []
 
         print("\n" + "─" * 70)
-        print("📋 RECOMMENDATIONS  (advice only — nothing traded)")
+        print(f"📋 RECOMMENDATIONS  ({self.cfg.profile} profile — advice only, nothing traded)")
         if decision.get("market_view"):
             print(f"   Market view: {decision['market_view']}")
         print("─" * 70)
@@ -532,12 +735,13 @@ class Orchestrator:
     # -- console UX --------------------------------------------------------
     def _banner(self) -> None:
         print("=" * 70)
-        print(f" Swing-Trading System  |  mode={self.mode.upper()}  |  run={self.run_id}")
+        print(f" Trading System  |  mode={self.mode.upper()}  |  "
+              f"profile={self.cfg.profile.upper()}  |  run={self.run_id}")
         print(f" LLM backend: {llm.backend_name()}")
         if self.mode == "recommend":
-            print(" RECOMMEND MODE: advice only — nothing is traded or simulated.")
-        elif self.mode == "paper":
-            print(" PAPER MODE: no real orders will be placed.")
+            print(" RECOMMEND MODE: advice only — nothing is traded.")
+        elif self.mode == "explain":
+            print(" EXPLAIN MODE: deep research briefing — read-only, nothing is traded.")
         print("=" * 70)
 
     def _live_warning(self) -> None:
@@ -552,8 +756,13 @@ class Orchestrator:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Multi-agent swing-trading orchestrator")
-    ap.add_argument("--mode", choices=["recommend", "paper", "preview", "live"],
+    ap.add_argument("--mode", choices=["recommend", "explain", "preview", "live"],
                     help="run mode (overrides config.yaml; default recommend)")
+    ap.add_argument("--ticker", default=None,
+                    help="stock symbol for --mode explain (e.g. --ticker NVDA)")
+    ap.add_argument("--profile", default=None,
+                    help="strategy profile from config.yaml strategy_profiles "
+                         "(e.g. swing, momentum; default: config `profile:`, i.e. swing)")
     ap.add_argument("--config", default=None, help="path to config.yaml")
     ap.add_argument("--yes", action="store_true",
                     help="skip the interactive LIVE confirmation (use with care)")
@@ -575,7 +784,26 @@ def main() -> None:
     if args.mode:
         config.set_mode(args.mode)
 
+    # Apply the strategy profile (CLI beats the config default) BEFORE anything
+    # reads strategy/analysis/discovery. Profiles never touch the hard risk: limits.
+    try:
+        config.apply_profile(args.profile or config.profile)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
     orch = Orchestrator(config, assume_yes=args.yes)
+
+    if config.mode == "explain":
+        ticker = (args.ticker or "").strip().upper()
+        if not ticker:
+            raise SystemExit("error: --mode explain requires --ticker SYMBOL "
+                             "(e.g. python orchestrator.py --mode explain --ticker NVDA)")
+        if not (ticker.isalpha() and 1 <= len(ticker) <= 5):
+            raise SystemExit(f"error: {args.ticker!r} does not look like a US equity "
+                             "symbol (1-5 letters)")
+        asyncio.run(orch.run_explain(ticker))
+        return
+
     asyncio.run(orch.run_cycle())
 
 

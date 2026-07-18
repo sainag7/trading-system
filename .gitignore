@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Dashboard-managed config overrides (machine-written; base config.yaml is canonical)
+config.local.yaml
+
 # Caches & data
 .cache/
 *.db

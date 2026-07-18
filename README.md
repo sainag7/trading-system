@@ -18,8 +18,8 @@ you money, potentially all of it. Nothing here is financial advice.**
 
 - The system **defaults to `recommend` mode** (advice only — it trades nothing).
   It was **developed and tested without placing real orders**. Do not run `live`
-  until you have read the code, run `recommend`/`paper` for a long time, and
-  understand exactly what it will do.
+  until you have read the code, run `recommend` for a long time, and understand
+  exactly what it will do.
 - LLM agents are **fallible**. They can be confidently wrong. That is *why* a
   separate, deterministic, LLM-free **risk layer** ([risk/guardrails.py](risk/guardrails.py))
   sits between every decision and every order and can resize or reject it.
@@ -37,13 +37,13 @@ you money, potentially all of it. Nothing here is financial advice.**
 
 ```
                  ┌─────────────────────────── orchestrator.py ───────────────────────────┐
-                 │   --mode paper | preview | live      (checks KILL SWITCH first)        │
+                 │   --mode recommend | preview | live   (checks KILL SWITCH first)       │
                  └────────────────────────────────────────────────────────────────────────┘
                                                 │
    Research ──▶ Analysis ──▶ Decision ──▶  RISK (guardrails) ──▶ Execution ──▶ Monitor
    (per-ticker   (0–100      (buy/add/hold/   DETERMINISTIC,        Robinhood     (exits:
-    JSON)         scores &    trim/sell +     NO LLM. Resizes or     MCP / paper   stop/target/
-                  ranking)    size + conf.)   rejects every order.   simulator)    time/thesis)
+    JSON)         scores &    trim/sell +     NO LLM. Resizes or     Trading       stop/target/
+                  ranking)    size + conf.)   rejects every order.   MCP)          time/thesis)
         │            │             │                │                    │             │
         └────────────┴─────────────┴──── all inputs & outputs ──────────┴─────────────┘
                                     written to SQLite audit trail (storage/db.py)
@@ -58,15 +58,15 @@ it is the one component you can fully unit-test and trust.
 | Path | What it does |
 |------|--------------|
 | [config.yaml](config.yaml) | Strategy params, **hard risk limits**, watchlist, models |
-| [orchestrator.py](orchestrator.py) | Main loop; `--mode paper\|preview\|live`; kill switch |
+| [orchestrator.py](orchestrator.py) | Main loop; `--mode recommend\|preview\|live`; kill switch |
 | [agents/](agents/) | research / analysis / decision / monitor (+ shared `llm.py`) |
 | [risk/guardrails.py](risk/guardrails.py) | **Deterministic** order validation (no LLM) |
 | [risk/test_guardrails.py](risk/test_guardrails.py) | Thorough unit tests for every limit |
-| [execution/executor.py](execution/executor.py) | Robinhood MCP broker + paper broker + retries |
+| [execution/executor.py](execution/executor.py) | Robinhood MCP broker + idempotent order lifecycle + retries |
 | [data/providers.py](data/providers.py) | Alpha Vantage / yfinance / FRED with caching + rate limits |
 | [storage/db.py](storage/db.py) | SQLite: trades, agent_outputs, positions, pnl, audit_log |
 | [dashboard/app.py](dashboard/app.py) | Streamlit view of scores, positions, P&L, decision log |
-| [smoke_test.py](smoke_test.py) | Offline end-to-end paper pipeline check (no keys needed) |
+| [recommend_check.py](recommend_check.py) | Offline end-to-end pipeline check (no keys needed) |
 
 ---
 
@@ -118,22 +118,17 @@ deterministic heuristics (useful for testing), but the analysis is much thinner.
 
 Mode is set by `--mode` (preferred), then `TRADING_MODE` env, then `config.yaml`.
 **Default is `recommend`** (advice only — the safest setting while you evaluate the
-agents). Switch to `paper` to track simulated P&L, and only to `preview`/`live`
-once you trust it.
+agents). Move to `preview`/`live` only once you trust it.
 
 | Mode | What happens | Real orders? |
 |------|--------------|:---:|
-| `recommend` | Runs the full pipeline + guardrails and **prints/saves recommendations only** — places nothing, simulates nothing, writes no fills/trades/plans. Reads your real account read-only **if connected**, else a hypothetical book. Use it to judge the agents' decisions before risking money. | **No** |
-| `paper` | Simulates fills against a persistent paper account and **tracks P&L/drawdown over time**. Best for judging *performance*. Reads no real account. | **No** |
+| `recommend` | Runs the full pipeline + guardrails and **prints/saves recommendations only** — places nothing, writes no fills/trades/plans. Reads your real account read-only **if connected**, else sizes advice against a hypothetical book (`recommend.hypothetical_cash`). | **No** |
 | `preview` | Reads your real account, runs the full pipeline, prints each planned order and **asks for explicit confirmation** before sending it live. | Only after you confirm |
 | `live` | Reads your real account and **places real orders** via the Robinhood Trading MCP, within the guardrails. Requires typing `I UNDERSTAND`. | **Yes** |
 
 ```bash
 # Advice only — see what the agents would do (nothing is traded)
 python orchestrator.py --mode recommend
-
-# Simulate everything and track simulated P&L over time
-python orchestrator.py --mode paper
 
 # Plan against the real account, confirm each order by hand
 python orchestrator.py --mode preview
@@ -143,11 +138,93 @@ python orchestrator.py --mode live
 python orchestrator.py --mode live --yes     # skip the typed confirmation
 ```
 
-> **`recommend` vs `paper` for evaluation:** `recommend` answers *"what would you do
-> today?"* (a daily advice list). `paper` actually simulates those trades and charts
-> the resulting equity/drawdown in the dashboard, so it answers *"how would these
-> decisions have performed?"* Use both. View either in the dashboard:
-> `streamlit run dashboard/app.py` (top section shows the latest recommendations).
+View recommendations in the dashboard: `streamlit run dashboard/app.py` (the top
+section shows the latest advice; equity/positions appear once your real account
+is connected).
+
+### Strategy profiles (`--profile`, orthogonal to `--mode`)
+
+Independent of the mode, a **strategy profile** selects the parameter set the
+agents run with (horizon, exit rules, scoring weights, screener appetite):
+
+```bash
+python orchestrator.py --mode recommend                      # swing (default)
+python orchestrator.py --profile momentum --mode recommend   # quick-profit ideas
+```
+
+Profiles live in `config.yaml → strategy_profiles:` and only overlay soft
+strategy/analysis/discovery parameters — **the hard `risk:` limits are never
+touched by a profile**. See "Momentum profile" below.
+
+---
+
+## Deep research on one stock (`--mode explain`)
+
+```bash
+python orchestrator.py --mode explain --ticker NVDA     # lowercase works too
+```
+
+A read-only, single-ticker briefing — the ticker does **not** need to be in your
+watchlist. Every report ends with a **🎯 verdict** (buy / watch / avoid — or
+add / hold / trim / sell when you already hold the name), derived
+deterministically from the analysis composite score and *your* configured
+strategy thresholds (profile-aware: `--profile momentum` applies its stricter
+bar), with a confidence score whose dampeners (earnings event risk, high
+volatility, thin news, missing data) are listed explicitly. A buy verdict
+includes informational stop/target levels — nothing is planned or ordered.
+It also covers: what the company does (sourced from provider data),
+returns over 1d/5d/1m/3m/YTD and where price sits vs SMA20/50/200/RSI/MACD/ATR,
+**why it moved** (attributed ONLY to actually-fetched headlines — if the news is
+thin it says *"no clear catalyst found in available news"* rather than inventing
+a reason), the next earnings date with an event-risk flag, fundamentals,
+**bull/base/bear scenarios with concrete levels** derived from support/
+resistance + ATR (conditional levels, never a forecast), key risks, what to
+watch, and — if your Robinhood account is connected — whether you already hold
+the name and any stored trade plan.
+
+Reports are persisted to SQLite (`agent_outputs`, agent='explain') and
+re-readable in the dashboard's **🔎 Deep dive** tab, newest first — where you can
+also **run a new deep dive directly** (type a ticker → Research) without touching
+the CLI.
+
+**Limits:** daily data (not intraday); move attribution is best-effort from the
+available headlines only; scenario levels are mechanical (levels ± ATR), not
+price targets; nothing here is financial advice.
+
+---
+
+## Momentum profile (quick-profit ideas)
+
+`--profile momentum` re-tunes the same pipeline for **short-horizon momentum
+trades: a few days to ~2 weeks**, aiming to surface names likely to move soon
+and get in and out fast:
+
+- **Leans on the discovery screener** (`max_discovered: 10`) — momentum,
+  breakouts, volume spikes, gainers — and **weights technicals 65%** of the
+  composite (fundamentals drop to 10%; news sentiment 25%).
+- **Fast, tight exits**, all config-driven under `strategy_profiles.momentum`:
+  | Param | Momentum | Swing (base) |
+  |---|---|---|
+  | `default_stop_loss_pct` | **5%** | 8% |
+  | `default_take_profit_pct` | **8%** | 20% |
+  | `max_holding_days` (time-stop) | **10** | 120 |
+  | `min_score_to_buy` | **70** | 65 |
+  | `target_portfolio_size` | **5** | 10 |
+- Exits are stored **per position at entry** (`trade_plans`), so a momentum
+  position keeps its tight stop/target/time-stop even if your next run uses the
+  swing profile — and vice versa.
+
+**Same pipeline, same safety.** Research → Analysis → Decision → **Guardrails**
+→ Execution is unchanged; there is no path to an order that skips the risk
+layer. Profiles may only *tighten* per-position exits; every hard limit in
+`risk:` (position/sector caps, per-trade $, daily trade cap, cash floor,
+drawdown halt, kill switch) applies identically.
+
+**Limitations — read this:** the system runs on **daily** data, once per day.
+This is days-to-2-weeks *idea generation*, **not** intraday day-trading. Prices
+gap overnight — a 5% stop does not guarantee a −5% worst case. Short-horizon
+momentum trading has higher turnover and is riskier than swing holding; evaluate
+it in `recommend` mode first, like everything else.
 
 ### Kill switch (emergency stop)
 
@@ -177,7 +254,7 @@ or **rejected**, and the reason is logged.
 | `max_position_pct` | 0.15 | No single name > 15% of account equity |
 | `max_sector_pct` | 0.40 | No single sector > 40% of equity |
 | `per_trade_max_usd` | 500 | Max $ notional per individual order |
-| `daily_max_trades` | 5 | Max executed orders per day (paper fills count too) |
+| `daily_max_trades` | 5 | Max executed orders per day |
 | `min_cash_reserve_pct` | 0.10 | Always keep ≥ 10% of equity in cash |
 | `max_account_drawdown_halt_pct` | 0.15 | If down ≥ 15% from peak, halt new risk |
 | `no_trade_list` | `[]` | Tickers never to buy (you may still sell to exit) |
@@ -199,13 +276,14 @@ enabled). Sells can never exceed shares held (no shorting / no overselling).
 The risk layer is the safety contract, so it is covered thoroughly:
 
 ```bash
-pytest risk/test_guardrails.py -v      # 40+ tests: approve / resize / reject per limit
-python smoke_test.py                   # offline end-to-end paper run (no keys)
+pytest risk/test_guardrails.py -v      # 59 tests: approve / resize / reject per limit
+python recommend_check.py              # offline end-to-end pipeline run (no keys)
 ```
 
-`smoke_test.py` injects a deterministic stub data provider and asserts the full
-pipeline runs, orders fill, the audit DB is populated, and **no guardrail is
-breached** (no position > 15%, daily cap respected).
+`recommend_check.py` injects a deterministic stub data provider and asserts the
+full pipeline (research → analysis → decision → guardrails) runs and produces
+recommendations with **zero trading side effects** — no fills, trades, plans, or
+P&L rows are ever written by recommend mode.
 
 ---
 
@@ -215,8 +293,24 @@ breached** (no position > 15%, daily cap respected).
 streamlit run dashboard/app.py
 ```
 
-A read-only view of equity/drawdown, current positions, latest scores, the
-decision/guardrail log, orders, fills, and the audit log. It never trades.
+An interactive control center with four tabs — **Ideas** (recommendations with
+score bars + click-through "why this stock" drill-down), **Portfolio**
+(equity/positions once your real account is connected), **Settings**, and
+**Activity** (decision/guardrail log, orders, fills, audit log).
+
+- **Run scans from the sidebar** — pick a profile (swing/momentum) and hit Run.
+  A live log streams while the scan runs and results refresh automatically.
+- **Run deep research from the Deep dive tab** — type any ticker and hit
+  🔎 Research to generate a full briefing without the CLI.
+- Both launchers execute **read-only modes only** (`recommend` / `explain`,
+  hardcoded): the dashboard can never place a trade. Preview/live remain CLI-only.
+- **Kill switch** — engage from the sidebar (creates the `KILL_SWITCH` file,
+  halting all trading instantly); release requires a confirm.
+- **Settings** — edits everything including the hard risk limits (those require
+  an explicit confirmation). Changes are written to **`config.local.yaml`**
+  (gitignored, machine-managed) and merged over `config.yaml` at load time, so
+  your commented base config is never rewritten. "Reset all overrides" deletes
+  the overlay. API keys stay in `.env`, never in the dashboard.
 
 ---
 
@@ -301,13 +395,26 @@ layer (Robinhood, live/preview) uses the Agent SDK + MCP.
 ## Scheduling a daily run
 
 This is a daily-cadence system; run it once per trading day (e.g. shortly after
-the open or near the close). Example cron (paper mode, weekdays 9:45 ET):
+the open or near the close). Runs are **single-shot and idempotent** — there is
+no daemon; schedule them with cron:
 
 ```cron
-45 9 * * 1-5  cd /path/to/trading-system && .venv/bin/python orchestrator.py --mode paper >> run.log 2>&1
+# Swing ideas every weekday morning (9:45 ET)
+45 9 * * 1-5   cd /path/to/trading-system && .venv/bin/python orchestrator.py --mode recommend >> run.log 2>&1
+
+# Momentum quick-profit scan near the close (15:30 ET) — or use `* * 1`/`* * 1,3,5`
+# for weekly / Mon-Wed-Fri cadence
+30 15 * * 1-5  cd /path/to/trading-system && .venv/bin/python orchestrator.py --profile momentum --mode recommend >> momentum.log 2>&1
 ```
 
-Promote to `--mode preview` only once you trust the paper results, and to
+Repeated runs are safe by construction: `recommend` writes only advice (zero
+trading side effects); in preview/live the `daily_max_trades` budget is shared
+across profiles, held names are never re-bought as fresh positions (the decision
+agent sees your positions; position/sector caps bound adds), and the executor's
+idempotency key prevents double-submitting an order. Each position's exit plan
+is stored at entry, so mixing profiles across runs never mixes up exits.
+
+Promote to `--mode preview` only once you trust the recommendations, and to
 `--mode live` only with eyes open and the kill switch within reach.
 
 ---

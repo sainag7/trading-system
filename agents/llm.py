@@ -9,8 +9,8 @@ This is the single place that talks to a model. Every agent calls
   2. **Anthropic Messages API** (`anthropic` SDK) — a lightweight fallback for
      the pure text-in/JSON-out agents when the Agent SDK runtime isn't present.
   3. **Offline** — if no backend/API key is available, returns ``None`` so the
-     caller can fall back to a deterministic heuristic. This keeps **paper mode
-     fully runnable without any API keys**, which is how you should develop.
+     caller can fall back to a deterministic heuristic. This keeps **recommend
+     mode fully runnable without any API keys**, which is how you should develop.
 
 The functions never raise on backend/network failure; they return ``None`` and
 let the agent degrade gracefully.

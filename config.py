@@ -24,8 +24,11 @@ except Exception:  # pragma: no cover - dotenv missing is non-fatal
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
+# Machine-managed overrides written by the dashboard's Settings tab. Merged over
+# config.yaml at load time so the commented base file is never rewritten.
+LOCAL_CONFIG_NAME = "config.local.yaml"
 
-VALID_MODES = ("recommend", "paper", "preview", "live")
+VALID_MODES = ("recommend", "explain", "preview", "live")
 
 
 @dataclass(frozen=True)
@@ -79,7 +82,7 @@ class Config:
     def mode(self) -> str:
         # Precedence: env override (TRADING_MODE) > config.yaml. The CLI flag is
         # applied by the orchestrator after construction via set_mode().
-        mode = os.getenv("TRADING_MODE") or self.raw.get("mode", "paper")
+        mode = os.getenv("TRADING_MODE") or self.raw.get("mode", "recommend")
         mode = str(mode).lower()
         if mode not in VALID_MODES:
             raise ValueError(f"Invalid mode {mode!r}; expected one of {VALID_MODES}")
@@ -90,6 +93,33 @@ class Config:
         if mode not in VALID_MODES:
             raise ValueError(f"Invalid mode {mode!r}; expected one of {VALID_MODES}")
         self.raw["mode"] = mode
+
+    # -- strategy profiles ---------------------------------------------------
+    @property
+    def profile(self) -> str:
+        """The active strategy profile name (default ``swing``)."""
+        return str(self.raw.get("profile", "swing")).lower()
+
+    def valid_profiles(self) -> tuple[str, ...]:
+        names = {"swing", *self.raw.get("strategy_profiles", {}).keys()}
+        return tuple(sorted(str(n).lower() for n in names))
+
+    def apply_profile(self, name: str) -> None:
+        """Overlay ``strategy_profiles.<name>`` onto strategy/analysis/discovery.
+
+        Profiles only ever adjust soft strategy parameters — the hard ``risk:``
+        limits are deliberately NOT touched by a profile, so guardrails are
+        identical across profiles. Unknown names raise with the valid choices.
+        """
+        name = str(name).lower()
+        valid = self.valid_profiles()
+        if name not in valid:
+            raise ValueError(f"Invalid profile {name!r}; expected one of {valid}")
+        overlay = self.raw.get("strategy_profiles", {}).get(name) or {}
+        for key in ("strategy", "analysis", "discovery"):
+            if key in overlay:
+                self.raw[key] = _deep_merge(self.raw.get(key, {}), overlay[key])
+        self.raw["profile"] = name
 
     @property
     def kill_switch_enabled(self) -> bool:
@@ -145,9 +175,8 @@ class Config:
         return self.raw.get("storage", {})
 
     @property
-    def paper(self) -> dict[str, Any]:
-        return self.raw.get("paper", {"starting_cash": 10000.0,
-                                      "state_file": "storage/paper_account.json"})
+    def recommend(self) -> dict[str, Any]:
+        return self.raw.get("recommend", {"hypothetical_cash": 10000.0})
 
     @property
     def db_path(self) -> Path:
@@ -159,9 +188,31 @@ class Config:
         return os.getenv(name, default)
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Return a new dict of ``base`` with ``overlay`` merged in (nested dicts
+    merge recursively; scalars/lists in the overlay replace the base value)."""
+    out = dict(base)
+    for k, v in (overlay or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def load_config(path: str | Path | None = None) -> Config:
-    """Load and return the :class:`Config` from ``config.yaml``."""
+    """Load the :class:`Config` from ``config.yaml``, then deep-merge the
+    dashboard-managed ``config.local.yaml`` overlay (if present) on top."""
     cfg_path = Path(path) if path else DEFAULT_CONFIG_PATH
     with open(cfg_path, "r") as f:
         raw = yaml.safe_load(f) or {}
+    local_path = cfg_path.parent / LOCAL_CONFIG_NAME
+    if local_path.exists():
+        try:
+            with open(local_path, "r") as f:
+                overrides = yaml.safe_load(f) or {}
+            if isinstance(overrides, dict):
+                raw = _deep_merge(raw, overrides)
+        except Exception:
+            pass  # a corrupt overlay must never take the system down
     return Config(raw=raw, path=cfg_path)

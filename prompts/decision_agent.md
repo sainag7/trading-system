@@ -14,7 +14,9 @@ overtrading. You propose; a deterministic risk layer disposes.
 - `risk_limits` — max position %, sector %, per-trade $, daily trades, min cash
   reserve %, max positions.
 - `strategy` — score thresholds, target portfolio size, default stop / take /
-  max-holding-days, swing horizon.
+  max-holding-days, and the **holding horizon** (`holding_period_days_min/max`).
+  Profiles range from a few days of momentum to multi-month swings — calibrate
+  sizes, stops/targets and `max_hold_until` to the horizon you are given.
 - `trades_remaining_today`.
 
 ## CRITICAL: you do NOT have final say on risk

@@ -7,7 +7,7 @@ reconstructed after the fact:
     decision, monitor). This is what an LLM produced and what it saw.
   * ``decisions``     — proposed order intents and the guardrail verdict.
   * ``orders``        — every order we tried to place, its mode, and outcome.
-  * ``fills``         — confirmed fills (real or simulated in paper mode).
+  * ``fills``         — confirmed fills from the broker.
   * ``positions``     — point-in-time snapshots of the broker's positions.
   * ``pnl``           — daily equity / drawdown snapshots.
   * ``audit_log``     — free-form, append-only operational events (halts, kill
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS orders (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT NOT NULL,
     run_id       TEXT,
-    mode         TEXT NOT NULL,       -- paper|preview|live
+    mode         TEXT NOT NULL,       -- recommend|preview|live
     ticker       TEXT NOT NULL,
     side         TEXT NOT NULL,
     order_type   TEXT,                -- limit|market
@@ -80,7 +81,7 @@ CREATE TABLE IF NOT EXISTS fills (
     qty          REAL,
     price        REAL,
     notional_usd REAL,
-    simulated    INTEGER,             -- 1 for paper-mode simulated fills
+    simulated    INTEGER,             -- 1 for simulated fills (legacy rows)
     FOREIGN KEY (order_id) REFERENCES orders(id)
 );
 
@@ -88,7 +89,7 @@ CREATE TABLE IF NOT EXISTS trades (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ts            TEXT NOT NULL,
     run_id        TEXT,
-    mode          TEXT,                -- paper|preview|live
+    mode          TEXT,                -- recommend|preview|live
     ticker        TEXT NOT NULL,
     side          TEXT,
     qty           REAL,
@@ -172,11 +173,19 @@ def _json(obj: Any) -> str:
 
 
 class Database:
-    """Thin, safe wrapper around the SQLite audit database."""
+    """Thin, safe wrapper around the SQLite audit database.
+
+    Thread-safety: research runs provider calls in worker threads
+    (``asyncio.to_thread``) whose audit callbacks write here while the main
+    thread also logs agent outputs — all on this single connection
+    (``check_same_thread=False``). ``self._lock`` serialises every
+    execute+commit so one thread's commit can never end another's transaction
+    ("cannot commit - no transaction is active")."""
 
     def __init__(self, db_path: str | Path):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
@@ -197,12 +206,13 @@ class Database:
 
     @contextmanager
     def _cursor(self) -> Iterator[sqlite3.Cursor]:
-        cur = self._conn.cursor()
-        try:
-            yield cur
-            self._conn.commit()
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            finally:
+                cur.close()
 
     # -- runs --------------------------------------------------------------
     def start_run(self, run_id: str, mode: str, notes: str = "") -> None:
@@ -460,6 +470,35 @@ class Database:
                 continue
         return out
 
+    # -- explain-mode report history ---------------------------------------
+    def get_explain_reports(self, ticker: str, limit: int = 10) -> list[dict]:
+        """Saved deep-research reports for a ticker, newest first."""
+        with self._cursor() as c:
+            c.execute(
+                """SELECT ts, run_id, output_json FROM agent_outputs
+                   WHERE agent='explain' AND ticker=? ORDER BY ts DESC LIMIT ?""",
+                (ticker.upper(), int(limit)),
+            )
+            rows = c.fetchall()
+        out = []
+        for r in rows:
+            try:
+                report = json.loads(r["output_json"])
+            except Exception:
+                continue
+            out.append({"ts": r["ts"], "run_id": r["run_id"], "report": report})
+        return out
+
+    def get_explain_tickers(self) -> list[str]:
+        """Tickers that have at least one saved deep-research report."""
+        with self._cursor() as c:
+            c.execute(
+                """SELECT ticker, MAX(ts) AS latest FROM agent_outputs
+                   WHERE agent='explain' AND ticker IS NOT NULL
+                   GROUP BY ticker ORDER BY latest DESC"""
+            )
+            return [r["ticker"] for r in c.fetchall()]
+
     def get_latest_scores(self) -> dict[str, float]:
         """Composite scores from the most recent analysis output, by ticker.
 
@@ -500,11 +539,10 @@ class Database:
             )
 
     def trades_today(self) -> int:
-        """Count of orders that transacted today (UTC).
+        """Count of orders that transacted today (UTC) for the daily-trade cap.
 
-        Includes paper-mode ``simulated`` fills so the daily-trade cap is
-        faithfully honoured across repeated paper runs within the same day,
-        exactly as it would be in live mode.
+        The legacy ``simulated`` status is still counted so historical rows keep
+        working; new orders are only ``submitted``/``filled``.
         """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with self._cursor() as c:
