@@ -39,6 +39,7 @@ def _fresh_config(tmp: str):
     config = load_config()
     config.set_mode("explain")
     config.raw.setdefault("discovery", {})["dynamic_discovery"] = False
+    config.raw.setdefault("execution", {})["read_live_account"] = False
     config.raw["storage"]["db_path"] = str(Path(tmp) / "trading.db")
     # Prove universe-independence: research AAPL while it is NOT in the universe.
     config.raw["universe"] = ["MSFT", "NVDA"]

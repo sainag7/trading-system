@@ -9,10 +9,13 @@ requests>=2.31               # Alpha Vantage / FRED HTTP
 yfinance>=0.2.40             # fallback price/fundamental data
 pandas>=2.0                  # data wrangling
 
-# Storage / dashboard
+# Storage
 # (sqlite3 is in the Python stdlib — no dependency needed)
-streamlit>=1.30              # dashboard/app.py
-plotly>=5.18                 # dashboard charts
+
+# Web app (server/ + web/) — the dashboard backend
+fastapi>=0.110               # REST API over the existing backend
+uvicorn>=0.29                # ASGI server (localhost-only)
+sse-starlette>=2.0           # Server-Sent Events for live job logs
 
 # Testing
 pytest>=8.0                  # risk layer unit tests

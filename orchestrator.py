@@ -44,8 +44,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import market
 from config import load_config
 from storage.db import Database
 from data.providers import build_provider
@@ -86,6 +88,36 @@ def _account_summary(acct: AccountState) -> dict:
     }
 
 
+@dataclass
+class CyclePlan:
+    """Everything the pipeline computes up to (and including) the guardrails,
+    with NOTHING executed yet. This is the seam the dashboard uses to show
+    proposed orders for per-order approval before any live send.
+
+    ``approved`` are the guardrail results that passed (approved with shares > 0);
+    ``results`` is every guardrail result (approved / resized / rejected).
+    """
+
+    account: AccountState
+    broker: object | None
+    approved: list = field(default_factory=list)
+    results: list = field(default_factory=list)
+    decision: dict = field(default_factory=dict)
+    monitor_out: dict = field(default_factory=dict)
+    all_intents: list = field(default_factory=list)
+
+
+@dataclass
+class PipelineOutcome:
+    """Result of running the pipeline without executing. Either a ``halted`` run
+    (a gate stopped it — already audited and finished) or a :class:`CyclePlan`."""
+
+    halted: bool
+    plan: "CyclePlan | None" = None
+    halt_reason: str | None = None   # audit-event slug, e.g. "kill_switch_active"
+    halt_message: str | None = None  # human-readable message
+
+
 class Orchestrator:
     def __init__(self, config, *, assume_yes: bool = False, provider=None):
         self.cfg = config
@@ -111,16 +143,18 @@ class Orchestrator:
 
     # -- broker selection --------------------------------------------------
     def _build_broker(self):
-        # preview/live read from (and place to) the real Robinhood MCP.
+        # preview/live read from (and place to) the real Robinhood MCP, scoped to
+        # the active account (defaults to `agentic` for trading modes).
         ex = self.cfg.execution
         return RobinhoodMCPBroker(
             mcp_url=ex.get("mcp_url"), model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
             token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
+            account_number=self.cfg.account_number,
             audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
         )
 
     async def _read_account(self, broker) -> AccountState | None:
-        peak = self.db.get_peak_equity(fallback=0.0)
+        peak = self.db.get_peak_equity(fallback=0.0, account=self.cfg.account_number)
         return await broker.get_account(peak_equity=peak, sectors=self.cfg.sectors)
 
     # -- recommend-mode account (read-only; never trades) ------------------
@@ -131,32 +165,102 @@ class Orchestrator:
         return AccountState(equity=cash, cash=cash, buying_power=cash,
                             peak_equity=cash, positions={})
 
+    def _live_account_enabled(self) -> bool:
+        """Read the real Robinhood account when the config flag is on, or a
+        non-interactive bearer token is configured."""
+        return bool(self.cfg.execution.get("read_live_account", False)
+                    or self.cfg.env("ROBINHOOD_MCP_TOKEN"))
+
+    def _robinhood_broker(self) -> RobinhoodMCPBroker:
+        # Read-only broker for recommend/explain, scoped to the active account
+        # (defaults to `individual` for advice modes).
+        return RobinhoodMCPBroker(
+            mcp_url=self.cfg.execution.get("mcp_url"),
+            model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
+            token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
+            account_number=self.cfg.account_number,
+            audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
+        )
+
     async def _recommend_account(self) -> AccountState:
-        """Use the real Robinhood account READ-ONLY when a token is configured and
-        the read succeeds; otherwise recommend against a hypothetical book.
-        Sets ``self._account_is_real`` so hypothetical numbers are never
-        snapshotted into the P&L/positions tables (keeps the dashboard real)."""
+        """Use the real Robinhood account READ-ONLY when enabled and the read
+        succeeds; otherwise recommend against a hypothetical book. Sets
+        ``self._account_is_real`` so hypothetical numbers are never snapshotted
+        into the P&L/positions tables (keeps the dashboard real)."""
         self._account_is_real = False
-        if self.cfg.env("ROBINHOOD_MCP_TOKEN"):
-            broker = RobinhoodMCPBroker(
-                mcp_url=self.cfg.execution.get("mcp_url"),
-                model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
-                token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
-                audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
-            )
-            acct = await broker.get_account(
-                peak_equity=self.db.get_peak_equity(fallback=0.0), sectors=self.cfg.sectors)
+        if self._live_account_enabled():
+            acct = await self._robinhood_broker().get_account(
+                peak_equity=self.db.get_peak_equity(
+                    fallback=0.0, account=self.cfg.account_number),
+                sectors=self.cfg.sectors)
             if acct is not None:
                 print("   (using your live Robinhood holdings, read-only)")
                 self._account_is_real = True
                 return acct
             self.db.audit(self.run_id, "WARN",
                           "recommend_real_read_failed_fallback_hypothetical", {})
-        print("   (no live account — recommending against a hypothetical book)")
+            print("   (couldn't read Robinhood — falling back to a hypothetical book)")
+        else:
+            print("   (live account read disabled — using a hypothetical book)")
         return self._hypothetical_account()
 
+    # -- autonomous-trading safety gates -----------------------------------
+    def _trading_safety_halt(self, account: AccountState) -> tuple[str, dict, str] | None:
+        """Pre-trade safety checks for preview/live. Returns ``None`` when it is
+        safe to proceed, else ``(audit_event, detail, human_message)`` and the
+        caller HALTS the cycle before any order is proposed or placed.
+
+        Two independent gates, on top of Robinhood's own agentic_allowed server
+        rule and the deterministic guardrails:
+          1. Equity guard — refuse to trade an account that reads RICHER than its
+             configured ceiling (a cheap structural block against mis-routing an
+             order into the large individual account).
+          2. Read sanity — if the account previously held position value but this
+             read shows zero positions, the model-mediated read likely
+             under-reported; skip trading rather than risk over-concentrating a
+             name we already hold. Reads are safe to retry, so re-running is fine.
+        """
+        active = self.cfg.active_account or {}
+        acct_no = self.cfg.account_number
+        guard = active.get("max_equity_guard")
+        if guard is not None and account.equity > float(guard):
+            return (
+                "trading_equity_guard",
+                {"account": acct_no, "equity": round(account.equity, 2),
+                 "max_equity_guard": float(guard)},
+                f"EQUITY GUARD: account {acct_no or 'default'} reads "
+                f"${account.equity:,.2f}, above its ${float(guard):,.2f} ceiling — "
+                "refusing to trade (possible mis-route to the wrong account). "
+                "No orders placed.",
+            )
+        if not account.positions:
+            prior = self.db.prior_pnl_for_account(acct_no, self.run_id)
+            if prior:
+                prior_equity = float(prior.get("equity") or 0.0)
+                prior_pos_value = prior_equity - float(prior.get("cash") or 0.0)
+                if prior_pos_value > max(1.0, 0.02 * prior_equity):
+                    return (
+                        "trading_read_sanity_skip",
+                        {"account": acct_no,
+                         "prior_position_value": round(prior_pos_value, 2),
+                         "this_read_positions": 0},
+                        "READ SANITY: this account previously held "
+                        f"~${prior_pos_value:,.2f} of positions but the current read "
+                        "shows 0 — the account read likely under-reported. Skipping "
+                        "trading this cycle (re-run to retry). No orders placed.",
+                    )
+        return None
+
     # -- main cycle --------------------------------------------------------
-    async def run_cycle(self) -> None:
+    async def build_plan(self) -> PipelineOutcome:
+        """Run the pipeline up to and including the guardrails, executing NOTHING.
+
+        Returns a :class:`PipelineOutcome`: either ``halted`` (a gate stopped the
+        run — it is audited and finished here) or one carrying a :class:`CyclePlan`
+        of guardrail-approved orders. In the non-halt case the run is left OPEN so
+        a later :meth:`execute_approved` (dashboard) or :meth:`run_cycle` (CLI) can
+        finish it. Executing nothing means the dashboard can present the proposed
+        orders for per-order approval before any live send."""
         cfg = self.cfg
         db = self.db
         db.start_run(self.run_id, self.mode,
@@ -169,7 +273,23 @@ class Orchestrator:
             db.audit(self.run_id, "HALT", "kill_switch_active", {"mode": self.mode})
             print("\n🛑 KILL SWITCH ACTIVE — halting all trading. No orders will be placed.")
             db.finish_run(self.run_id)
-            return
+            return PipelineOutcome(
+                halted=True, halt_reason="kill_switch_active",
+                halt_message="Kill switch is active — halting all trading. No orders placed.")
+
+        # 0b) MARKET-DAY gate (trading modes only). The daily schedule fires on
+        # weekdays; skip weekends and NYSE holidays so a firing on a closed market
+        # cleanly no-ops instead of attempting to trade. Advice modes may run any
+        # day, so they are exempt.
+        if self.mode in ("preview", "live") and not market.is_trading_day():
+            db.audit(self.run_id, "INFO", "market_closed_skip",
+                     {"mode": self.mode, "date": market.now_et().date().isoformat()})
+            print("\n📆 Market closed today (weekend/holiday) — no trading. "
+                  "No orders placed.")
+            db.finish_run(self.run_id)
+            return PipelineOutcome(
+                halted=True, halt_reason="market_closed_skip",
+                halt_message="Market is closed today (weekend/holiday) — no trading.")
 
         # Recommend mode reads no broker it could trade through; it uses the real
         # account read-only when connected, else a hypothetical book.
@@ -184,19 +304,39 @@ class Orchestrator:
             db.audit(self.run_id, "ERROR", "account_read_failed", {"mode": self.mode})
             print("❌ Could not read the account from the broker. Aborting cycle.")
             db.finish_run(self.run_id)
-            return
+            return PipelineOutcome(
+                halted=True, halt_reason="account_read_failed",
+                halt_message="Could not read the account from the broker. No orders placed.")
 
         # Snapshot account state up front — REAL accounts only. A hypothetical
         # recommend book must never pollute the P&L/positions tables/dashboard.
+        acct_no = self.cfg.account_number
         if self._account_is_real:
-            db.snapshot_positions(self.run_id, account.positions)
+            db.snapshot_positions(self.run_id, account.positions, account=acct_no)
             db.snapshot_pnl(
                 self.run_id, equity=account.equity, cash=account.cash,
                 buying_power=account.buying_power, peak_equity=account.peak_equity,
-                drawdown_pct=account.drawdown_pct() * 100,
+                drawdown_pct=account.drawdown_pct() * 100, account=acct_no,
             )
+        acct_label = ""
+        if self.cfg.active_account:
+            acct_label = (f" | account {self.cfg.active_account['role']}"
+                          f" ({acct_no or 'default'})")
         print(f"\n📊 Account: equity ${account.equity:,.2f} | cash ${account.cash:,.2f} | "
-              f"positions {account.open_position_count()} | drawdown {account.drawdown_pct()*100:.2f}%")
+              f"positions {account.open_position_count()} | "
+              f"drawdown {account.drawdown_pct()*100:.2f}%{acct_label}")
+
+        # ----- AUTONOMOUS-TRADING SAFETY GATES (trading modes only) -----------
+        # These run before any order is proposed/placed. Recommend/explain never
+        # trade, so they are exempt.
+        if self.mode in ("preview", "live"):
+            halt = self._trading_safety_halt(account)
+            if halt is not None:
+                db.audit(self.run_id, "HALT", halt[0], halt[1])
+                print(f"\n🛑 {halt[2]}")
+                db.finish_run(self.run_id)
+                return PipelineOutcome(halted=True, halt_reason=halt[0],
+                                       halt_message=halt[2])
 
         limits = cfg.risk
         limits_dict = cfg.raw.get("risk", {})
@@ -286,36 +426,73 @@ class Orchestrator:
                 if res.approved and res.approved_shares > 0:
                     approved.append(res)
 
+        # Pipeline complete — hand the guardrail-approved orders back to the
+        # caller. Execution (if any) happens in run_cycle / execute_approved.
+        return PipelineOutcome(halted=False, plan=CyclePlan(
+            account=account, broker=broker, approved=approved, results=results,
+            decision=decision, monitor_out=monitor_out, all_intents=all_intents))
+
+    async def run_cycle(self) -> None:
+        """CLI entry: build the plan, then handle each mode exactly as before —
+        recommend prints advice and stops; preview/live execute the full approved
+        batch (preview confirms per order via the interactive prompt)."""
+        outcome = await self.build_plan()
+        if outcome.halted:
+            return
+        plan = outcome.plan
+
         # =================================================================
         # RECOMMEND MODE — advice only. Emit the report and STOP: no execution,
         # no fills / trades / trade_plans, no account mutation.
         # =================================================================
         if self.mode == "recommend":
-            self._print_recommendations(decision, monitor_out, results)
-            db.finish_run(self.run_id)
+            self._print_recommendations(plan.decision, plan.monitor_out, plan.results)
+            self.db.finish_run(self.run_id)
             print("\n✅ Recommendation run complete — nothing was traded.")
             return
 
-        if not all_intents:
+        if not plan.all_intents:
             print("\n✅ No actions proposed this cycle. Done.")
-            db.finish_run(self.run_id)
+            self.db.finish_run(self.run_id)
             return
 
-        if not approved:
+        if not plan.approved:
             print("\n✅ Nothing cleared the guardrails. No orders sent.")
-            db.finish_run(self.run_id)
+            self.db.finish_run(self.run_id)
             return
 
         # =================================================================
         # EXECUTION
         # =================================================================
-        await self._execute(broker, approved, account)
+        await self._execute(plan.broker, plan.approved, plan.account)
 
         # Post-execution: refresh positions, summarise the run, send the digest.
-        await self._finalize_run(broker)
+        await self._finalize_run(plan.broker)
 
-        db.finish_run(self.run_id)
+        self.db.finish_run(self.run_id)
         print(f"\n✅ Cycle complete (run_id={self.run_id}, mode={self.mode}).")
+
+    async def execute_approved(self, plan: CyclePlan, approved_subset: list, *,
+                               confirm_callback=None) -> None:
+        """Place a user-approved SUBSET of a plan's guardrail-approved orders,
+        then refresh positions, summarise and finish the run.
+
+        Used by the dashboard AFTER per-order approval. The caller must have
+        already gathered any live confirmation (construct the Orchestrator with
+        ``assume_yes=True``); ``confirm_callback`` may auto-approve the per-order
+        preview confirmation since the UI already collected the user's choice.
+        Every order still re-checks the kill switch inside the Executor and only
+        guardrail-approved intents can appear in ``approved_subset``."""
+        await self._execute(plan.broker, approved_subset, plan.account,
+                            confirm_callback=confirm_callback)
+        await self._finalize_run(plan.broker)
+        self.db.finish_run(self.run_id)
+
+    def discard_plan(self) -> None:
+        """Abandon a built-but-unexecuted plan and close its run (dashboard
+        'cancel' after previewing proposed orders)."""
+        self.db.audit(self.run_id, "INFO", "plan_discarded", {})
+        self.db.finish_run(self.run_id)
 
     # =====================================================================
     # EXPLAIN MODE — single-ticker deep research. READ-ONLY: no discovery,
@@ -366,14 +543,8 @@ class Orchestrator:
     async def _position_context(self, ticker: str) -> dict | None:
         """READ-ONLY position context: real holdings (if connected) + stored plan."""
         position: dict | None = None
-        if self.cfg.env("ROBINHOOD_MCP_TOKEN"):
-            broker = RobinhoodMCPBroker(
-                mcp_url=self.cfg.execution.get("mcp_url"),
-                model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
-                token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
-                audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
-            )
-            acct = await broker.get_account(
+        if self._live_account_enabled():
+            acct = await self._robinhood_broker().get_account(
                 peak_equity=self.db.get_peak_equity(fallback=0.0), sectors=self.cfg.sectors)
             if acct is not None:
                 held = acct.positions.get(ticker)
@@ -506,13 +677,15 @@ class Orchestrator:
         print(f"\n  {report.get('disclaimer', '')}")
 
     # -- execution ---------------------------------------------------------
-    async def _execute(self, broker, approved, start_account: AccountState) -> None:
+    async def _execute(self, broker, approved, start_account: AccountState, *,
+                       confirm_callback=None) -> None:
         if self.mode == "live" and not self.assume_yes:
             self._live_warning()
 
         executor = Executor(
             broker=broker, mode=self.mode, db=self.db, run_id=self.run_id,
             exec_cfg=self.cfg.execution, kill_switch_check=self.kill_switch_active,
+            confirm_callback=confirm_callback,
         )
         verb = {"preview": "Previewing", "live": "PLACING LIVE"}[self.mode]
         print(f"\n💸 {verb} {len(approved)} order(s):")
@@ -544,11 +717,12 @@ class Orchestrator:
         """Refresh the positions table from the broker, summarise, and notify."""
         account = await self._read_account(broker)
         if account is not None:
-            self.db.snapshot_positions(self.run_id, account.positions)
+            acct_no = self.cfg.account_number
+            self.db.snapshot_positions(self.run_id, account.positions, account=acct_no)
             self.db.snapshot_pnl(
                 self.run_id, equity=account.equity, cash=account.cash,
                 buying_power=account.buying_power, peak_equity=account.peak_equity,
-                drawdown_pct=account.drawdown_pct() * 100,
+                drawdown_pct=account.drawdown_pct() * 100, account=acct_no,
             )
         summary = self.db.get_run_summary(self.run_id)
         print("\n📋 Run summary: "
@@ -627,7 +801,7 @@ class Orchestrator:
 
         if holds or passes:
             print(f"\n  Hold: {len(holds)}   Pass: {len(passes)}")
-        print("\n  Full ranked view + history:  streamlit run dashboard/app.py")
+        print("\n  Full ranked view + history:  open the dashboard (./start.command)")
 
     # -- intent construction ----------------------------------------------
     def _ref_price(self, ticker: str, fallback: float | None) -> float:
@@ -763,6 +937,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--profile", default=None,
                     help="strategy profile from config.yaml strategy_profiles "
                          "(e.g. swing, momentum; default: config `profile:`, i.e. swing)")
+    ap.add_argument("--account", default=None,
+                    help="brokerage account role from config.yaml accounts: "
+                         "(e.g. individual, agentic). Default: individual for "
+                         "recommend/explain, agentic for preview/live.")
     ap.add_argument("--config", default=None, help="path to config.yaml")
     ap.add_argument("--yes", action="store_true",
                     help="skip the interactive LIVE confirmation (use with care)")
@@ -790,6 +968,27 @@ def main() -> None:
         config.apply_profile(args.profile or config.profile)
     except ValueError as e:
         raise SystemExit(f"error: {e}")
+
+    # Select the brokerage account for this run (multi-account routing). Advice
+    # modes default to `individual`, trading modes to `agentic`, so autonomous
+    # orders never touch the individual book. When no accounts: block is
+    # configured the system stays single-account (MCP default). The per-account
+    # risk overlay is applied here, so it must run AFTER apply_profile.
+    role = args.account
+    if role is None and config.accounts:
+        role = "agentic" if config.mode in ("preview", "live") else "individual"
+    if role:
+        try:
+            active = config.apply_account(role)
+        except ValueError as e:
+            raise SystemExit(f"error: {e}")
+        number = active.get("number")
+        if config.mode in ("preview", "live") and (
+                not number or str(number).startswith("YOUR_")):
+            raise SystemExit(
+                f"error: account role {role!r} has no real account number configured "
+                "(set accounts.<role>.number in config.local.yaml) — refusing to "
+                "trade without an explicit account.")
 
     orch = Orchestrator(config, assume_yes=args.yes)
 

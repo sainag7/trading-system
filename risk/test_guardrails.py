@@ -492,6 +492,22 @@ def test_fractional_shares_allowed():
     assert res.approved_shares == pytest.approx(2.5)
 
 
+def test_fractional_buy_quantized_to_8_decimals():
+    # Reproduces the live rejection: 24.77 / 333.07 = 0.07439590524937507 (17 dp);
+    # Robinhood rejects a quantity with more than 8 decimal places.
+    from decimal import Decimal
+    res = validate_order(buy(usd=24.77, price=333.07),
+                         account(equity=100_000, cash=100_000),
+                         default_limits(per_trade_max_usd=25, min_trade_usd=1,
+                                        allow_fractional_shares=True))
+    assert res.approved
+    decimals = -Decimal(str(res.approved_shares)).as_tuple().exponent
+    assert decimals <= 8, res.approved_shares
+    # Floored (never up) and the notional is recomputed to match the tradeable size.
+    assert res.approved_shares <= 24.77 / 333.07 + 1e-12
+    assert res.approved_usd == pytest.approx(res.approved_shares * 333.07)
+
+
 def test_whole_shares_floor_when_fractional_disabled():
     res = validate_order(buy(usd=250, price=100), account(equity=100_000, cash=100_000),
                          default_limits(per_trade_max_usd=10_000, allow_fractional_shares=False))

@@ -361,6 +361,15 @@ async def run_research(
     Returns objects in the same order as ``universe``. The Alpha Vantage throttle
     becomes approximate under concurrency, but the daily-budget cap + yfinance
     fallback still protect the quota."""
+    # A Robinhood-backed provider batch-fetches the whole universe (plus the
+    # sector-trend ETFs) up front, so the per-ticker reads below hit its store
+    # instead of spending Alpha Vantage quota. No-op for the plain provider.
+    if hasattr(provider, "prefetch"):
+        etfs = sorted(set(SECTOR_ETF.values()))
+        try:
+            await provider.prefetch(list(universe) + etfs)
+        except Exception:
+            pass
     macro = await asyncio.to_thread(provider.get_macro)
     sector_trends: dict = {}  # memoised sector-ETF trends (DiskCache dedupes fetches)
     sem = asyncio.Semaphore(max(1, int(concurrency)))

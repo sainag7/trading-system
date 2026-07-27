@@ -462,9 +462,13 @@ def validate_order(
     ))
 
     # Convert to shares (honour the fractional-shares setting) BEFORE the
-    # cap checks, since flooring can only reduce the notional.
+    # cap checks, since flooring can only reduce the notional. Fractional shares
+    # are floored to 8 decimals — the broker (Robinhood) rejects a quantity with
+    # more than 8 decimal places — and the notional is recomputed to match, so the
+    # recorded decision and the cap checks below use the exact tradeable size.
     if limits.allow_fractional_shares:
-        approved_shares = approved_usd / price
+        approved_shares = math.floor(approved_usd / price * 1e8) / 1e8
+        approved_usd = approved_shares * price
     else:
         approved_shares = math.floor(approved_usd / price)
         approved_usd = approved_shares * price

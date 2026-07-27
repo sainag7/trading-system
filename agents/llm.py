@@ -76,20 +76,23 @@ async def generate_text(
     mcp_servers: dict | None = None,
     allowed_tools: list[str] | None = None,
     max_turns: int = 1,
+    setting_sources: list[str] | None = None,
 ) -> str | None:
     """Return the model's text output, or ``None`` if no backend is available.
 
     When ``mcp_servers`` is supplied the Agent SDK is used so the model can call
-    those MCP tools (e.g. the Robinhood Trading MCP). For tool-using flows pass a
-    larger ``max_turns``.
+    those MCP tools. When ``setting_sources`` is supplied (e.g. ``["local"]``)
+    the SDK **inherits Claude Code's configured MCP servers** — this is how the
+    Robinhood Trading MCP is reached: its OAuth is held by Claude Code, so we let
+    the SDK pick up the connected ``robinhood-trading`` server rather than passing
+    a token. For tool-using flows pass a larger ``max_turns``.
 
-    Speed: for pure text-in/JSON-out agents (``mcp_servers is None``) the
-    lightweight Anthropic Messages API is used FIRST — it is far faster than the
-    Agent SDK, which spins up a full agent runtime per call. The SDK is reserved
-    for MCP flows (and used as a fallback when no API key is configured).
+    Speed: pure text-in/JSON-out agents (no MCP, no inheritance) use the
+    lightweight Anthropic Messages API FIRST — far faster than the Agent SDK.
     """
+    force_sdk = mcp_servers is not None or setting_sources is not None
     # Pure agents: prefer the fast Messages API.
-    if mcp_servers is None and _anthropic_available():
+    if not force_sdk and _anthropic_available():
         text = await _via_anthropic(system_prompt, user_prompt, model)
         if text is not None:
             return text
@@ -98,9 +101,10 @@ async def generate_text(
         return await _via_agent_sdk(
             system_prompt, user_prompt, model,
             mcp_servers=mcp_servers, allowed_tools=allowed_tools, max_turns=max_turns,
+            setting_sources=setting_sources,
         )
     # Last resort (e.g. MCP requested but SDK unavailable): try the API anyway.
-    if _anthropic_available():
+    if not force_sdk and _anthropic_available():
         return await _via_anthropic(system_prompt, user_prompt, model)
     return None
 
@@ -108,6 +112,7 @@ async def generate_text(
 async def _via_agent_sdk(
     system_prompt: str, user_prompt: str, model: str, *,
     mcp_servers: dict | None, allowed_tools: list[str] | None, max_turns: int,
+    setting_sources: list[str] | None = None,
 ) -> str | None:
     try:
         from claude_agent_sdk import query, ClaudeAgentOptions
@@ -119,8 +124,9 @@ async def _via_agent_sdk(
             max_turns=max_turns,
             allowed_tools=allowed_tools or [],
             mcp_servers=mcp_servers or {},
-            # Don't pull in this repo's CLAUDE.md / settings; keep the agent pure.
-            setting_sources=[],
+            # Inherit Claude Code's config (for the OAuth'd Robinhood MCP) ONLY when
+            # asked; otherwise stay pure. Only be strict when we pass explicit servers.
+            setting_sources=setting_sources if setting_sources is not None else [],
             strict_mcp_config=bool(mcp_servers),
             permission_mode="default",
         )
@@ -192,6 +198,7 @@ async def generate_json(
     mcp_servers: dict | None = None,
     allowed_tools: list[str] | None = None,
     max_turns: int = 1,
+    setting_sources: list[str] | None = None,
 ) -> tuple[Any | None, str | None]:
     """Generate and parse JSON. Returns ``(parsed_or_None, raw_text_or_None)``."""
     user_prompt = (
@@ -201,5 +208,6 @@ async def generate_json(
     raw = await generate_text(
         system_prompt, user_prompt, model,
         mcp_servers=mcp_servers, allowed_tools=allowed_tools, max_turns=max_turns,
+        setting_sources=setting_sources,
     )
     return extract_json(raw), raw

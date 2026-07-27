@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS positions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT NOT NULL,
     run_id       TEXT,
+    account      TEXT,                -- brokerage account number (multi-account); NULL=legacy/single
     ticker       TEXT NOT NULL,
     shares       REAL,
     avg_cost     REAL,
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS pnl (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT NOT NULL,
     run_id       TEXT,
+    account      TEXT,                -- brokerage account number (multi-account); NULL=legacy/single
     equity       REAL,
     cash         REAL,
     buying_power REAL,
@@ -194,7 +196,9 @@ class Database:
 
     def _migrate(self) -> None:
         """Add columns introduced after the initial schema (no-op if present)."""
-        for table, col, decl in [("trade_plans", "thesis", "TEXT")]:
+        for table, col, decl in [("trade_plans", "thesis", "TEXT"),
+                                  ("positions", "account", "TEXT"),
+                                  ("pnl", "account", "TEXT")]:
             try:
                 with self._cursor() as c:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -385,24 +389,27 @@ class Database:
         }
 
     # -- positions / pnl ---------------------------------------------------
-    def snapshot_positions(self, run_id: str, positions: dict) -> None:
+    def snapshot_positions(self, run_id: str, positions: dict,
+                           account: str | None = None) -> None:
         with self._cursor() as c:
             for p in positions.values():
                 c.execute(
-                    """INSERT INTO positions(ts, run_id, ticker, shares, avg_cost,
-                       market_value, sector) VALUES (?,?,?,?,?,?,?)""",
-                    (_now(), run_id, p.ticker, p.shares, p.avg_cost,
+                    """INSERT INTO positions(ts, run_id, account, ticker, shares,
+                       avg_cost, market_value, sector) VALUES (?,?,?,?,?,?,?,?)""",
+                    (_now(), run_id, account, p.ticker, p.shares, p.avg_cost,
                      p.market_value, p.sector),
                 )
 
     def snapshot_pnl(self, run_id: str, *, equity: float, cash: float,
                      buying_power: float, peak_equity: float, drawdown_pct: float,
-                     realized_pnl: float = 0.0, unrealized_pnl: float = 0.0) -> None:
+                     realized_pnl: float = 0.0, unrealized_pnl: float = 0.0,
+                     account: str | None = None) -> None:
         with self._cursor() as c:
             c.execute(
-                """INSERT INTO pnl(ts, run_id, equity, cash, buying_power, peak_equity,
-                   drawdown_pct, realized_pnl, unrealized_pnl) VALUES (?,?,?,?,?,?,?,?,?)""",
-                (_now(), run_id, equity, cash, buying_power, peak_equity,
+                """INSERT INTO pnl(ts, run_id, account, equity, cash, buying_power,
+                   peak_equity, drawdown_pct, realized_pnl, unrealized_pnl)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (_now(), run_id, account, equity, cash, buying_power, peak_equity,
                  drawdown_pct, realized_pnl, unrealized_pnl),
             )
 
@@ -522,10 +529,33 @@ class Database:
         except Exception:
             return {}
 
-    def get_peak_equity(self, fallback: float) -> float:
-        """Highest equity ever recorded in the pnl table (for drawdown calc)."""
+    def prior_pnl_for_account(self, account: str | None, exclude_run_id: str) -> dict | None:
+        """The most recent pnl snapshot for ``account`` from a run OTHER than
+        ``exclude_run_id`` (used by the read-sanity gate to compare the current
+        read against the account's last known state before this run's snapshot)."""
         with self._cursor() as c:
-            c.execute("SELECT MAX(MAX(equity, peak_equity)) AS peak FROM pnl")
+            if account is not None:
+                c.execute("SELECT equity, cash FROM pnl WHERE account = ? AND run_id != ? "
+                          "ORDER BY id DESC LIMIT 1", (account, exclude_run_id))
+            else:
+                c.execute("SELECT equity, cash FROM pnl WHERE run_id != ? "
+                          "ORDER BY id DESC LIMIT 1", (exclude_run_id,))
+            row = c.fetchone()
+        return dict(row) if row else None
+
+    def get_peak_equity(self, fallback: float, account: str | None = None) -> float:
+        """Highest equity ever recorded in the pnl table (for drawdown calc).
+
+        When ``account`` is given the high-water mark is scoped to THAT account,
+        so each brokerage account has its own peak — the agentic account's
+        drawdown halt is never computed against the (much larger) individual
+        account's equity history, and vice versa."""
+        with self._cursor() as c:
+            if account is not None:
+                c.execute("SELECT MAX(MAX(equity, peak_equity)) AS peak FROM pnl "
+                          "WHERE account = ?", (account,))
+            else:
+                c.execute("SELECT MAX(MAX(equity, peak_equity)) AS peak FROM pnl")
             row = c.fetchone()
         peak = row["peak"] if row and row["peak"] is not None else None
         return max(peak, fallback) if peak is not None else fallback

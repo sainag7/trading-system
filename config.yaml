@@ -201,6 +201,16 @@ research:
 data:
   cache_dir: ".cache"
   cache_ttl_minutes: 1440            # reuse cached data for 24h (daily cadence)
+  # Use your connected Robinhood Trading MCP for market data (quotes / daily
+  # series / fundamentals) instead of Alpha Vantage — it is real-time and
+  # quota-free, so the 25/day AV cap stops biting. Alpha Vantage is then used
+  # ONLY for news sentiment (Robinhood has no news tool); FRED still supplies
+  # macro. Falls back to AV/yfinance on any Robinhood miss. Requires the
+  # robinhood-trading MCP connected in Claude Code (OAuth). Turn off to use the
+  # pure Alpha-Vantage/yfinance path (identical to before).
+  use_robinhood_data: true
+  robinhood_data_model: "claude-haiku-4-5-20251001"   # cheap model for the batched data reads
+  robinhood_historical_days: 400     # calendar days pulled (covers a 260-trading-day lookback)
   alphavantage:
     daily_request_budget: 25         # free-tier hard cap; provider self-throttles
     min_seconds_between_calls: 13    # ~5 calls/min on free tier
@@ -217,6 +227,53 @@ execution:
   limit_slippage_pct: 0.005          # place limit 0.5% above ask (buy) / below bid (sell)
   max_order_retries: 2               # retries for *submission* errors only, never blind re-fills
   retry_backoff_seconds: 5
+  # Read your REAL Robinhood holdings (READ-ONLY) in recommend/explain modes, so
+  # advice + verdicts are position-aware (hold/trim/sell/add for names you own).
+  # Requires the robinhood-trading MCP connected in Claude Code (OAuth). Adds one
+  # slower MCP call per run; turn off to always use the hypothetical book.
+  # Trading still only happens in preview/live — this flag never places an order.
+  read_live_account: true
+
+# ----------------------------------------------------------------------------
+# BROKERAGE ACCOUNTS (multi-account routing)
+# Robinhood exposes multiple accounts under one login; every per-account MCP
+# tool (get_portfolio, get_equity_positions, place_equity_order, …) takes an
+# account number. Roles below map a friendly name to an account number and to a
+# behaviour:
+#   individual : ADVICE ONLY — read read-only for recommend/explain.
+#   agentic    : AUTONOMOUS TRADING — the small book the agents actually trade.
+# Advice modes (recommend/explain) default to `individual`; trading modes
+# (preview/live) default to `agentic`, so autonomous trades never touch the
+# individual book. Override per run with `--account {individual,agentic}`.
+#
+# Put your REAL account numbers in config.local.yaml (gitignored), not here.
+# Find them in the Robinhood app (Account → account number) or via get_accounts.
+#
+# SAFETY (three independent backstops against trading the wrong account):
+#   1. Robinhood only permits agent/automated orders on an account flagged
+#      agentic_allowed=true; place_equity_order is REJECTED server-side otherwise.
+#   2. place_equity_order REQUIRES an explicit account number — orders can never
+#      silently fall through to a default account.
+#   3. `max_equity_guard`: this system refuses to place ANY order when the target
+#      account reads richer than the ceiling — so a misroute to a large account
+#      cannot place a trade locally either.
+# ----------------------------------------------------------------------------
+accounts:
+  individual:
+    number: "YOUR_INDIVIDUAL_ACCT_NUMBER"   # ~$3k book — advice only (agentic_allowed=false)
+  agentic:
+    number: "YOUR_AGENTIC_ACCT_NUMBER"      # ~$100 "Agentic" book — autonomous (agentic_allowed=true)
+    max_equity_guard: 500                   # refuse to trade if this account reads > $500 (anti-misroute)
+    # Per-account risk overrides for the small sandbox book, deep-merged over the
+    # base risk: block above FOR AGENTIC RUNS ONLY. The individual account always
+    # uses the strict base limits unchanged. These make a $100 book tradable
+    # (the base $50 min-trade would otherwise reject every order) while keeping
+    # every percentage ceiling explicit.
+    risk:
+      min_trade_usd: 1          # allow small/fractional orders (a floor, not a risk ceiling)
+      per_trade_max_usd: 25     # cap any single order (far tighter than the base $500)
+      max_position_pct: 0.34    # allow a few concentrated momentum names on a tiny book
+      max_positions: 5          # momentum: few, fast names
 
 # ----------------------------------------------------------------------------
 # Recommend mode: when no real account is connected, recommendations are sized

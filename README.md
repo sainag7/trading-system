@@ -65,7 +65,9 @@ it is the one component you can fully unit-test and trust.
 | [execution/executor.py](execution/executor.py) | Robinhood MCP broker + idempotent order lifecycle + retries |
 | [data/providers.py](data/providers.py) | Alpha Vantage / yfinance / FRED with caching + rate limits |
 | [storage/db.py](storage/db.py) | SQLite: trades, agent_outputs, positions, pnl, audit_log |
-| [dashboard/app.py](dashboard/app.py) | Streamlit view of scores, positions, P&L, decision log |
+| [server/](server/) | FastAPI backend for the web dashboard (over the same Python backend) |
+| [web/](web/) | React dashboard frontend (built to `web/dist`, served by the server) |
+| [start.command](start.command) | One-click launcher: build + serve the dashboard on localhost |
 | [recommend_check.py](recommend_check.py) | Offline end-to-end pipeline check (no keys needed) |
 
 ---
@@ -81,7 +83,7 @@ cp .env.example .env        # then fill in your keys
 ```
 
 > **Run everything from the SAME environment you install into.** If you create a
-> `.venv`, `pip install` into it AND run `python orchestrator.py` / `streamlit run`
+> `.venv`, `pip install` into it AND run `python orchestrator.py` / the dashboard
 > from that same activated venv. A common gotcha: installing in a venv but running
 > from a different (e.g. anaconda base) Python — the deps won't be found and you'll
 > get a degraded run (see below).
@@ -138,9 +140,44 @@ python orchestrator.py --mode live
 python orchestrator.py --mode live --yes     # skip the typed confirmation
 ```
 
-View recommendations in the dashboard: `streamlit run dashboard/app.py` (the top
-section shows the latest advice; equity/positions appear once your real account
-is connected).
+View recommendations in the dashboard: double-click `start.command` (or run
+`uvicorn server.app:app` — see [Dashboard](#dashboard-web-app)). You can also run
+scans, deep research, and preview/live trades right from the dashboard.
+
+### Two accounts (`--account`, advice vs. autonomous)
+
+Robinhood exposes multiple accounts under one login; every per-account MCP tool
+takes an account number. Map friendly roles in `config.yaml → accounts:` (put the
+real numbers in the gitignored `config.local.yaml`):
+
+| Role | Typical use | Default mode |
+|------|-------------|--------------|
+| `individual` | Your main book — **advice only** | `recommend` / `explain` |
+| `agentic` | A small book the agents **trade autonomously** | `preview` / `live` |
+
+`--account` selects the account for a run. Advice modes default to `individual`,
+trading modes to `agentic`, so **autonomous orders never touch your main book**:
+
+```bash
+python orchestrator.py --mode recommend --account individual   # advice on the big book
+python orchestrator.py --mode live --yes --profile momentum --account agentic   # trade the small book
+```
+
+The `agentic` role also carries a **per-account risk overlay** (`accounts.agentic.risk`)
+so a small book is actually tradable (e.g. `min_trade_usd: 1`) — deep-merged over
+the base `risk:` for agentic runs only; the individual account keeps the strict
+base limits. Three independent backstops prevent trading the wrong account:
+
+1. **Robinhood** only permits agent orders on an account flagged
+   `agentic_allowed=true` (rejects others server-side).
+2. `place_equity_order` **requires** an explicit account number (no silent default).
+3. **`accounts.agentic.max_equity_guard`** — this system refuses to place any
+   order when the target account reads richer than the ceiling (default $500), so
+   a mis-route to a large account can't trade locally either.
+
+Each account keeps its **own** equity history / drawdown high-water mark, and a
+**read-sanity gate** skips a live cycle if the (model-mediated) account read looks
+like it under-reported holdings — so a bad read never trades on stale positions.
 
 ### Strategy profiles (`--profile`, orthogonal to `--mode`)
 
@@ -287,34 +324,75 @@ P&L rows are ever written by recommend mode.
 
 ---
 
-## Dashboard
+## Dashboard (web app)
 
-```bash
-streamlit run dashboard/app.py
+The dashboard is a local web app — a FastAPI server (`server/`) over the existing
+Python backend, serving a React frontend (`web/`). **Zero terminal needed:**
+
+```
+double-click  start.command      # macOS: builds if needed, starts the server, opens your browser
 ```
 
-An interactive control center with four tabs — **Ideas** (recommendations with
-score bars + click-through "why this stock" drill-down), **Portfolio**
-(equity/positions once your real account is connected), **Settings**, and
-**Activity** (decision/guardrail log, orders, fills, audit log).
+Or run it directly:
 
-- **Run scans from the sidebar** — pick a profile (swing/momentum) and hit Run.
-  A live log streams while the scan runs and results refresh automatically.
-- **Run deep research from the Deep dive tab** — type any ticker and hit
-  🔎 Research to generate a full briefing without the CLI.
-- Both launchers execute **read-only modes only** (`recommend` / `explain`,
-  hardcoded): the dashboard can never place a trade. Preview/live remain CLI-only.
-- **Kill switch** — engage from the sidebar (creates the `KILL_SWITCH` file,
-  halting all trading instantly); release requires a confirm.
-- **Settings** — edits everything including the hard risk limits (those require
-  an explicit confirmation). Changes are written to **`config.local.yaml`**
-  (gitignored, machine-managed) and merged over `config.yaml` at load time, so
-  your commented base config is never rewritten. "Reset all overrides" deletes
-  the overlay. API keys stay in `.env`, never in the dashboard.
+```bash
+.venv/bin/python -m uvicorn server.app:app --host 127.0.0.1 --port 8000
+# then open http://127.0.0.1:8000   (stop.command, or Ctrl+C, stops it)
+```
+
+It binds to **localhost only** — it can place real orders, so it is never exposed
+off-host. The `start.command` builds the frontend on first run (needs Node 18+).
+
+Eight sections, everything runnable from the UI:
+
+- **Overview** — status, last run, quick actions, top ideas.
+- **Ideas** — ranked recommendations with score bars + a per-stock "why" drawer
+  (technicals / fundamentals / news / scoring / guardrail).
+- **Deep dive** — research any ticker (read-only briefing); researched tickers can
+  be **removed** with the ✕ (reversible — restore from "Removed tickers").
+- **Portfolio** — equity curve, positions, sector allocation, per-account.
+- **Trade** — **plan → approve each order → place**, or **one-click live** after a
+  typed confirmation. Every order still passes the guardrails and re-checks the
+  kill switch; trading modes route to the `agentic` account by default.
+- **Automation** — install/remove the daily launchd schedule and run diagnostics.
+- **Activity** — decisions/orders/fills/audit, with friendly timestamps.
+- **Settings** — the full config editor (strategy, weights, universe + sectors,
+  discovery, models, data, execution, accounts, notifications, and the hard risk
+  limits behind a confirmation). Edits write **`config.local.yaml`** (gitignored,
+  merged over `config.yaml` at load); "Reset all overrides" deletes the overlay.
+  API keys stay in `.env`, never in the dashboard.
+
+A **kill switch** toggle (top bar) engages/releases the `KILL_SWITCH` file for an
+instant halt. Long actions stream a **live log** in a docked panel.
+
+The old Streamlit app (`dashboard/`) has been superseded by this web app.
 
 ---
 
 ## Data & rate limits
+
+### Robinhood market data (default) — no Alpha Vantage quota for prices/fundamentals
+
+With `data.use_robinhood_data: true` (the default), the system pulls **quotes,
+daily OHLCV series, and fundamentals** from your connected **Robinhood Trading
+MCP** — real-time and quota-free. [data/robinhood_provider.py](data/robinhood_provider.py)
+wraps the classic provider and **batch-fetches the whole universe once per run**
+(a handful of multi-symbol MCP calls), so per-ticker reads hit an in-memory store.
+Fundamentals Robinhood doesn't expose (operating margin, debt/equity, free cash
+flow, beta, next-earnings date, company name) are still filled from `yfinance`;
+`revenue_ttm / growth / margins / P-S / EPS` are computed from Robinhood's
+quarterly `get_financials`. On **any** Robinhood miss it falls back to the path
+below, so behaviour degrades gracefully.
+
+Robinhood has **no news or macro tool**, so:
+- **News sentiment** still uses **Alpha Vantage** (now ~1 call/ticker — far under
+  the cap, since quotes/series/fundamentals no longer touch AV).
+- **Macro** (rates/CPI/unemployment) still uses **FRED**.
+
+Set `use_robinhood_data: false` to use the pure Alpha-Vantage/yfinance path below
+(identical to before) — the switch is fully reversible.
+
+### Alpha Vantage / yfinance fallback
 
 The Alpha Vantage free tier is **25 requests/day**. `data/providers.py` defends
 the quota three ways:
@@ -394,25 +472,38 @@ layer (Robinhood, live/preview) uses the Agent SDK + MCP.
 
 ## Scheduling a daily run
 
-This is a daily-cadence system; run it once per trading day (e.g. shortly after
-the open or near the close). Runs are **single-shot and idempotent** — there is
-no daemon; schedule them with cron:
+This is a daily-cadence system; run it **once per trading day** (e.g. ~30–60 min
+after the open, so the opening auction settles). Runs are **single-shot and
+idempotent** — there is no daemon. A **market-day gate** (`market.py`) makes any
+weekend/NYSE-holiday firing a clean no-op for trading modes, so it is safe to
+schedule on every weekday.
 
-```cron
-# Swing ideas every weekday morning (9:45 ET)
-45 9 * * 1-5   cd /path/to/trading-system && .venv/bin/python orchestrator.py --mode recommend >> run.log 2>&1
+### macOS launchd (recommended)
 
-# Momentum quick-profit scan near the close (15:30 ET) — or use `* * 1`/`* * 1,3,5`
-# for weekly / Mon-Wed-Fri cadence
-30 15 * * 1-5  cd /path/to/trading-system && .venv/bin/python orchestrator.py --profile momentum --mode recommend >> momentum.log 2>&1
+```bash
+./scheduling/install.sh                 # individual advice job (read-only), 10:00 local weekdays
+./scheduling/install.sh --enable-live   # ALSO schedule autonomous $100 trading — commission first!
+./scheduling/uninstall.sh               # stop all scheduled runs
 ```
+
+See [scheduling/README.md](scheduling/README.md) for the timezone caveat, logs,
+and a cron alternative. Before enabling the live job, **commission it once**:
+
+```bash
+# Supervised: proposes an order on the $100 book and asks y/N before placing.
+python orchestrator.py --mode preview --profile momentum --account agentic
+```
+
+Confirm a single small order lands in the Agentic account, then
+`install.sh --enable-live`.
 
 Repeated runs are safe by construction: `recommend` writes only advice (zero
 trading side effects); in preview/live the `daily_max_trades` budget is shared
 across profiles, held names are never re-bought as fresh positions (the decision
 agent sees your positions; position/sector caps bound adds), and the executor's
-idempotency key prevents double-submitting an order. Each position's exit plan
-is stored at entry, so mixing profiles across runs never mixes up exits.
+idempotency key (plus the MCP `ref_id`) prevents double-submitting an order. Each
+position's exit plan is stored at entry, so mixing profiles across runs never
+mixes up exits.
 
 Promote to `--mode preview` only once you trust the recommendations, and to
 `--mode live` only with eyes open and the kill switch within reach.

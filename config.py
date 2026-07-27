@@ -121,6 +121,54 @@ class Config:
                 self.raw[key] = _deep_merge(self.raw.get(key, {}), overlay[key])
         self.raw["profile"] = name
 
+    # -- brokerage accounts (multi-account routing) ------------------------
+    @property
+    def accounts(self) -> dict[str, Any]:
+        """The configured ``accounts:`` block (role -> account settings)."""
+        return self.raw.get("accounts", {})
+
+    def apply_account(self, role: str) -> dict[str, Any]:
+        """Select the active brokerage account by role (``individual`` /
+        ``agentic``) for this run and overlay its per-account ``risk`` overrides
+        onto the base ``risk:`` block.
+
+        Unlike a strategy profile, a per-account risk overlay MAY tune the hard
+        limits — that is its whole purpose (a $100 sandbox book needs a smaller
+        ``min_trade_usd`` to trade at all). The overlay applies only to the
+        selected account's run; the other account keeps the strict base limits.
+
+        Returns the resolved active-account dict; raises on an unknown role.
+        """
+        role = str(role).lower()
+        accts = self.accounts
+        if role not in accts:
+            raise ValueError(
+                f"Unknown account role {role!r}; configured accounts: {tuple(accts)}"
+            )
+        acct = dict(accts[role] or {})
+        overlay = acct.get("risk") or {}
+        if overlay:
+            self.raw["risk"] = _deep_merge(self.raw.get("risk", {}), overlay)
+        number = str(acct.get("number") or "").strip() or None
+        active = {
+            "role": role,
+            "number": number,
+            "max_equity_guard": acct.get("max_equity_guard"),
+        }
+        self.raw["_active_account"] = active
+        return active
+
+    @property
+    def active_account(self) -> dict[str, Any] | None:
+        """The account selected via :meth:`apply_account`, or ``None`` when the
+        system is running single-account (no ``accounts:`` block / no selection)."""
+        return self.raw.get("_active_account")
+
+    @property
+    def account_number(self) -> str | None:
+        """Account number of the active account, or ``None`` (single-account)."""
+        return (self.active_account or {}).get("number")
+
     @property
     def kill_switch_enabled(self) -> bool:
         """True if the config flag is set OR the kill-switch file exists."""

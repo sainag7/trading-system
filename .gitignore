@@ -22,6 +22,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Web dashboard build artifacts
+web/node_modules/
+web/dist/
+
 # OS / editor
 .DS_Store
 .idea/

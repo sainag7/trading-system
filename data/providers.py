@@ -584,4 +584,15 @@ def build_provider(config, audit=None) -> DataProvider:
         fred_api_key=config.env("FRED_API_KEY"),
         sector_overrides=config.sectors,
     )
-    return DataProvider(pcfg, audit=audit)
+    inner = DataProvider(pcfg, audit=audit)
+    # When enabled, front the Alpha-Vantage/yfinance provider with Robinhood's
+    # real-time, quota-free market data for quotes/series/fundamentals. Alpha
+    # Vantage is left only for news sentiment (Robinhood has no news tool); FRED
+    # still supplies macro. Falls back to `inner` on any Robinhood miss.
+    if data_cfg.get("use_robinhood_data", False):
+        from data.robinhood_provider import RobinhoodDataProvider
+        model = data_cfg.get("robinhood_data_model", "claude-haiku-4-5-20251001")
+        return RobinhoodDataProvider(
+            inner, model=model, audit=audit,
+            historical_days=int(data_cfg.get("robinhood_historical_days", 400)))
+    return inner

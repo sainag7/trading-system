@@ -97,6 +97,7 @@ async def run_profile_check(profile: str) -> None:
         config.set_mode("recommend")
         # Keep this offline check deterministic — no network discovery.
         config.raw.setdefault("discovery", {})["dynamic_discovery"] = False
+        config.raw.setdefault("execution", {})["read_live_account"] = False
         config.raw["storage"]["db_path"] = str(Path(tmp) / "trading.db")
         config.raw.setdefault("recommend", {})["hypothetical_cash"] = 10_000.0
         # Lower the buy bar so the offline policy actually recommends something
