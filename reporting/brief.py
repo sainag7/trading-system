@@ -125,6 +125,28 @@ def _verdicts_by_ticker(payload) -> dict[str, dict]:
     return out
 
 
+def _exits_by_ticker(payload) -> dict[str, dict]:
+    """Sells come from the MONITOR agent, not the decision agent.
+
+    The decision agent reduces risk with ``trim`` and explicitly "does not place
+    outright sells" — stop-loss and take-profit exits are the monitor's job and
+    live only in its ``exits`` payload. A brief that reads only the decision
+    output therefore reports "hold" for a position that just breached its stop.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    out = {}
+    for e in payload.get("exits", []) or []:
+        if isinstance(e, dict) and e.get("ticker"):
+            t = str(e["ticker"]).upper()
+            # Keep the strongest signal if a ticker appears more than once
+            # (the deterministic and LLM paths can both emit one).
+            if out.get(t, {}).get("action") == "exit_full":
+                continue
+            out[t] = e
+    return out
+
+
 def _previous_run_id(conn: sqlite3.Connection, run: sqlite3.Row) -> str | None:
     row = conn.execute(
         "select run_id from runs where started_ts < ? and mode = ? "
@@ -160,10 +182,25 @@ def _delta(cur: float | None, prev: float | None) -> str:
     return f" ({d:+.0f})"
 
 
-def _pnl_cell(h: _Holding) -> str:
-    if h.pnl_usd is None:
+def _pnl_cell(h: _Holding, available: bool = True) -> str:
+    if not available or h.pnl_usd is None:
         return DASH
     return f"{fmt_money(h.pnl_usd)} / {_fpct(h.pnl_pct, signed=True)}"
+
+
+def _cost_basis_available(holdings: list[_Holding]) -> bool:
+    """True only if avg_cost looks like a real entry price.
+
+    The broker read can populate avg_cost as market_value / shares — i.e. the
+    CURRENT price — in which case cost basis equals market value for every
+    position and P&L is identically zero. Reporting "$0.00 / +0.0%" across a
+    book that is sitting below its stops is worse than reporting nothing, so
+    this detects the degenerate case and the column is suppressed instead.
+    """
+    priced = [h for h in holdings if h.market_value and h.cost_basis]
+    if not priced:
+        return False
+    return any(abs(h.cost_basis - h.market_value) > 0.01 for h in priced)
 
 
 def _action_label(action: str | None) -> str:
@@ -174,27 +211,44 @@ def _action_label(action: str | None) -> str:
             "sell": "SELL", "hold": "hold", "pass": "pass"}.get(a, a.upper())
 
 
-def _build_holdings(conn, run_id, analysis, verdicts, prev_analysis) -> list[_Holding]:
+def _build_holdings(conn, run_id, analysis, verdicts, prev_analysis,
+                    exits: dict[str, dict] | None = None) -> list[_Holding]:
+    exits = exits or {}
     out: list[_Holding] = []
     for row in _holdings(conn, run_id):
         t = str(row["ticker"]).upper()
         a = analysis.get(t, {})
         v = verdicts.get(t, {})
+        x = exits.get(t, {})
+
+        # A monitor exit OVERRIDES the decision verdict: a breached stop is more
+        # urgent than "hold", and it is the only place a sell is ever expressed.
+        if x:
+            action = "sell" if x.get("action") == "exit_full" else "trim"
+            rationale = x.get("reason") or v.get("rationale")
+            trigger = x.get("trigger")
+            if trigger:
+                rationale = f"**{trigger}** — {rationale}"
+        else:
+            action, rationale = v.get("action"), v.get("rationale")
+
         out.append(_Holding(
             ticker=t,
             shares=row["shares"] or 0.0,
             avg_cost=row["avg_cost"] or 0.0,
             market_value=row["market_value"] or 0.0,
             sector=row["sector"] or a.get("_sector"),
-            action=v.get("action"),
-            rationale=v.get("rationale"),
+            action=action,
+            rationale=rationale,
             score=a.get("composite_score"),
             prev_score=(prev_analysis.get(t) or {}).get("composite_score"),
-            price=a.get("_price"),
+            price=a.get("_price") or x.get("current_price"),
             risks=list(a.get("key_risks") or []),
         ))
-    # Worst score first: what needs attention should be read first.
-    out.sort(key=lambda h: (h.score if h.score is not None else 999))
+    # Exits first, then worst score: what needs acting on should be read first.
+    _urgency = {"sell": 0, "trim": 1, "add": 2, "buy": 2}
+    out.sort(key=lambda h: (_urgency.get(str(h.action or "").lower(), 3),
+                            h.score if h.score is not None else 999))
     return out
 
 
@@ -222,12 +276,13 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
     analysis = _analysis_by_ticker(_agent_payload(conn, run_id, "analysis"))
     decision = _agent_payload(conn, run_id, "decision")
     verdicts = _verdicts_by_ticker(decision)
+    exits = _exits_by_ticker(_agent_payload(conn, run_id, "monitor"))
 
     prev_id = _previous_run_id(conn, run)
     prev_analysis = _analysis_by_ticker(
         _agent_payload(conn, prev_id, "analysis")) if prev_id else {}
 
-    holdings = _build_holdings(conn, run_id, analysis, verdicts, prev_analysis)
+    holdings = _build_holdings(conn, run_id, analysis, verdicts, prev_analysis, exits)
     held = {h.ticker for h in holdings}
 
     started = run["started_ts"]
@@ -265,6 +320,7 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
                  "Robinhood connection before trusting the ideas below.")
         L.append("")
     else:
+        has_basis = _cost_basis_available(holdings)
         L.append("| Ticker | Action | Score | Shares | Value | P&L | Why |")
         L.append("|---|---|---|---:|---:|---:|---|")
         for h in holdings:
@@ -276,8 +332,14 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
             L.append(
                 f"| **{h.ticker}** | {_action_label(h.action)} | {score} | "
                 f"{fmt_shares(h.shares)} | {fmt_money(h.market_value)} | "
-                f"{_pnl_cell(h)} | {why} |")
+                f"{_pnl_cell(h, has_basis)} | {why} |")
         L.append("")
+        if not has_basis:
+            L.append("> **P&L is unavailable.** The account read reports `avg_cost` as "
+                     "market value ÷ shares — the *current* price, not what you paid — so "
+                     "every position would compute to exactly $0.00. The column is blanked "
+                     "rather than showing a flat book that isn't real.")
+            L.append("")
 
         missing = [h.ticker for h in holdings if h.action is None]
         if missing:
@@ -328,6 +390,16 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
 
     # ---- 3. attention ---------------------------------------------------
     attention: list[str] = []
+
+    # An exit signal for a ticker that is not in the account cannot be acted on
+    # and usually means the monitor invented or mangled a symbol. Worth seeing:
+    # it is a signal you would otherwise assume covered one of your holdings.
+    phantom = sorted(t for t in exits if t not in held)
+    if phantom:
+        attention.append(
+            f"**Exit signal(s) for ticker(s) you do not hold: {', '.join(phantom)}.** "
+            "These cannot be acted on and point at a bad symbol from the monitor agent — "
+            "check whether a real holding was meant.")
 
     review = conn.execute(
         "select ticker, ts, detail from orders where status = 'needs_review'").fetchall()
@@ -412,16 +484,20 @@ def summary_line(db_path: str | Path = _DEFAULT_DB, run_id: str | None = None,
         analysis = _analysis_by_ticker(_agent_payload(conn, rid, "analysis"))
         decision = _agent_payload(conn, rid, "decision")
         verdicts = _verdicts_by_ticker(decision)
-        holdings = _build_holdings(conn, rid, analysis, verdicts, {})
+        exits = _exits_by_ticker(_agent_payload(conn, rid, "monitor"))
+        holdings = _build_holdings(conn, rid, analysis, verdicts, {}, exits)
         held = {h.ticker for h in holdings}
 
+        sells = sum(1 for h in holdings if str(h.action or "").lower() == "sell")
         acts = sum(1 for h in holdings
-                   if str(h.action or "").lower() in ("add", "trim", "sell", "buy"))
+                   if str(h.action or "").lower() in ("add", "trim", "buy"))
         ideas = sum(1 for t, v in verdicts.items()
                     if t not in held and str(v.get("action", "")).lower() in ("buy", "add"))
-        parts = [f"{len(holdings)} held",
-                 f"{acts} action{'s' if acts != 1 else ''}",
-                 f"{ideas} new idea{'s' if ideas != 1 else ''}"]
+        parts = [f"{len(holdings)} held"]
+        if sells:
+            parts.append(f"🔴 {sells} SELL")
+        parts += [f"{acts} other action{'s' if acts != 1 else ''}",
+                  f"{ideas} new idea{'s' if ideas != 1 else ''}"]
         if _degraded_reasons(analysis, decision):
             parts.append("⚠️ degraded")
         return " · ".join(parts)

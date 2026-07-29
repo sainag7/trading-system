@@ -38,7 +38,7 @@ RUN = "20260729T120000Z-test"
 PREV = "20260728T120000Z-test"
 
 
-def _make_db(tmp_path, *, verdicts, holdings, analysis=None):
+def _make_db(tmp_path, *, verdicts, holdings, analysis=None, exits=None):
     db = tmp_path / "t.db"
     c = sqlite3.connect(db)
     c.executescript(_SCHEMA)
@@ -62,6 +62,9 @@ def _make_db(tmp_path, *, verdicts, holdings, analysis=None):
                   [dict(a, composite_score=(a["composite_score"] or 0) + 12) for a in analysis])))
     c.execute("insert into agent_outputs (run_id,agent,output_json) values (?,?,?)",
               (RUN, "decision", json.dumps({"market_view": "Constructive.", "orders": verdicts})))
+    if exits is not None:
+        c.execute("insert into agent_outputs (run_id,agent,output_json) values (?,?,?)",
+                  (RUN, "monitor", json.dumps({"exits": exits, "holds": [], "notes": ""})))
     c.commit()
     c.close()
     return db
@@ -155,6 +158,71 @@ def test_empty_holdings_warns_about_account_read(tmp_path):
                    verdicts=[{"ticker": "MSFT", "action": "buy"}])
     assert "No open positions recorded" in text
     assert "account read returned nothing" in text
+
+
+def test_monitor_exit_overrides_a_decision_hold(tmp_path):
+    """Sells come ONLY from the monitor agent — the decision agent reduces risk
+    with trim and never emits an outright sell. A brief that reads only the
+    decision output reports "hold" for a position that just breached its stop,
+    which is the most consequential thing it could get wrong."""
+    text = _render(
+        tmp_path,
+        holdings=[("MU", 0.2, 1000.0, 200.0)],
+        verdicts=[{"ticker": "MU", "action": "hold", "rationale": "avoid churn"}],
+        exits=[{"ticker": "MU", "action": "exit_full", "trigger": "stop_loss",
+                "reason": "price $773 <= stop $953", "current_price": 773.0}],
+    )
+    assert "SELL" in text
+    assert "stop_loss" in text and "773" in text
+    assert "avoid churn" not in text        # the stale hold rationale is replaced
+
+
+def test_partial_exit_renders_as_trim(tmp_path):
+    text = _render(
+        tmp_path,
+        holdings=[("VYX", 10.0, 7.0, 78.0)],
+        verdicts=[{"ticker": "VYX", "action": "hold", "rationale": "x"}],
+        exits=[{"ticker": "VYX", "action": "exit_partial", "trigger": "take_profit",
+                "reason": "reached target"}],
+    )
+    assert "TRIM" in text and "take_profit" in text
+
+
+def test_exit_for_unheld_ticker_is_flagged(tmp_path):
+    """A mangled symbol from the monitor (observed live: 'GOOGLEL' for GOOGL)
+    produces a sell signal that cannot be acted on. It must not pass silently."""
+    text = _render(
+        tmp_path,
+        holdings=[("GOOGL", 1.0, 100.0, 100.0)],
+        verdicts=[{"ticker": "GOOGL", "action": "hold"}],
+        exits=[{"ticker": "GOOGLEL", "action": "exit_full", "trigger": "stop_loss",
+                "reason": "bad symbol"}],
+    )
+    assert "GOOGLEL" in text
+    assert "do not hold" in text
+
+
+def test_pnl_suppressed_when_avg_cost_is_really_current_price(tmp_path):
+    """avg_cost == market_value / shares means the broker read gave the current
+    price, not a cost basis, so every P&L computes to exactly $0. Reporting a
+    flat book that isn't real is worse than reporting nothing."""
+    text = _render(
+        tmp_path,
+        holdings=[("MU", 0.2, 1000.0, 200.0), ("AAPL", 0.5, 300.0, 150.0)],
+        verdicts=[{"ticker": "MU", "action": "hold"}, {"ticker": "AAPL", "action": "hold"}],
+    )
+    assert "P&L is unavailable" in text
+    assert "$0.00 / +0.0%" not in text
+
+
+def test_pnl_shown_when_cost_basis_is_real(tmp_path):
+    text = _render(
+        tmp_path,
+        holdings=[("AAPL", 10.0, 100.0, 1200.0)],   # basis 1000 != value 1200
+        verdicts=[{"ticker": "AAPL", "action": "hold"}],
+    )
+    assert "P&L is unavailable" not in text
+    assert "$200.00" in text and "+20.0%" in text
 
 
 def test_no_run_returns_none(tmp_path):
