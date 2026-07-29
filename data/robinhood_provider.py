@@ -17,7 +17,6 @@ so the system degrades to its previous behaviour if a Robinhood read is thin).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from agents.llm import generate_json
@@ -82,13 +81,11 @@ def _batches(items: list, n: int):
 class RobinhoodDataProvider:
     """Robinhood market data over a wrapped :class:`DataProvider` fallback."""
 
-    def __init__(self, inner, model: str, *, audit=None, historical_days: int = 400):
+    def __init__(self, inner, model: str, *, audit=None):
         self._inner = inner
         self.model = model
         self._audit = audit
-        self.historical_days = historical_days
         self._quotes: dict[str, dict] = {}
-        self._series: dict[str, list[dict]] = {}
         self._fundamentals: dict[str, dict] = {}
         self._prefetched: set[str] = set()
 
@@ -134,8 +131,12 @@ class RobinhoodDataProvider:
             return
         # Sequential (not concurrent) — the MCP bridge is LLM-mediated; a burst of
         # parallel Agent-SDK queries is neither faster here nor more reliable.
-        for step in (self._prefetch_quotes, self._prefetch_series,
-                     self._prefetch_fundamentals):
+        # NOTE: daily SERIES is deliberately NOT prefetched from Robinhood. A
+        # get_equity_historicals result is hundreds of bars per symbol, and the
+        # model cannot reliably re-emit that volume as JSON (it returns empty), so
+        # series is served by yfinance via the wrapped provider instead. Only the
+        # compact quotes + fundamentals go through the MCP bridge.
+        for step in (self._prefetch_quotes, self._prefetch_fundamentals):
             try:
                 await step(syms)
             except Exception as e:  # never let a data read break the run
@@ -144,7 +145,7 @@ class RobinhoodDataProvider:
         self._prefetched.update(syms)
         self._log("INFO", "robinhood_prefetch",
                   {"requested": len(syms), "quotes": len(self._quotes),
-                   "series": len(self._series), "fundamentals": len(self._fundamentals)})
+                   "fundamentals": len(self._fundamentals)})
 
     async def _prefetch_quotes(self, syms: list[str]) -> None:
         missing = list(syms)
@@ -169,31 +170,6 @@ class RobinhoodDataProvider:
                             "price": price,
                             "prev_close": _f(row.get("prev_close")) or price}
                 missing = [s for s in syms if s not in self._quotes]
-
-    async def _prefetch_series(self, syms: list[str]) -> None:
-        start = (datetime.now(timezone.utc)
-                 - timedelta(days=self.historical_days)).strftime("%Y-%m-%dT00:00:00Z")
-        for batch in _batches(syms, 10):     # get_equity_historicals: <=10 symbols/call
-            missing = list(batch)
-            for _ in range(2):
-                if not missing:
-                    break
-                instr = (
-                    f"Call get_equity_historicals with symbols={json.dumps(missing)}, "
-                    f'interval="day", start_time="{start}". For EVERY symbol return its '
-                    "daily bars oldest-first, mapping each bar to: date (from "
-                    "begins_at, YYYY-MM-DD), open/high/low/close (from the *_price "
-                    "fields), volume. Return STRICT JSON only, covering every symbol: "
-                    '{"SYM": [{"date":"YYYY-MM-DD","open":<f>,"high":<f>,"low":<f>,'
-                    '"close":<f>,"volume":<f>}, ...], ...}')
-                parsed = await self._ask(instr, max_turns=6)
-                if isinstance(parsed, dict):
-                    for sym in list(missing):
-                        rows = parsed.get(sym) or parsed.get(sym.upper())
-                        clean = self._clean_series(rows)
-                        if clean:
-                            self._series[sym] = clean
-                    missing = [s for s in batch if s not in self._series]
 
     async def _prefetch_fundamentals(self, syms: list[str]) -> None:
         profiles = await self._fetch_profiles(syms)
@@ -242,31 +218,6 @@ class RobinhoodDataProvider:
         return out
 
     # -- mapping helpers ---------------------------------------------------
-    @staticmethod
-    def _clean_series(rows: Any) -> list[dict] | None:
-        if not isinstance(rows, list):
-            return None
-        out = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            date = r.get("date")
-            close = _f(r.get("close"))
-            if not date or close is None:
-                continue
-            out.append({
-                "date": str(date)[:10],
-                "open": _f(r.get("open")) if _f(r.get("open")) is not None else close,
-                "high": _f(r.get("high")) if _f(r.get("high")) is not None else close,
-                "low": _f(r.get("low")) if _f(r.get("low")) is not None else close,
-                "close": close,
-                "volume": _f(r.get("volume")) or 0.0,
-            })
-        if not out:
-            return None
-        out.sort(key=lambda x: x["date"])
-        return out
-
     @staticmethod
     def _compute_fundamentals(prof: Any, fin: Any) -> dict | None:
         """Assemble the provider fundamentals contract from Robinhood's profile +
@@ -334,11 +285,10 @@ class RobinhoodDataProvider:
         return self._inner.get_quote(t)
 
     def get_daily_series(self, ticker: str, lookback: int = 100) -> list[dict] | None:
-        t = ticker.upper()
-        s = self._series.get(t)
-        if s:
-            return s[-lookback:] if lookback and len(s) > lookback else s
-        return self._inner.get_daily_series(t, lookback)
+        # Series is intentionally NOT sourced from Robinhood: the MCP bridge is
+        # LLM-mediated and cannot reliably re-emit hundreds of OHLCV bars. The
+        # wrapped provider serves it from yfinance (free, full lookback).
+        return self._inner.get_daily_series(ticker.upper(), lookback)
 
     def get_fundamentals(self, ticker: str) -> dict:
         t = ticker.upper()

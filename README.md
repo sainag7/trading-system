@@ -373,24 +373,30 @@ The old Streamlit app (`dashboard/`) has been superseded by this web app.
 
 ### Robinhood market data (default) — no Alpha Vantage quota for prices/fundamentals
 
-With `data.use_robinhood_data: true` (the default), the system pulls **quotes,
-daily OHLCV series, and fundamentals** from your connected **Robinhood Trading
-MCP** — real-time and quota-free. [data/robinhood_provider.py](data/robinhood_provider.py)
-wraps the classic provider and **batch-fetches the whole universe once per run**
-(a handful of multi-symbol MCP calls), so per-ticker reads hit an in-memory store.
+With `data.use_robinhood_data: true` (the default), the system pulls **real-time
+quotes and fundamentals** from your connected **Robinhood Trading MCP** —
+quota-free. [data/robinhood_provider.py](data/robinhood_provider.py) wraps the
+classic provider and **batch-fetches the whole universe once per run** (a couple
+of compact multi-symbol MCP calls), so per-ticker reads hit an in-memory store.
 Fundamentals Robinhood doesn't expose (operating margin, debt/equity, free cash
 flow, beta, next-earnings date, company name) are still filled from `yfinance`;
 `revenue_ttm / growth / margins / P-S / EPS` are computed from Robinhood's
-quarterly `get_financials`. On **any** Robinhood miss it falls back to the path
-below, so behaviour degrades gracefully.
+quarterly `get_financials`. On **any** Robinhood miss it falls back to `yfinance`.
 
-Robinhood has **no news or macro tool**, so:
-- **News sentiment** still uses **Alpha Vantage** (now ~1 call/ticker — far under
-  the cap, since quotes/series/fundamentals no longer touch AV).
-- **Macro** (rates/CPI/unemployment) still uses **FRED**.
+Each source does what it's best at:
+- **Quotes + fundamentals** → Robinhood (compact, real-time, quota-free).
+- **Daily OHLCV series** → **yfinance**. Robinhood *has* the data, but its MCP is
+  LLM-mediated and a model can't reliably re-emit hundreds of bars per symbol as
+  JSON, so series is served free by yfinance instead. Alpha Vantage is **not**
+  used for series — its free tier made `TIME_SERIES_DAILY outputsize=full`
+  premium-only (`data.use_alphavantage_series` defaults `false`; set `true` only
+  with a premium AV key).
+- **News sentiment** → **Alpha Vantage** — now the *only* AV endpoint used, so its
+  25/day budget is spent on news alone.
+- **Macro** (rates/CPI/unemployment) → **FRED**.
 
 Set `use_robinhood_data: false` to use the pure Alpha-Vantage/yfinance path below
-(identical to before) — the switch is fully reversible.
+— the switch is fully reversible.
 
 ### Alpha Vantage / yfinance fallback
 

@@ -75,9 +75,10 @@ _FIN = {"NVDA": [
 ]}
 
 
-def _fake_ask_factory(seen_symbols=None):
+def _fake_ask_factory(calls):
     async def _ask(instruction, max_turns=8):
         instr = instruction
+        calls.append(instr)               # record every MCP instruction issued
         # Only answer for symbols mentioned in the instruction (so a fallback
         # symbol not in the canned data is simply never returned).
         def scope(table):
@@ -96,24 +97,42 @@ def _fake_ask_factory(seen_symbols=None):
 
 def _provider():
     inner = FakeInner()
-    p = RobinhoodDataProvider(inner, model="test", historical_days=400)
-    p._ask = _fake_ask_factory()          # bypass the real MCP/LLM bridge
+    p = RobinhoodDataProvider(inner, model="test")
+    p.ask_calls = []                      # instructions the provider issued to the MCP
+    p._ask = _fake_ask_factory(p.ask_calls)   # bypass the real MCP/LLM bridge
     return p, inner
 
 
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
-def test_prefetch_populates_quotes_and_series():
+def test_prefetch_populates_quotes_from_robinhood():
     p, inner = _provider()
     asyncio.run(p.prefetch(["NVDA"]))
     q = p.get_quote("NVDA")
     assert q["price"] == 206.96 and q["source"] == "robinhood"
+    assert inner.quote_calls == []        # served from the store, not the inner provider
+
+
+def test_prefetch_never_requests_historicals():
+    # Series is deliberately NOT sourced from Robinhood (the LLM bridge can't
+    # re-emit hundreds of bars). Prefetch must issue quotes + fundamentals +
+    # financials calls, but NEVER get_equity_historicals.
+    p, _ = _provider()
+    asyncio.run(p.prefetch(["NVDA"]))
+    assert p.ask_calls, "prefetch should issue some MCP calls"
+    assert not any("get_equity_historicals" in c for c in p.ask_calls)
+    assert any("get_equity_quotes" in c for c in p.ask_calls)
+
+
+def test_series_always_delegates_to_yfinance():
+    # Even a prefetched ticker's series comes from the wrapped provider (yfinance),
+    # never from Robinhood.
+    p, inner = _provider()
+    asyncio.run(p.prefetch(["NVDA"]))
     s = p.get_daily_series("NVDA", 260)
-    assert [r["date"] for r in s] == ["2026-06-15", "2026-06-16"]   # oldest-first
-    assert set(s[0]) == {"date", "open", "high", "low", "close", "volume"}
-    # Served from the store — the inner provider was never consulted.
-    assert inner.quote_calls == [] and inner.series_calls == []
+    assert inner.series_calls == [("NVDA", 260)]   # delegated to the inner provider
+    assert s is not None and s[0]["date"] == "2026-01-01"   # the FakeInner (yfinance) stub
 
 
 def test_fundamentals_merge_compute_and_sector_map():
@@ -172,3 +191,32 @@ def test_sector_map_unit():
     assert _map_rh_sector("Finance") == "Financials"
     assert _map_rh_sector("Health Technology") == "Health Care"
     assert _map_rh_sector("Totally Unknown Sector", "Energy") == "Energy"   # fallback
+
+
+# --------------------------------------------------------------------------- #
+# DataProvider: series must not spend Alpha Vantage quota
+# --------------------------------------------------------------------------- #
+def test_dataprovider_series_skips_alphavantage():
+    import tempfile
+    from data.providers import DataProvider, ProviderConfig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # use_alphavantage_series False (default) + no yfinance -> series returns
+        # None WITHOUT ever calling Alpha Vantage (no premium-blocked TIME_SERIES
+        # calls, no wasted budget).
+        cfg = ProviderConfig(cache_dir=tmp, av_api_key="dummy",
+                             use_alphavantage_series=False, use_yfinance_fallback=False)
+        dp = DataProvider(cfg)
+        calls = []
+        dp._alpha_vantage = lambda params: calls.append(params) or None
+        assert dp.get_daily_series("AAPL", 260) is None
+        assert calls == [], "series must not call Alpha Vantage when disabled"
+
+        # Opt back in -> Alpha Vantage IS consulted (premium key scenario).
+        cfg2 = ProviderConfig(cache_dir=tmp, av_api_key="dummy",
+                              use_alphavantage_series=True, use_yfinance_fallback=False)
+        dp2 = DataProvider(cfg2)
+        calls2 = []
+        dp2._alpha_vantage = lambda params: calls2.append(params) or None
+        dp2.get_daily_series("AAPL", 260)
+        assert calls2 and calls2[0]["function"] == "TIME_SERIES_DAILY"

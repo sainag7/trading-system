@@ -201,20 +201,24 @@ research:
 data:
   cache_dir: ".cache"
   cache_ttl_minutes: 1440            # reuse cached data for 24h (daily cadence)
-  # Use your connected Robinhood Trading MCP for market data (quotes / daily
-  # series / fundamentals) instead of Alpha Vantage — it is real-time and
-  # quota-free, so the 25/day AV cap stops biting. Alpha Vantage is then used
-  # ONLY for news sentiment (Robinhood has no news tool); FRED still supplies
-  # macro. Falls back to AV/yfinance on any Robinhood miss. Requires the
-  # robinhood-trading MCP connected in Claude Code (OAuth). Turn off to use the
-  # pure Alpha-Vantage/yfinance path (identical to before).
+  # Use your connected Robinhood Trading MCP for market data (real-time quotes +
+  # fundamentals) instead of Alpha Vantage — quota-free, so the 25/day AV cap
+  # stops biting. Daily SERIES comes from yfinance (see use_alphavantage_series
+  # below), and Alpha Vantage is then used ONLY for news sentiment (Robinhood has
+  # no news tool); FRED still supplies macro. Falls back to yfinance on any
+  # Robinhood miss. Requires the robinhood-trading MCP connected in Claude Code
+  # (OAuth). Turn off to use the pure Alpha-Vantage/yfinance path.
   use_robinhood_data: true
   robinhood_data_model: "claude-haiku-4-5-20251001"   # cheap model for the batched data reads
-  robinhood_historical_days: 400     # calendar days pulled (covers a 260-trading-day lookback)
+  # Alpha Vantage no longer serves daily series on the free tier
+  # (TIME_SERIES_DAILY outputsize=full is premium; compact is only 100 bars <
+  # the 200-day SMA lookback). Keep OFF: series is served free by yfinance and AV
+  # is reserved for news. Only set true if you hold a premium Alpha Vantage key.
+  use_alphavantage_series: false
   alphavantage:
     daily_request_budget: 25         # free-tier hard cap; provider self-throttles
     min_seconds_between_calls: 13    # ~5 calls/min on free tier
-  use_yfinance_fallback: true        # fall back to yfinance when AV quota is spent
+  use_yfinance_fallback: true        # yfinance serves quotes/series when needed (free)
   use_fred: true                     # macro context (rates, etc.) when configured
 
 # ----------------------------------------------------------------------------

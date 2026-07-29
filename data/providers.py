@@ -122,6 +122,14 @@ class ProviderConfig:
     av_daily_budget: int = 25
     av_min_seconds_between_calls: int = 13
     use_yfinance_fallback: bool = True
+    # Alpha Vantage's free tier can no longer serve the daily series we need
+    # (TIME_SERIES_DAILY outputsize=full is premium; compact is only 100 bars <
+    # the 200-day SMA lookback). Default OFF so series comes straight from
+    # yfinance instead of burning quota on premium-blocked calls.
+    use_alphavantage_series: bool = False
+    # Whether to gap-fill fundamentals from AV OVERVIEW. Turned off when Robinhood
+    # supplies fundamentals, leaving NEWS_SENTIMENT as the only AV endpoint used.
+    use_alphavantage_fundamentals: bool = True
     use_fred: bool = True
     fred_api_key: str | None = None
     sector_overrides: dict[str, str] | None = None
@@ -251,11 +259,17 @@ class DataProvider:
         ``compact`` payload.
         """
         ticker = ticker.upper()
-        outsize = "full" if lookback > 100 else "compact"
-        data = self._alpha_vantage(
-            {"function": "TIME_SERIES_DAILY", "symbol": ticker, "outputsize": outsize}
-        )
-        series = (data or {}).get("Time Series (Daily)")
+        # Alpha Vantage is skipped for series by default: outputsize=full is a
+        # premium feature, so free-tier calls only waste quota (and starve news).
+        # yfinance serves the full lookback for free. Opt back in with
+        # data.use_alphavantage_series: true if you hold a premium AV key.
+        series = None
+        if self.cfg.use_alphavantage_series:
+            outsize = "full" if lookback > 100 else "compact"
+            data = self._alpha_vantage(
+                {"function": "TIME_SERIES_DAILY", "symbol": ticker, "outputsize": outsize}
+            )
+            series = (data or {}).get("Time Series (Daily)")
         if series:
             rows = []
             for date in sorted(series.keys())[-lookback:]:
@@ -416,8 +430,11 @@ class DataProvider:
                 result["sector"] = yf_data.get("sector")
             result["source"] = "yfinance"
 
-        # AV OVERVIEW only when core valuation fields are still missing.
-        if result.get("pe_ratio") is None or result.get("revenue_ttm") is None:
+        # AV OVERVIEW only when enabled AND core valuation fields are still
+        # missing (disabled when Robinhood supplies fundamentals, so AV is used
+        # only for news).
+        if self.cfg.use_alphavantage_fundamentals and (
+                result.get("pe_ratio") is None or result.get("revenue_ttm") is None):
             av = self._av_fundamentals(ticker)
             if av:
                 for k, v in av.items():
@@ -580,6 +597,10 @@ def build_provider(config, audit=None) -> DataProvider:
         av_daily_budget=av.get("daily_request_budget", 25),
         av_min_seconds_between_calls=av.get("min_seconds_between_calls", 13),
         use_yfinance_fallback=data_cfg.get("use_yfinance_fallback", True),
+        use_alphavantage_series=data_cfg.get("use_alphavantage_series", False),
+        # When Robinhood supplies fundamentals, don't also gap-fill from AV
+        # OVERVIEW — leaves NEWS_SENTIMENT as the only AV endpoint used.
+        use_alphavantage_fundamentals=not data_cfg.get("use_robinhood_data", False),
         use_fred=data_cfg.get("use_fred", True),
         fred_api_key=config.env("FRED_API_KEY"),
         sector_overrides=config.sectors,
@@ -592,7 +613,5 @@ def build_provider(config, audit=None) -> DataProvider:
     if data_cfg.get("use_robinhood_data", False):
         from data.robinhood_provider import RobinhoodDataProvider
         model = data_cfg.get("robinhood_data_model", "claude-haiku-4-5-20251001")
-        return RobinhoodDataProvider(
-            inner, model=model, audit=audit,
-            historical_days=int(data_cfg.get("robinhood_historical_days", 400)))
+        return RobinhoodDataProvider(inner, model=model, audit=audit)
     return inner
