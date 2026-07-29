@@ -29,8 +29,14 @@ echo "===== $(date '+%Y-%m-%d %H:%M:%S %Z') :: orchestrator.py $* =====" >> "$LO
 # Not `exec`: the run has to be followed by rendering the briefing, so the
 # scheduled output is pushed to a file instead of waiting in SQLite to be
 # remembered. Capture the status rather than letting `set -e` abort here.
+#
+# PYTHONUNBUFFERED: stdout is a file here, not a TTY, so Python block-buffers it
+# and the log stays empty until the process exits. That makes a run that is
+# stuck (e.g. waiting on a broker OAuth prompt that can never be answered from a
+# scheduled job) look exactly like one that is working. Unbuffered output is
+# what makes `tail -f logs/scheduled.log` tell you which it is.
 STATUS=0
-"$PY" orchestrator.py "$@" >> "$LOG" 2>&1 || STATUS=$?
+PYTHONUNBUFFERED=1 "$PY" orchestrator.py "$@" >> "$LOG" 2>&1 || STATUS=$?
 
 notify() {  # notify <title> <message>
   # Best-effort only: a headless session has no notification centre, and a
