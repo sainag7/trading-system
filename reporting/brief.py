@@ -399,6 +399,36 @@ def render_brief(db_path: str | Path = _DEFAULT_DB, run_id: str | None = None,
     return path
 
 
+def summary_line(db_path: str | Path = _DEFAULT_DB, run_id: str | None = None,
+                 mode: str | None = None) -> str:
+    """A one-line summary suitable for a desktop notification body."""
+    conn = _connect(db_path)
+    try:
+        run = (conn.execute("select * from runs where run_id = ?", (run_id,)).fetchone()
+               if run_id else _latest_run(conn, mode))
+        if run is None:
+            return "No run found."
+        rid = run["run_id"]
+        analysis = _analysis_by_ticker(_agent_payload(conn, rid, "analysis"))
+        decision = _agent_payload(conn, rid, "decision")
+        verdicts = _verdicts_by_ticker(decision)
+        holdings = _build_holdings(conn, rid, analysis, verdicts, {})
+        held = {h.ticker for h in holdings}
+
+        acts = sum(1 for h in holdings
+                   if str(h.action or "").lower() in ("add", "trim", "sell", "buy"))
+        ideas = sum(1 for t, v in verdicts.items()
+                    if t not in held and str(v.get("action", "")).lower() in ("buy", "add"))
+        parts = [f"{len(holdings)} held",
+                 f"{acts} action{'s' if acts != 1 else ''}",
+                 f"{ideas} new idea{'s' if ideas != 1 else ''}"]
+        if _degraded_reasons(analysis, decision):
+            parts.append("⚠️ degraded")
+        return " · ".join(parts)
+    finally:
+        conn.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Render a run into a markdown briefing")
     ap.add_argument("--run-id", default=None, help="run to render (default: latest)")
@@ -406,7 +436,13 @@ def main() -> int:
                     help="when picking the latest run, restrict to this mode")
     ap.add_argument("--db", default=str(_DEFAULT_DB))
     ap.add_argument("--out-dir", default=str(_DEFAULT_OUT))
+    ap.add_argument("--summary", action="store_true",
+                    help="print a one-line summary instead of the file path")
     args = ap.parse_args()
+
+    if args.summary:
+        print(summary_line(args.db, args.run_id, args.mode))
+        return 0
 
     path = render_brief(args.db, args.run_id, args.out_dir, args.mode)
     if path is None:

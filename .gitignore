@@ -10,6 +10,14 @@ config.local.yaml
 *.db-journal
 storage/*.db
 storage/*.db-journal
+# Manual DB backups: *.db does NOT match "trading.db.bak-20260729-120735".
+*.db.bak-*
+storage/*.bak-*
+
+# Run output — contains real holdings, P&L and account equity. This repo has a
+# remote, so none of it may ever be committed.
+reports/
+logs/
 
 # Kill switch artifact (operator-created, should not be committed)
 KILL_SWITCH
