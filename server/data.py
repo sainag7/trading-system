@@ -353,7 +353,10 @@ def portfolio(account: str | None = None) -> dict:
         "summary": {
             "equity_display": F.fmt_money(last["equity"]),
             "cash_display": F.fmt_money(last["cash"]),
-            "drawdown_display": F.fmt_pct(last["drawdown_pct"]),
+            # drawdown_pct is stored as a FRACTION (0.15 == 15%), while fmt_pct
+            # expects percent units — without the scale a 15% drawdown, the level
+            # that trips the halt, rendered as a harmless-looking "0.1%".
+            "drawdown_display": F.fmt_pct((last["drawdown_pct"] or 0.0) * 100.0),
             "peak_display": F.fmt_money(last["peak_equity"]),
         },
         "series": series,
