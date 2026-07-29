@@ -6,15 +6,19 @@
 #
 # Two jobs, both fire on weekdays; the orchestrator's market-day gate no-ops on
 # NYSE holidays:
-#   * individual advice  — 10:00 local — recommend mode, READ-ONLY, never trades.
-#   * agentic autonomous — 10:05 local — live mode on the $100 account (--enable-live).
+#   * individual advice  — 10:00 ET — recommend mode, READ-ONLY, never trades.
+#   * agentic autonomous — 10:05 ET — live mode on the $100 account (--enable-live).
 #
-# TIMES ARE IN THE MAC'S LOCAL TIMEZONE. Defaults assume US/Eastern (market
-# time). If this Mac is not on Eastern time, edit HOUR_* below.
+# Schedule times are expressed in MARKET TIME (US/Eastern) and converted to this
+# Mac's local timezone at install, because launchd fires on local time. Getting
+# this wrong is silent: on a Central-time Mac a naive "10:00" fires at 11:00 ET,
+# 90 minutes after the open instead of the intended 30.
+#
+# Re-run this installer if the Mac's timezone changes — the conversion is
+# resolved once, here, not at fire time.
 #
 # Safety: the autonomous live job is NOT installed unless you pass --enable-live
-# AND type the confirmation — do the Phase 5 commissioning (one supervised
-# order) first.
+# AND type the confirmation — do the commissioning (one supervised order) first.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,8 +27,32 @@ AGENTS_DIR="$HOME/Library/LaunchAgents"
 LABEL_ADVICE="com.trading-system.individual-advice"
 LABEL_LIVE="com.trading-system.agentic-live"
 
-HOUR_ADVICE=10; MIN_ADVICE=0
-HOUR_LIVE=10;   MIN_LIVE=5
+# Target times in MARKET TIME (ET). 10:00 ET is 30 minutes after the open, which
+# lets the opening auction settle before the daily cycle reads prices.
+ET_HOUR_ADVICE=10; ET_MIN_ADVICE=0
+ET_HOUR_LIVE=10;   ET_MIN_LIVE=5
+
+# Convert an ET wall-clock time to this Mac's local wall clock. Echoes "H M".
+et_to_local () {
+  python3 - "$1" "$2" <<'PY'
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+hour, minute = int(sys.argv[1]), int(sys.argv[2])
+et = datetime.now(ZoneInfo("America/New_York")).replace(
+    hour=hour, minute=minute, second=0, microsecond=0)
+local = et.astimezone()
+print(local.hour, local.minute)
+PY
+}
+
+read -r HOUR_ADVICE MIN_ADVICE <<<"$(et_to_local $ET_HOUR_ADVICE $ET_MIN_ADVICE)"
+read -r HOUR_LIVE   MIN_LIVE   <<<"$(et_to_local $ET_HOUR_LIVE   $ET_MIN_LIVE)"
+
+LOCAL_TZ="$(date +%Z)"
+printf 'Market time %02d:%02d ET  ->  %02d:%02d %s (this Mac)\n' \
+  "$ET_HOUR_ADVICE" "$ET_MIN_ADVICE" "$HOUR_ADVICE" "$MIN_ADVICE" "$LOCAL_TZ"
 
 ENABLE_LIVE=0
 [ "${1:-}" = "--enable-live" ] && ENABLE_LIVE=1
@@ -63,7 +91,8 @@ write_plist () {
   echo "  loaded: $plist"
 }
 
-echo "Installing individual advice job (read-only, 10:00 local, weekdays)..."
+printf "Installing individual advice job (read-only, %02d:%02d %s, weekdays)...\n" \
+  "$HOUR_ADVICE" "$MIN_ADVICE" "$LOCAL_TZ"
 write_plist "$LABEL_ADVICE" "$HOUR_ADVICE" "$MIN_ADVICE" \
   --mode recommend --account individual
 
@@ -74,7 +103,8 @@ if [ "$ENABLE_LIVE" = "1" ]; then
   echo "!!! Only do this AFTER the supervised commissioning order (Phase 5)."
   read -r -p "Type 'ENABLE LIVE' to confirm: " ans
   if [ "$ans" = "ENABLE LIVE" ]; then
-    echo "Installing agentic autonomous job (live, 10:05 local, weekdays)..."
+    printf "Installing agentic autonomous job (live, %02d:%02d %s, weekdays)...\n" \
+      "$HOUR_LIVE" "$MIN_LIVE" "$LOCAL_TZ"
     write_plist "$LABEL_LIVE" "$HOUR_LIVE" "$MIN_LIVE" \
       --mode live --yes --profile momentum --account agentic
   else
