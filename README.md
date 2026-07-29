@@ -484,10 +484,42 @@ idempotent** — there is no daemon. A **market-day gate** (`market.py`) makes a
 weekend/NYSE-holiday firing a clean no-op for trading modes, so it is safe to
 schedule on every weekday.
 
-### macOS launchd (recommended)
+### The daily brief
+
+Every scheduled run renders a markdown briefing to **`reports/YYYY-MM-DD.md`**
+and fires a macOS notification when it is ready, so the output is pushed to you
+rather than waiting in SQLite to be remembered. It contains:
+
+- **Your positions** — *every* holding, with its action (add / hold / trim /
+  sell), composite score **and the change since the previous run** (a decaying
+  score is the trim signal), P&L, and the rationale. A holding that receives no
+  verdict is listed as `NO VERDICT` and called out — a position silently missing
+  from the report is the one failure this is built to prevent.
+- **New ideas** — actionable names you don't already hold, with size/stop/target.
+- **Needs your attention** — orders stuck in `needs_review`, guardrail resizes,
+  kill-switch and drawdown state.
+- A **⚠️ degraded run** banner when the decision agent fell back to its
+  deterministic policy, or when every score is exactly 50 (no market data) — so
+  a briefing built on missing inputs never reads like a confident one.
+
+Render one by hand at any time (read-only, renders the latest run):
 
 ```bash
-./scheduling/install.sh                 # individual advice job (read-only), 10:00 local weekdays
+python -m reporting.brief                  # writes reports/<date>.md, prints the path
+python -m reporting.brief --summary        # one-line summary, as used in the notification
+python -m reporting.brief --run-id <RUN>   # a specific run
+```
+
+`reports/` and `logs/` are gitignored — they contain real holdings and equity.
+
+### macOS launchd (recommended)
+
+Schedule times are declared in **market time (ET)** and converted to this Mac's
+local timezone at install; the installer prints both. Re-run it if the machine's
+timezone changes.
+
+```bash
+./scheduling/install.sh                 # individual advice job (read-only), 10:00 ET weekdays
 ./scheduling/install.sh --enable-live   # ALSO schedule autonomous $100 trading — commission first!
 ./scheduling/uninstall.sh               # stop all scheduled runs
 ```
