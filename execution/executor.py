@@ -110,6 +110,9 @@ class RobinhoodMCPBroker:
         # legacy behaviour, kept for backward compatibility.
         self.account_number = str(account_number).strip() if account_number else None
         self._audit = audit
+        # Set when the most recent get_account() failed, so callers can print an
+        # actionable message (connection/auth lapse vs an unparseable read).
+        self.last_read_failure: dict | None = None
         # The Agent SDK grants MCP permission at SERVER granularity, so the
         # allow-list uses the server prefix (individual tool names are silently
         # denied → empty responses). The narrow per-call instruction + the
@@ -235,14 +238,18 @@ class RobinhoodMCPBroker:
         # reverse; it can't invent holdings). So take the RICHEST of a few reads
         # and stop as soon as one returns holdings. Reads are idempotent, so
         # retrying is always safe (unlike a fill).
+        from agents.llm import last_error
         sec = {k.upper(): v for k, v in (sectors or {}).items()}
         best: AccountState | None = None
+        any_text = False            # did any attempt return non-empty model output?
         for attempt in range(3):
             try:
-                parsed, _ = await self._ask(instruction, self.read_tools, max_turns=8)
+                parsed, raw = await self._ask(instruction, self.read_tools, max_turns=8)
             except Exception as e:
                 self._log("WARN", "robinhood_read_retry", {"attempt": attempt + 1, "error": str(e)})
                 continue
+            if raw:
+                any_text = True
             if not isinstance(parsed, dict):
                 continue
             cand = self._account_from_json(parsed, peak_equity, sec)
@@ -252,8 +259,30 @@ class RobinhoodMCPBroker:
             if best.positions:  # got holdings -> trust it, stop early
                 break
         if best is None:
-            self._log("ERROR", "robinhood_read_failed", {"note": "no parseable account JSON"})
+            err = last_error()
+            if not any_text:
+                # No model output at all on any attempt — the MCP call returned
+                # nothing. This is (almost always) a dropped/expired Robinhood MCP
+                # connection: the OAuth'd `robinhood-trading` session the subprocess
+                # inherits via setting_sources=["local"] has lapsed. NOT a stochastic
+                # parse miss — retrying won't help until it's reconnected.
+                self.last_read_failure = {
+                    "kind": "no_response", "attempts": 3,
+                    "account": self.account_number, "error": err,
+                    "hint": "reconnect robinhood-trading via /mcp in an interactive "
+                            "claude session started from this repo, then re-run",
+                }
+                self._log("ERROR", "robinhood_mcp_no_response", self.last_read_failure)
+            else:
+                # Got model text but never valid account JSON — the rarer, genuinely
+                # stochastic case; a re-run usually succeeds.
+                self.last_read_failure = {
+                    "kind": "unparseable", "attempts": 3,
+                    "account": self.account_number, "error": err,
+                }
+                self._log("ERROR", "robinhood_read_unparseable", self.last_read_failure)
             return None
+        self.last_read_failure = None
 
         # The positions-rich read usually reports cash as 0 (the model called the
         # positions tool but not the cash/portfolio one). Top up cash with a

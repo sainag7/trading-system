@@ -65,15 +65,14 @@ def _latest_analysis_map() -> dict[str, dict]:
     return {str(i.get("ticker")): i for i in arr if isinstance(i, dict) and i.get("ticker")}
 
 
-def _run_meta(run_id: str) -> tuple[str, str]:
-    """(mode, profile) parsed from runs.notes."""
-    row = _one("SELECT mode, notes FROM runs WHERE run_id=?", (run_id,))
-    if not row:
-        return "?", "swing"
-    notes = row["notes"] or ""
-    profile = next((p.split("=", 1)[1] for p in notes.split() if p.startswith("profile=")),
-                   "swing")
-    return row["mode"], profile
+def _run_mode(run_id: str) -> str:
+    """Run mode for ``run_id``.
+
+    Historical rows still carry a ``profile=...`` token in ``runs.notes`` from
+    before strategy profiles were removed. It is inert — nothing parses it now.
+    """
+    row = _one("SELECT mode FROM runs WHERE run_id=?", (run_id,))
+    return row["mode"] if row else "?"
 
 
 def _data_ok(run_id: str) -> bool:
@@ -94,7 +93,7 @@ def status() -> dict:
 
     cfg = load_config()
     _, run_id, ts = _latest_decision()
-    mode, profile = _run_meta(run_id) if run_id else (cfg.mode, cfg.profile)
+    mode = _run_mode(run_id) if run_id else cfg.mode
     try:
         backend = llm.backend_name()
     except Exception:
@@ -127,15 +126,13 @@ def status() -> dict:
         "healthy": healthy,
         "warnings": warnings,
         "mode": cfg.mode,
-        "profile": cfg.profile,
-        "profiles": list(cfg.valid_profiles()),
         "kill_switch": {
             "engaged": cfg.kill_switch_enabled,
             "pinned": bool(cfg.raw.get("kill_switch", False)),
         },
         "accounts": accounts,
         "latest_run": (
-            {"run_id": run_id, "mode": mode, "profile": profile,
+            {"run_id": run_id, "mode": mode,
              "ts": ts, "ts_display": F.fmt_ts(ts)} if run_id else None
         ),
     }
@@ -146,7 +143,7 @@ def ideas() -> dict:
     obj, run_id, ts = _latest_decision()
     if not obj:
         return {"has_data": False}
-    mode, profile = _run_meta(run_id)
+    mode = _run_mode(run_id)
     amap = _latest_analysis_map()
     orders = obj.get("orders", []) or []
     rows = []
@@ -194,7 +191,7 @@ def ideas() -> dict:
             })
     return {
         "has_data": True,
-        "run": {"run_id": run_id, "mode": mode, "profile": profile,
+        "run": {"run_id": run_id, "mode": mode,
                 "ts_display": F.fmt_ts(ts)},
         "market_view": mv,
         "fallback": "fallback" in mv.lower(),

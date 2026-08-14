@@ -27,14 +27,11 @@ Hard safety properties enforced here:
     layer.
   * Every agent input/output, decision, order and fill is written to SQLite.
 
-Strategy profiles (``--profile``, orthogonal to ``--mode``; default ``swing``):
-overlay short-horizon parameter sets from config.yaml ``strategy_profiles:`` —
-e.g. ``momentum`` for days-to-~2-weeks quick-profit ideas. Profiles only adjust
-soft strategy/analysis/discovery parameters; hard risk limits never change.
+There is ONE strategy, configured under ``strategy:`` / ``analysis:`` in
+config.yaml — no profiles or per-run parameter switching.
 
 Usage:
     python orchestrator.py --mode recommend
-    python orchestrator.py --profile momentum --mode recommend
     python orchestrator.py --mode explain --ticker NVDA
     python orchestrator.py --mode preview
     python orchestrator.py --mode live --yes      # skip the extra live warning
@@ -157,6 +154,28 @@ class Orchestrator:
         peak = self.db.get_peak_equity(fallback=0.0, account=self.cfg.account_number)
         return await broker.get_account(peak_equity=peak, sectors=self.cfg.sectors)
 
+    async def check_broker(self) -> None:
+        """Preflight the Robinhood MCP connection: read the selected account and
+        print equity/cash/positions, or an actionable error. Places nothing."""
+        acct = self.cfg.account_number or "default"
+        print(f"🔌 Checking Robinhood MCP connection (account {acct})...")
+        broker = self._build_broker()
+        account = await self._read_account(broker)
+        if account is not None:
+            print(f"✅ Connected — account {acct}: equity ${account.equity:,.2f} · "
+                  f"cash ${account.cash:,.2f} · {account.open_position_count()} positions")
+            return
+        fail = getattr(broker, "last_read_failure", None) or {}
+        if fail.get("kind") == "no_response":
+            print("❌ No data from the Robinhood MCP — the connection likely needs "
+                  "re-authentication. In an interactive `claude` session started from "
+                  "this repo, run `/mcp` and reconnect robinhood-trading, then retry.")
+        else:
+            print("❌ Got a response but no valid account data — re-run; if it "
+                  "persists, reconnect robinhood-trading via `/mcp`.")
+        if fail.get("error"):
+            print(f"   detail: {fail['error']}")
+
     # -- recommend-mode account (read-only; never trades) ------------------
     def _hypothetical_account(self) -> AccountState:
         """A clean book sized from recommend.hypothetical_cash, so recommendation
@@ -264,7 +283,7 @@ class Orchestrator:
         cfg = self.cfg
         db = self.db
         db.start_run(self.run_id, self.mode,
-                     notes=f"backend={llm.backend_name()} profile={self.cfg.profile}")
+                     notes=f"backend={llm.backend_name()}")
         self._banner()
 
         # 0) KILL SWITCH gate (before anything trades). Recommend mode never
@@ -301,12 +320,27 @@ class Orchestrator:
             broker = self._build_broker()
             account = await self._read_account(broker)
         if account is None:
-            db.audit(self.run_id, "ERROR", "account_read_failed", {"mode": self.mode})
-            print("❌ Could not read the account from the broker. Aborting cycle.")
+            fail = getattr(broker, "last_read_failure", None) or {}
+            if fail.get("kind") == "no_response":
+                msg = ("Robinhood MCP returned no data across "
+                       f"{fail.get('attempts', 3)} attempts — the background connection "
+                       "likely needs re-authentication. In an interactive `claude` session "
+                       "started from this repo, run `/mcp` and reconnect robinhood-trading, "
+                       "then re-run. (Preview/live never fall back to a hypothetical book.)")
+                if fail.get("error"):
+                    msg += f"\n   detail: {fail['error']}"
+            else:
+                msg = ("Could not read the account from the Robinhood MCP "
+                       f"(got a response but no valid account data across "
+                       f"{fail.get('attempts', 3)} attempts). Re-run; if it persists, "
+                       "reconnect robinhood-trading via `/mcp`.")
+            db.audit(self.run_id, "ERROR", "account_read_failed",
+                     {"mode": self.mode, **fail})
+            print(f"❌ {msg}")
             db.finish_run(self.run_id)
             return PipelineOutcome(
                 halted=True, halt_reason="account_read_failed",
-                halt_message="Could not read the account from the broker. No orders placed.")
+                halt_message=msg + " No orders placed.")
 
         # Snapshot account state up front — REAL accounts only. A hypothetical
         # recommend book must never pollute the P&L/positions tables/dashboard.
@@ -360,21 +394,34 @@ class Orchestrator:
                 print(f"\n🔔 Monitor proposes {len(exit_intents)} exit(s).")
 
         # =================================================================
-        # DYNAMIC DISCOVERY (additive; silently falls back to the fixed universe)
+        # DYNAMIC DISCOVERY — the ONLY source of tickers. There is no fixed
+        # watchlist to fall back to, so a scan that yields nothing HALTS the
+        # run rather than trading a stale list of names.
         # =================================================================
-        universe = list(cfg.universe)
+        universe: list[str] = []
         if cfg.discovery.get("dynamic_discovery", False):
             try:
                 from data.screener import discover_candidates
-                discovered = discover_candidates(
-                    cfg, self.provider, cfg.discovery.get("max_discovered", 5))
-                for t in discovered:
-                    if t not in universe:
-                        universe.append(t)
-                if discovered:
-                    db.audit(self.run_id, "INFO", "discovery_added", {"tickers": discovered})
-            except Exception as e:  # never break the cycle over discovery
+                universe = discover_candidates(
+                    cfg, self.provider, cfg.discovery.get("max_discovered", 20))
+                if universe:
+                    db.audit(self.run_id, "INFO", "discovery_added", {"tickers": universe})
+            except Exception as e:
                 db.audit(self.run_id, "WARN", "discovery_failed", {"error": str(e)})
+                print(f"\n⚠️  Discovery failed: {e}")
+        else:
+            print("\n⚠️  discovery.dynamic_discovery is OFF — there is no fixed "
+                  "universe, so this run has nothing to research.")
+
+        if not universe:
+            db.audit(self.run_id, "WARN", "no_universe_halt", {})
+            print("\n🛑 Market scan produced no tradable candidates. Halting this "
+                  "cycle — nothing researched, nothing traded.")
+            db.finish_run(self.run_id)
+            return PipelineOutcome(
+                halted=True, halt_reason="no_universe_halt",
+                halt_message="Market scan produced no tradable candidates — "
+                             "nothing researched, no orders placed.")
 
         # =================================================================
         # RESEARCH -> ANALYSIS -> DECISION
@@ -389,7 +436,8 @@ class Orchestrator:
         )
         analysis = await run_analysis(
             research, cfg.models.get("analysis_agent", "claude-sonnet-4-6"),
-            strategy, weights=cfg.analysis.get("weights"), db=db, run_id=self.run_id,
+            strategy, weights=cfg.analysis.get("weights"),
+            factor_weights=cfg.analysis.get("factor_weights"), db=db, run_id=self.run_id,
         )
         print("📈 Top composites: " + ", ".join(
             f"{a['ticker']}={a.get('composite_score','?')}({a.get('swing_setup','?')})"
@@ -398,7 +446,7 @@ class Orchestrator:
 
         decision = await run_decision(
             analysis, _account_summary(account), limits_dict, strategy, trades_remaining,
-            cfg.models.get("decision_agent", "claude-opus-4-8"), db=db, run_id=self.run_id,
+            cfg.models.get("decision_agent", "claude-sonnet-4-6"), db=db, run_id=self.run_id,
         )
         buy_intents = self._decision_to_intents(decision.get("orders", []), account)
         print(f"🧠 Decision: {decision.get('market_view','')!r} -> {len(buy_intents)} proposed order(s)")
@@ -517,15 +565,15 @@ class Orchestrator:
         research = research_list[0]
         analysis_items = await run_analysis(
             research_list, cfg.models.get("analysis_agent", "claude-haiku-4-5-20251001"),
-            cfg.strategy, weights=cfg.analysis.get("weights"), db=db, run_id=self.run_id,
+            cfg.strategy, weights=cfg.analysis.get("weights"),
+            factor_weights=cfg.analysis.get("factor_weights"), db=db, run_id=self.run_id,
         )
         analysis = analysis_items[0] if analysis_items else {}
 
         position = await self._position_context(ticker)
         series = await asyncio.to_thread(self.provider.get_daily_series, ticker, 260)
         payload = explain_agent.build_payload(
-            ticker, research, analysis, series or [], cfg.strategy, position,
-            profile=cfg.profile)
+            ticker, research, analysis, series or [], cfg.strategy, position)
         report = await explain_agent.run_explain(
             payload, cfg.models.get("explain_agent", "claude-sonnet-4-6"),
             db=db, run_id=self.run_id,
@@ -586,10 +634,24 @@ class Orchestrator:
             icons = {"buy": "🟢", "add": "🔵", "hold": "⚪", "watch": "👁",
                      "trim": "🟠", "sell": "🔴", "avoid": "⛔"}
             print(f"\n  🎯 VERDICT: {icons.get(v['action'], '•')} "
-                  f"{str(v['action']).upper()}  (confidence {v.get('confidence', '—')}, "
-                  f"{v.get('profile', 'swing')} profile)")
+                  f"{str(v['action']).upper()}  (confidence {v.get('confidence', '—')})")
             if v.get("rationale"):
                 print(f"     {v['rationale']}")
+            # Forward lean + estimates (rough, not a prediction).
+            lean_icon = {"bullish": "📈", "bearish": "📉", "neutral": "➖"}
+            fwd = []
+            if v.get("lean"):
+                fwd.append(f"{lean_icon.get(v['lean'], '')} lean {v['lean']}")
+            if isinstance(v.get("expected_return_pct"), (int, float)):
+                fwd.append(f"est. return ~{v['expected_return_pct']:+.0f}%")
+            if isinstance(v.get("analyst_upside_pct"), (int, float)):
+                fwd.append(f"analyst upside {v['analyst_upside_pct']:+.0f}%")
+            if isinstance(v.get("expected_value_pct"), (int, float)):
+                fwd.append(f"scenario EV {v['expected_value_pct']:+.0f}%")
+            if v.get("risk_reward_r"):
+                fwd.append(f"{v['risk_reward_r']:.1f}R")
+            if fwd:
+                print("     " + "  ·  ".join(fwd))
             for reason in (v.get("reasons") or [])[:4]:
                 print(f"     • {reason}")
             plan = v.get("suggested_plan")
@@ -634,18 +696,21 @@ class Orchestrator:
                 return f"{label} n/a"
             return f"{label} {'$' + format(v, ',.0f') if money else round(v, 2)}"
         print("\n  🧾 " + " · ".join([
-            fv("pe_ratio", "P/E"), fv("ps_ratio", "P/S"),
+            fv("pe_ratio", "P/E"), fv("forward_pe", "fwd P/E"), fv("ps_ratio", "P/S"),
             fv("eps_growth_yoy", "EPS growth%"), fv("debt_to_equity", "D/E"),
+            fv("analyst_upside_pct", "analyst upside%"),
             fv("free_cash_flow", "FCF", money=True)]))
         if f.get("note"):
             print(f"     {f['note']}")
 
         scenarios = report.get("scenarios") or []
         if scenarios:
-            print("\n  🔮 Scenarios (conditional levels — NOT a forecast):")
+            print("\n  🔮 Scenarios (probability-weighted — rough estimates, not a forecast):")
             for s in scenarios:
                 tl = s.get("target_level")
-                print(f"     • {str(s.get('name', '')).upper():4} if {s.get('condition', '?')}"
+                prob = s.get("probability")
+                prob_s = f" [~{int(round(prob * 100))}%]" if isinstance(prob, (int, float)) else ""
+                print(f"     • {str(s.get('name', '')).upper():4}{prob_s} if {s.get('condition', '?')}"
                       + (f" → toward ${tl:,.2f}" if isinstance(tl, (int, float)) else ""))
                 if s.get("narrative"):
                     print(f"        {s['narrative']}")
@@ -703,11 +768,12 @@ class Orchestrator:
             # Record/refresh the exit plan for opened/increased positions so the
             # Monitor enforces the decision's stop / target / time-stop later.
             if result.ok and intent.side == Side.BUY and intent.action in ("buy", "add"):
+                fill = result.fill_price or ref_price
                 self.db.upsert_trade_plan(
                     ticker=intent.ticker, run_id=self.run_id,
-                    entry_price=result.fill_price or ref_price,
-                    stop_loss=intent.stop_loss, take_profit=intent.take_profit,
-                    max_hold_until=intent.max_hold_until, thesis=intent.rationale,
+                    entry_price=fill, stop_loss=intent.stop_loss,
+                    take_profit=intent.take_profit, max_hold_until=intent.max_hold_until,
+                    thesis=intent.rationale, peak_price=fill,  # seed the chandelier trail
                 )
             tag = "✓" if result.ok else "✗"
             print(f"   {tag} {intent.side.value} {res.approved_shares:g} {intent.ticker} "
@@ -768,7 +834,7 @@ class Orchestrator:
         exits = monitor_out.get("exits", []) or []
 
         print("\n" + "─" * 70)
-        print(f"📋 RECOMMENDATIONS  ({self.cfg.profile} profile — advice only, nothing traded)")
+        print("📋 RECOMMENDATIONS  (advice only, nothing traded)")
         if decision.get("market_view"):
             print(f"   Market view: {decision['market_view']}")
         print("─" * 70)
@@ -869,9 +935,11 @@ class Orchestrator:
         stop/target/time-stop levels + original thesis) plus fresh price and the
         latest thesis-break signals (score, sma50, volume, sentiment)."""
         strat = self.cfg.strategy
-        default_stop = strat.get("default_stop_loss_pct", 0.08)
+        default_stop = strat.get("max_loss_pct", strat.get("default_stop_loss_pct", 0.10))
         default_tp = strat.get("default_take_profit_pct", 0.20)
         exit_below = strat.get("exit_below_score", 35)
+        use_trail = bool(strat.get("use_trailing_stop", True))
+        trail_mult = float(strat.get("trail_atr_mult", 3.0))
         plans = self.db.get_trade_plans()           # decision agent's exit plans
         scores = self.db.get_latest_scores()        # previous cycle's composites
         research = self.db.get_latest_research()     # previous cycle's technicals/sentiment
@@ -881,6 +949,7 @@ class Orchestrator:
             plan = plans.get(t, {})
             tech = (research.get(t, {}) or {}).get("technicals", {}) or {}
             news = (research.get(t, {}) or {}).get("news_sentiment", {}) or {}
+            atr = tech.get("atr20")
             # Absolute exit levels: prefer the stored plan, else derive defaults
             # from entry so the rules still protect an un-planned legacy position.
             stop_level = plan.get("stop_loss")
@@ -889,6 +958,18 @@ class Orchestrator:
             take_level = plan.get("take_profit")
             if take_level is None and p.avg_cost:
                 take_level = round(p.avg_cost * (1 + default_tp), 2)
+
+            # CHANDELIER TRAIL — ratchet the stop up with the highest price seen
+            # since entry (never down). This is what stops a winner giving back its
+            # gains and, crucially, a loser riding far past its stop. Persisted so
+            # the level is current on the next run and in the live path.
+            peak = max(x for x in (plan.get("peak_price"), plan.get("entry_price"),
+                                   p.avg_cost, price) if x is not None)
+            if use_trail and atr and peak:
+                trailed = round(peak - trail_mult * atr, 2)
+                stop_level = max(stop_level or trailed, trailed)
+                self.db.update_trail(t, stop_loss=stop_level, peak_price=peak)
+
             out.append({
                 "ticker": t, "shares": p.shares, "avg_cost": p.avg_cost,
                 "current_price": price, "market_value": p.market_value, "sector": p.sector,
@@ -900,7 +981,10 @@ class Orchestrator:
                 "thesis": plan.get("thesis"),
                 "score": scores.get(t, 50),
                 "exit_below_score": exit_below,
+                "atr20": atr,
                 "sma50": tech.get("sma50"),
+                "above_sma200": tech.get("above_sma200"),
+                "ret_3m": tech.get("ret_3m"),
                 "volume_vs_avg": tech.get("volume_vs_avg"),
                 "sentiment_score": news.get("aggregate_score"),
             })
@@ -909,8 +993,7 @@ class Orchestrator:
     # -- console UX --------------------------------------------------------
     def _banner(self) -> None:
         print("=" * 70)
-        print(f" Trading System  |  mode={self.mode.upper()}  |  "
-              f"profile={self.cfg.profile.upper()}  |  run={self.run_id}")
+        print(f" Trading System  |  mode={self.mode.upper()}  |  run={self.run_id}")
         print(f" LLM backend: {llm.backend_name()}")
         if self.mode == "recommend":
             print(" RECOMMEND MODE: advice only — nothing is traded.")
@@ -934,9 +1017,6 @@ def parse_args() -> argparse.Namespace:
                     help="run mode (overrides config.yaml; default recommend)")
     ap.add_argument("--ticker", default=None,
                     help="stock symbol for --mode explain (e.g. --ticker NVDA)")
-    ap.add_argument("--profile", default=None,
-                    help="strategy profile from config.yaml strategy_profiles "
-                         "(e.g. swing, momentum; default: config `profile:`, i.e. swing)")
     ap.add_argument("--account", default=None,
                     help="brokerage account role from config.yaml accounts: "
                          "(e.g. individual, agentic). Default: individual for "
@@ -946,6 +1026,9 @@ def parse_args() -> argparse.Namespace:
                     help="skip the interactive LIVE confirmation (use with care)")
     ap.add_argument("--kill", action="store_true",
                     help="create the kill-switch file and exit (emergency stop)")
+    ap.add_argument("--check-broker", action="store_true",
+                    help="test the Robinhood MCP connection: read the account and "
+                         "print equity/cash/positions (or an actionable error), then exit")
     return ap.parse_args()
 
 
@@ -962,18 +1045,11 @@ def main() -> None:
     if args.mode:
         config.set_mode(args.mode)
 
-    # Apply the strategy profile (CLI beats the config default) BEFORE anything
-    # reads strategy/analysis/discovery. Profiles never touch the hard risk: limits.
-    try:
-        config.apply_profile(args.profile or config.profile)
-    except ValueError as e:
-        raise SystemExit(f"error: {e}")
-
     # Select the brokerage account for this run (multi-account routing). Advice
     # modes default to `individual`, trading modes to `agentic`, so autonomous
     # orders never touch the individual book. When no accounts: block is
-    # configured the system stays single-account (MCP default). The per-account
-    # risk overlay is applied here, so it must run AFTER apply_profile.
+    # configured the system stays single-account (MCP default). This is where
+    # the per-account risk overlay is applied.
     role = args.account
     if role is None and config.accounts:
         role = "agentic" if config.mode in ("preview", "live") else "individual"
@@ -991,6 +1067,10 @@ def main() -> None:
                 "trade without an explicit account.")
 
     orch = Orchestrator(config, assume_yes=args.yes)
+
+    if args.check_broker:
+        asyncio.run(orch.check_broker())
+        return
 
     if config.mode == "explain":
         ticker = (args.ticker or "").strip().upper()

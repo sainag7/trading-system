@@ -28,8 +28,9 @@ from data import indicators
 SYSTEM_PROMPT = load_prompt("explain_agent")
 
 NO_CATALYST = "no clear catalyst found in available news"
-DISCLAIMER = ("Conditional scenarios derived from current levels — not a forecast, "
-              "not financial advice.")
+DISCLAIMER = ("Forward lean, expected value and scenario probabilities are rough "
+              "estimates from momentum, valuation and analyst consensus — wide "
+              "error bars, not guarantees, not financial advice.")
 
 
 def _r(v, nd: int = 2):
@@ -82,36 +83,116 @@ def _levels(series: list[dict], price: float | None, atr: float | None) -> dict:
     }
 
 
-def _scenarios(price: float | None, levels: dict, atr: float | None) -> list[dict]:
-    """Bull/base/bear as CONDITIONAL levels (never a prediction)."""
+def _scenario_probs(tech: dict) -> dict:
+    """Rough probabilities for bull/base/bear, tilted by trend + 3-month momentum.
+    Deliberately coarse — a lean, not a precise forecast. Base case anchors the
+    middle; a confirmed up/down-trend shifts weight toward bull/bear respectively."""
+    bull, base, bear = 0.33, 0.34, 0.33
+    above200 = tech.get("above_sma200")
+    if above200 is True:
+        bull, bear = bull + 0.10, bear - 0.10
+    elif above200 is False:
+        bear, bull = bear + 0.10, bull - 0.10
+    ret3 = tech.get("ret_3m")
+    if isinstance(ret3, (int, float)):
+        if ret3 > 5:
+            bull, bear = bull + 0.05, bear - 0.05
+        elif ret3 < -5:
+            bear, bull = bear + 0.05, bull - 0.05
+    vals = {"bull": max(0.05, bull), "base": max(0.05, base), "bear": max(0.05, bear)}
+    total = sum(vals.values())
+    return {k: round(v / total, 2) for k, v in vals.items()}
+
+
+def _scenarios(price: float | None, levels: dict, atr: float | None,
+               tech: dict | None = None) -> list[dict]:
+    """Bull/base/bear conditional levels, each with a rough probability so the
+    reader gets a directional lean and an expected value — not just 'if X then Y'."""
     if not price:
         return []
     atr = atr or max(price * 0.02, 0.01)  # conservative fallback band
     res = levels.get("resistance") or _r(price + 1.5 * atr)
     sup = levels.get("support") or _r(price - 1.5 * atr)
+    probs = _scenario_probs(tech or {})
     return [
         {
-            "name": "bull",
+            "name": "bull", "probability": probs["bull"],
             "condition": f"breaks and holds above resistance ${res:,.2f}",
             "target_level": _r(res + 2 * atr),
             "confirm": f"daily close above ${res:,.2f} on above-average volume",
             "invalidate": f"rejection at ${res:,.2f} and close back below ${_r(price - atr):,.2f}",
         },
         {
-            "name": "base",
+            "name": "base", "probability": probs["base"],
             "condition": f"holds the ${sup:,.2f}–${res:,.2f} range",
             "target_level": _r((sup + res) / 2),
             "confirm": f"closes remaining between ${sup:,.2f} and ${res:,.2f}",
             "invalidate": f"daily close outside the range in either direction",
         },
         {
-            "name": "bear",
+            "name": "bear", "probability": probs["bear"],
             "condition": f"loses support at ${sup:,.2f}",
             "target_level": _r(sup - 2 * atr),
             "confirm": f"daily close below ${sup:,.2f}, especially on volume",
             "invalidate": f"reclaim of ${sup:,.2f} within 1–2 sessions",
         },
     ]
+
+
+def _expected_move_pct(atr_pct: float | None, days: int | None) -> float | None:
+    """Vol-scaled expected move over ``days`` sessions (ATR% · sqrt(days)). A
+    volatility band, not a directional forecast."""
+    if not isinstance(atr_pct, (int, float)) or not days or days <= 0:
+        return None
+    return round(atr_pct * (days ** 0.5), 1)
+
+
+def _expected_value_pct(price: float | None, scenarios: list[dict]) -> float | None:
+    """Probability-weighted expected return across the scenarios (rough estimate)."""
+    if not price or not scenarios:
+        return None
+    ev = 0.0
+    for s in scenarios:
+        tgt, p = s.get("target_level"), s.get("probability")
+        if not isinstance(tgt, (int, float)) or not isinstance(p, (int, float)):
+            return None
+        ev += p * (tgt / price - 1) * 100
+    return round(ev, 1)
+
+
+def _forward_view(price, tech: dict, fund: dict, plan: dict | None) -> dict:
+    """A clearly-labeled forward lean from data the system actually has: analyst
+    consensus upside, recent momentum, trend regime, and the plan's reward:risk.
+    An estimate with wide error bars — never a promise."""
+    up = fund.get("analyst_upside_pct")
+    ret3 = tech.get("ret_3m")
+    above200 = tech.get("above_sma200")
+
+    votes, n = 0, 0
+    for v in (above200, (ret3 or 0) > 0 if ret3 is not None else None):
+        if v is not None:
+            votes += 1 if v else -1
+            n += 1
+    if isinstance(up, (int, float)):
+        votes += 1 if up > 5 else (-1 if up < -5 else 0)
+        n += 1
+    lean = "neutral"
+    if n:
+        if votes >= 2:
+            lean = "bullish"
+        elif votes <= -2:
+            lean = "bearish"
+
+    parts = [(0.6, up), (0.4, ret3)]
+    er_num = sum(w * v for w, v in parts if isinstance(v, (int, float)))
+    er_den = sum(w for w, v in parts if isinstance(v, (int, float)))
+    expected_return = round(er_num / er_den, 1) if er_den else None
+    return {
+        "lean": lean,
+        "expected_return_pct": expected_return,   # rough blend of analyst upside + momentum
+        "analyst_upside_pct": up,
+        "risk_reward_r": (plan or {}).get("risk_reward_r"),
+    }
 
 
 def _days_until(date_str) -> int | None:
@@ -126,12 +207,12 @@ def _days_until(date_str) -> int | None:
 # Verdict (deterministic buy/sell recommendation; the LLM only narrates it)
 # ---------------------------------------------------------------------------
 def _verdict(price, composite, held: bool | None, strategy: dict, *,
-             profile: str = "swing", event_risk: bool = False,
+             event_risk: bool = False, atr=None,
              atr_pct=None, news_score=None, article_count: int = 0,
              missing_fields: int = 0) -> dict:
     """Map the composite score + position context onto an explicit action using
-    the ACTIVE profile's strategy thresholds — the same numbers recommend mode
-    trades on. Pure & unit-testable; advice only (never writes a plan/order)."""
+    the configured strategy thresholds — the same numbers recommend mode trades
+    on. Pure & unit-testable; advice only (never writes a plan/order)."""
     buy_th = float(strategy.get("min_score_to_buy", 65))
     add_th = float(strategy.get("min_score_to_add", 70))
     trim_th = float(strategy.get("trim_below_score", 45))
@@ -191,17 +272,15 @@ def _verdict(price, composite, held: bool | None, strategy: dict, *,
 
     plan = None
     if action in ("buy", "add") and isinstance(price, (int, float)) and price > 0:
-        stop, take, until = _plan_levels(
-            price, strategy.get("default_stop_loss_pct", 0.08),
-            strategy.get("default_take_profit_pct", 0.20),
-            strategy.get("max_holding_days", 120))
+        stop, take, until = _plan_levels(price, atr, strategy)
+        rr = round((take - price) / (price - stop), 2) if (take and stop and price > stop) else None
         plan = {"stop": stop, "target": take, "max_hold_until": until,
+                "risk_reward_r": rr,
                 "note": "informational levels only — nothing is planned or ordered"}
 
     return {
         "action": action,
         "confidence": conf,
-        "profile": profile,
         "based_on": {"composite": _r(score, 0), "buy_threshold": buy_th,
                      "add_threshold": add_th, "trim_threshold": trim_th,
                      "exit_threshold": exit_th, "held": held},
@@ -214,8 +293,7 @@ def _verdict(price, composite, held: bool | None, strategy: dict, *,
 # Payload assembly (deterministic)
 # ---------------------------------------------------------------------------
 def build_payload(ticker: str, research: dict, analysis: dict, series: list[dict],
-                  strategy: dict, position: dict | None,
-                  profile: str = "swing") -> dict:
+                  strategy: dict, position: dict | None) -> dict:
     tech = research.get("technicals") or {}
     fund = research.get("fundamentals") or {}
     news = research.get("news_sentiment") or {}
@@ -234,12 +312,19 @@ def build_payload(ticker: str, research: dict, analysis: dict, series: list[dict
 
     held = position.get("held") if isinstance(position, dict) else None
     verdict_seed = _verdict(
-        price, analysis.get("composite_score"), held, strategy, profile=profile,
-        event_risk=event_risk, atr_pct=tech.get("atr20_pct"),
+        price, analysis.get("composite_score"), held, strategy,
+        event_risk=event_risk, atr=atr, atr_pct=tech.get("atr20_pct"),
         news_score=news.get("aggregate_score"),
         article_count=int(news.get("article_count", 0) or 0),
         missing_fields=len((research.get("data_quality") or {}).get("missing_fields") or []),
     )
+    # Forward lean (analyst upside + momentum + trend) and probability-weighted
+    # expected value across the scenarios. Estimates with wide error bars, merged
+    # onto the verdict so the briefing states a direction, not just levels.
+    scenario_levels = _scenarios(price, levels, atr, tech)
+    verdict_seed.update(_forward_view(price, tech, fund, verdict_seed.get("suggested_plan")))
+    verdict_seed["expected_value_pct"] = _expected_value_pct(price, scenario_levels)
+    expected_move = _expected_move_pct(tech.get("atr20_pct"), edays)
 
     return {
         "ticker": ticker,
@@ -263,9 +348,13 @@ def build_payload(ticker: str, research: dict, analysis: dict, series: list[dict
             "atr20": tech.get("atr20"), "atr20_pct": tech.get("atr20_pct"),
             "volume_vs_avg": tech.get("volume_vs_avg"), "trend": tech.get("trend"),
             "distance_from_52w_high_pct": tech.get("distance_from_52w_high_pct"),
+            # Momentum (time-series) — the primary factor in the new methodology.
+            "ret_1m": tech.get("ret_1m"), "ret_3m": tech.get("ret_3m"),
+            "ret_6m": tech.get("ret_6m"), "ret_12m": tech.get("ret_12m"),
+            "ret_12_1": tech.get("ret_12_1"), "above_sma200": tech.get("above_sma200"),
         },
         "levels": levels,
-        "scenario_levels": _scenarios(price, levels, atr),
+        "scenario_levels": scenario_levels,
         "news": {
             "aggregate_score": news.get("aggregate_score"),
             "aggregate_label": news.get("aggregate_label"),
@@ -282,12 +371,16 @@ def build_payload(ticker: str, research: dict, analysis: dict, series: list[dict
             "days_until": edays,
             "event_risk": event_risk,
             "horizon_days": horizon,
+            "expected_move_pct": expected_move,   # vol-scaled band into the report
         },
         "verdict_seed": verdict_seed,
         "fundamentals": {k: fund.get(k) for k in (
             "pe_ratio", "ps_ratio", "eps_ttm", "eps_growth_yoy", "revenue_ttm",
             "revenue_growth_yoy", "gross_margin", "operating_margin",
-            "debt_to_equity", "free_cash_flow", "beta")},
+            "debt_to_equity", "free_cash_flow", "beta",
+            # Forward-looking: analyst consensus + forward valuation.
+            "analyst_target", "analyst_upside_pct", "forward_pe", "forward_eps",
+            "recommendation_mean", "num_analysts")},
         "analysis": {
             "composite_score": analysis.get("composite_score"),
             "swing_setup": analysis.get("swing_setup"),
@@ -351,9 +444,16 @@ def _offline_report(payload: dict) -> dict:
     if e.get("event_risk") and not any("earnings" in str(r).lower() for r in risks):
         risks.insert(0, f"earnings in ~{e['days_until']}d ({e['next_date']}) — event risk")
     seed = payload.get("verdict_seed") or {}
+    fwd = []
+    if seed.get("lean"):
+        fwd.append(f"lean {seed['lean']}")
+    if isinstance(seed.get("expected_return_pct"), (int, float)):
+        fwd.append(f"~{seed['expected_return_pct']:+.0f}% est. return")
+    if seed.get("risk_reward_r"):
+        fwd.append(f"{seed['risk_reward_r']:.1f}R reward:risk")
     verdict = {**seed,
                "rationale": (f"{str(seed.get('action', 'watch')).upper()} — "
-                             + "; ".join(seed.get("reasons", [])[:3]))}
+                             + "; ".join(list(seed.get("reasons", [])[:2]) + fwd))}
     return {
         "ticker": payload["ticker"],
         "as_of": payload["as_of"],
@@ -373,8 +473,8 @@ def _offline_report(payload: dict) -> dict:
         "fundamentals": {**payload["fundamentals"],
                          "note": "fields not returned by providers are null/unavailable"},
         "scenarios": [
-            {**s, "narrative": f"{s['name']}: if {s['condition']}, "
-                               f"potential move toward ${s['target_level']:,.2f}."}
+            {**s, "narrative": (f"{s['name']} (~{int(round(s.get('probability', 0) * 100))}%): "
+                                f"if {s['condition']}, toward ${s['target_level']:,.2f}.")}
             for s in payload["scenario_levels"]
         ],
         "risks": risks or ["insufficient data to enumerate risks"],

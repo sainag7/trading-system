@@ -1,24 +1,27 @@
 """Dynamic stock discovery (screener).
 
-Runs BEFORE the research pipeline to surface trending / most-active names beyond
-the fixed ``universe:`` in config.yaml — using FREE sources only:
+Runs BEFORE the research pipeline and produces **the entire universe** for a
+run. There is no fixed watchlist in config.yaml — every ticker the agents look
+at comes from here, using FREE sources only:
 
   * yfinance predefined screeners (most_actives / day_gainers)
   * Yahoo Finance's public trending endpoint
   * Reddit r/wallstreetbets + r/stocks "hot" JSON (public, no auth)
 
-Candidates are de-duplicated, excluded against the fixed universe + no-trade
-list, then passed through a **yfinance-only** pre-filter (price band + average
-volume) so it costs **zero Alpha Vantage quota**. The top N by recent momentum
-are returned and appended to the universe for that run only.
+Candidates are de-duplicated, excluded against the no-trade list, then passed
+through a **yfinance-only** pre-filter (price band, average volume, and an
+annualised-volatility ceiling) so it costs **zero Alpha Vantage quota**. The top
+N by recent momentum are returned.
 
 The single public entry point is :func:`discover_candidates`. It is fully
 defensive: every external call is wrapped, and any failure (or no network)
-results in an empty list so the orchestrator silently falls back to the fixed
-universe. It logs what it found and why each candidate was kept/dropped.
+results in an empty list. Because there is no fallback watchlist, an empty
+result means the orchestrator HALTS the cycle and trades nothing — fail-closed
+by design. It logs what it found and why each candidate was kept/dropped.
 """
 from __future__ import annotations
 
+import math
 import re
 
 try:
@@ -56,7 +59,10 @@ _STOPWORDS = {
     "GO", "ON", "IN", "AT", "BE", "DO", "IF", "OR", "SO", "UP", "TO", "IT",
 }
 
-_MAX_EXAMINED = 25  # cap candidates we hit yfinance for, to bound runtime
+# Cap on candidates we hit yfinance for, to bound runtime. Must be comfortably
+# larger than discovery.max_discovered — the price-band and volume pre-filter
+# typically drops a fifth of what the sources return.
+_MAX_EXAMINED = 60
 
 
 # ---------------------------------------------------------------------------
@@ -138,12 +144,21 @@ def _reddit_mentions(limit_posts: int = 50) -> list[str]:
 # ---------------------------------------------------------------------------
 # Pre-filter (yfinance ONLY — no Alpha Vantage quota cost)
 # ---------------------------------------------------------------------------
-def _passes_filter(ticker: str, min_vol: float, min_p: float, max_p: float):
-    """Return ``(ok, reason, momentum_pct)``. Uses only yfinance."""
+_MOMENTUM_BARS = 21   # ~1 trading month — the window the momentum ranking uses
+
+
+def _passes_filter(ticker: str, min_vol: float, min_p: float, max_p: float,
+                   max_vol_ann: float):
+    """Return ``(ok, reason, momentum_pct)``. Uses only yfinance.
+
+    Fetches 3 months so annualised volatility has enough samples to be stable
+    (~21 bars is far too noisy for a std-dev estimate), but still measures
+    momentum over the last ~21 bars so the ranking keeps its 1-month meaning.
+    """
     if yf is None:
         return False, "yfinance unavailable", None
     try:
-        hist = yf.Ticker(ticker).history(period="1mo")
+        hist = yf.Ticker(ticker).history(period="3mo")
     except Exception:
         return False, "fetch error", None
     if hist is None or getattr(hist, "empty", True):
@@ -156,37 +171,61 @@ def _passes_filter(ticker: str, min_vol: float, min_p: float, max_p: float):
     if not closes or not vols:
         return False, "no price data", None
     price = closes[-1]
-    avg_vol = sum(vols) / len(vols)
-    momentum = (closes[-1] / closes[0] - 1) * 100 if len(closes) > 1 and closes[0] else 0.0
+    # Volume over the recent window, matching the pre-3mo behaviour.
+    recent_vols = vols[-_MOMENTUM_BARS:]
+    avg_vol = sum(recent_vols) / len(recent_vols)
+    # Momentum over the last ~month, unchanged in meaning by the longer fetch.
+    mom_closes = closes[-_MOMENTUM_BARS:]
+    momentum = ((mom_closes[-1] / mom_closes[0] - 1) * 100
+                if len(mom_closes) > 1 and mom_closes[0] else 0.0)
+
     if not (min_p <= price <= max_p):
         return False, f"price ${price:,.2f} outside ${min_p:g}-${max_p:g}", None
     if avg_vol < min_vol:
         return False, f"avg vol {avg_vol/1e3:,.0f}k < {min_vol/1e3:,.0f}k", None
-    return True, f"price ${price:,.2f}, avg vol {avg_vol/1e6:,.1f}M, 1mo {momentum:+.1f}%", momentum
+
+    # Annualised volatility from the full 3-month window.
+    rets = [closes[i] / closes[i - 1] - 1
+            for i in range(1, len(closes)) if closes[i - 1]]
+    ann_vol = None
+    if len(rets) > 2:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        ann_vol = math.sqrt(var) * math.sqrt(252)
+        if max_vol_ann > 0 and ann_vol > max_vol_ann:
+            return False, (f"annualised vol {ann_vol*100:,.0f}% > "
+                           f"{max_vol_ann*100:,.0f}%"), None
+
+    vol_txt = f", vol {ann_vol*100:,.0f}%" if ann_vol is not None else ""
+    return True, (f"price ${price:,.2f}, avg vol {avg_vol/1e6:,.1f}M, "
+                  f"1mo {momentum:+.1f}%{vol_txt}"), momentum
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 def discover_candidates(cfg, provider, n: int = 5) -> list[str]:
-    """Return up to ``n`` trending tickers NOT already in the fixed universe.
+    """Return up to ``n`` trending tickers — the whole universe for this run.
 
     Args:
-        cfg: the global :class:`config.Config` (uses ``.discovery``, ``.universe``,
+        cfg: the global :class:`config.Config` (uses ``.discovery`` and
             ``.risk.no_trade_list``).
         provider: the :class:`data.providers.DataProvider`; its ``.cache`` is
             reused for a daily cache when present.
         n: max tickers to return.
 
-    Never raises — returns ``[]`` on any failure so discovery stays additive.
+    Never raises — returns ``[]`` on any failure. An empty result halts the
+    cycle upstream (there is no watchlist to fall back to).
     """
     try:
         disc = cfg.discovery or {}
     except Exception:
         disc = {}
+    # No fixed universe exists, so turning this off does not fall back to a
+    # watchlist — it stops the system from researching (and trading) anything.
     if not disc.get("dynamic_discovery", False):
         return []
-    n = int(n or disc.get("max_discovered", 5))
+    n = int(n or disc.get("max_discovered", 20))
 
     cache = getattr(provider, "cache", None)
     cache_key = f"discovery_candidates_n{n}"
@@ -199,10 +238,6 @@ def discover_candidates(cfg, provider, n: int = 5) -> list[str]:
             print(f"\n🔎 Discovery: reusing today's cached candidates {cached}")
             return list(cached)
 
-    try:
-        fixed = set(cfg.universe)
-    except Exception:
-        fixed = set()
     try:
         no_trade = set(cfg.risk.no_trade_list)
     except Exception:
@@ -223,40 +258,41 @@ def discover_candidates(cfg, provider, n: int = 5) -> list[str]:
         print(f"   reddit mentions:    {len(s)} symbols")
         raw += s
 
-    # Normalize, dedupe (preserve order), exclude universe + no-trade list.
+    # Normalize, dedupe (preserve order), exclude the no-trade list.
     seen: set[str] = set()
     candidates: list[str] = []
     for sym in raw:
         t = str(sym).upper().strip().lstrip("$")
         if not t.isalpha() or not (1 <= len(t) <= 5):
             continue
-        if t in fixed or t in no_trade or t in seen:
+        if t in no_trade or t in seen:
             continue
         seen.add(t)
         candidates.append(t)
 
     if not candidates:
-        print("   no new candidates found — falling back to the fixed universe.")
+        print("   no candidates found from any source — this run will be halted.")
         return []
 
     min_vol = float(disc.get("min_avg_volume", 500000))
     min_p = float(disc.get("min_price", 2))
     max_p = float(disc.get("max_price", 500))
+    max_vol_ann = float(disc.get("max_annualized_vol", 0.60))
 
     kept: list[tuple[str, float]] = []
     for t in candidates[:_MAX_EXAMINED]:
-        ok, reason, momentum = _passes_filter(t, min_vol, min_p, max_p)
+        ok, reason, momentum = _passes_filter(t, min_vol, min_p, max_p, max_vol_ann)
         print(f"   {'kept ' if ok else 'drop '} {t}: {reason}")
         if ok:
             kept.append((t, momentum if momentum is not None else 0.0))
 
     if not kept:
-        print("   no candidates passed the pre-filter — using the fixed universe.")
+        print("   no candidates passed the pre-filter — this run will be halted.")
         return []
 
     kept.sort(key=lambda kv: kv[1], reverse=True)  # strongest momentum first
     result = [t for t, _ in kept[:n]]
-    print(f"   ➕ adding {len(result)} discovered ticker(s): {result}")
+    print(f"   ➕ universe for this run — {len(result)} ticker(s): {result}")
     if cache is not None:
         try:
             cache.set(cache_key, result)

@@ -64,6 +64,32 @@ def rsi(closes: list[float], n: int = 14) -> float | None:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
+def pct_return(closes: list[float], lookback_days: int) -> float | None:
+    """Percent price return over the last ``lookback_days`` bars (oldest-first).
+
+    Used for time-series momentum features. Returns ``None`` when there is not
+    enough history or the reference price is missing/zero.
+    """
+    if not closes or lookback_days <= 0 or len(closes) <= lookback_days:
+        return None
+    prev = closes[-1 - lookback_days]
+    if not prev:
+        return None
+    return (closes[-1] / prev - 1) * 100.0
+
+
+def momentum_12_1(closes: list[float]) -> float | None:
+    """Classic 12-1 momentum: the return from ~12 months ago to ~1 month ago,
+    skipping the most recent month to sidestep short-term reversal. Assumes ~252
+    trading days/year and ~21/month. ``None`` if under ~1 year of history."""
+    if not closes or len(closes) <= 252:
+        return None
+    old, recent = closes[-252], closes[-21]
+    if not old:
+        return None
+    return (recent / old - 1) * 100.0
+
+
 def macd(
     closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9
 ) -> dict[str, float | None]:

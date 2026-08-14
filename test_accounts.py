@@ -45,9 +45,17 @@ def test_agentic_overlay_applies_100dollar_risk():
         r = cfg.risk
         # The $100 overlay must take effect for the agentic account.
         assert r.min_trade_usd == 1.0, r.min_trade_usd
-        assert r.per_trade_max_usd == 25.0, r.per_trade_max_usd
         assert r.max_position_pct == 0.34, r.max_position_pct
-        assert r.max_positions == 5, r.max_positions
+        assert r.max_positions == 3, r.max_positions
+        # Per-trade sizing is equity-scaled: the pct binds on a small book and
+        # grows with the account, so it is never a stale dollar figure.
+        assert r.per_trade_max_pct == 0.30, r.per_trade_max_pct
+        assert min(r.per_trade_max_usd, r.per_trade_max_pct * 100.0) == 30.0
+        # Discovered tickers often have no sector, so they all collapse into one
+        # "Unknown" bucket; the sector cap is disabled here on purpose.
+        assert r.max_sector_pct == 1.0, r.max_sector_pct
+        # The concentrated book must fit inside the cash floor exactly.
+        assert r.max_positions * 30.0 == (100.0 - r.min_cash_reserve_pct * 100.0)
         # Overrides that were NOT specified inherit the base limits.
         assert r.min_cash_reserve_pct == 0.10
         # Routing metadata is resolved.

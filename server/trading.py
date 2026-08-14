@@ -122,8 +122,7 @@ def _plan_payload(pending: _Pending) -> dict:
     }
 
 
-async def build(mode: str = "preview", profile: str | None = None,
-                account: str | None = None) -> dict:
+async def build(mode: str = "preview", account: str | None = None) -> dict:
     """Run the pipeline to the guardrails and stash the plan. Returns a payload of
     proposed orders for the approval UI, or a ``halted`` result if a gate stopped
     the run."""
@@ -132,7 +131,7 @@ async def build(mode: str = "preview", profile: str | None = None,
     for pid in list(_pending):
         _drop(pid)
 
-    cfg, role, _active = engine.prepare_config(mode=mode, profile=profile, account=account)
+    cfg, role, _active = engine.prepare_config(mode=mode, account=account)
     orch = Orchestrator(cfg, assume_yes=True)  # the UI collects any live confirmation
     outcome = await orch.build_plan()
     if outcome.halted:
@@ -176,13 +175,13 @@ async def execute(plan_id: str, approved_indices: list[int]) -> dict:
     return _summary(pending.orch.run_id, len(chosen))
 
 
-async def live(profile: str | None = None, account: str | None = None) -> dict:
+async def live(account: str | None = None) -> dict:
     """One-click live: build the plan and place EVERY guardrail-approved order."""
     _sweep()
     for pid in list(_pending):
         _drop(pid)
 
-    cfg, role, _active = engine.prepare_config(mode="live", profile=profile, account=account)
+    cfg, role, _active = engine.prepare_config(mode="live", account=account)
     orch = Orchestrator(cfg, assume_yes=True)  # UI already collected the typed confirm
     outcome = await orch.build_plan()
     if outcome.halted:

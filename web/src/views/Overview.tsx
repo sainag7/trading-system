@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Play, TrendingUp, Search, ArrowRight, AlertTriangle } from "lucide-react";
 import { api } from "../lib/api";
 import { useStatus } from "../lib/status";
@@ -10,13 +9,9 @@ export function Overview({ onNavigate }: { onNavigate: (v: View) => void }) {
   const { status, reload } = useStatus();
   const { runJob, busy } = useJob();
   const ideas = useFetch(() => api.ideas(), []);
-  const [profile, setProfile] = useState<string>("");
-
-  const prof = profile || status?.profile || "swing";
-
   const runScan = () =>
-    runJob(() => api.scan(prof), {
-      label: `${prof} scan`,
+    runJob(() => api.scan(), {
+      label: "scan",
       onDone: () => { reload(); ideas.reload(); },
     });
 
@@ -42,10 +37,10 @@ export function Overview({ onNavigate }: { onNavigate: (v: View) => void }) {
 
       <div className="grid grid-4" style={{ marginBottom: 16 }}>
         <Stat label="Market" value={status?.market.label ?? "—"} sub={status?.market.now_et} />
-        <Stat label="Default mode" value={status?.mode ?? "—"} sub={`profile ${status?.profile ?? "—"}`} />
+        <Stat label="Default mode" value={status?.mode ?? "—"} />
         <Stat label="LLM backend" value={status?.backend ?? "—"}
           sub={status?.data_ok ? "market data ok" : "no market data"} />
-        <Stat label="Last scan" value={status?.latest_run?.profile ?? "none yet"}
+        <Stat label="Last scan" value={status?.latest_run?.mode ?? "none yet"}
           sub={status?.latest_run?.ts_display ?? "run a scan to begin"} />
       </div>
 
@@ -54,10 +49,6 @@ export function Overview({ onNavigate }: { onNavigate: (v: View) => void }) {
           <CardHead title="Quick actions" />
           <div className="card-pad">
             <div className="row wrap" style={{ marginBottom: 12 }}>
-              <select className="input" style={{ width: 150 }} value={prof}
-                onChange={(e) => setProfile(e.target.value)}>
-                {(status?.profiles ?? ["swing"]).map((p) => <option key={p} value={p}>{p}</option>)}
-              </select>
               <button className="btn btn-primary" onClick={runScan} disabled={busy}>
                 <Play size={15} /> Run scan (advice)
               </button>

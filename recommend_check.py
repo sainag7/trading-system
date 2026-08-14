@@ -87,23 +87,28 @@ class StubProvider:
         return self.SECTORS.get(ticker.upper(), "Unknown")
 
 
-async def run_profile_check(profile: str) -> None:
-    """Run one full recommend cycle offline under ``profile`` and assert zero
-    trading side effects (plus, for momentum, that the overlay took effect)."""
+# Discovery is the ONLY source of tickers now, and it hits the network. Feed the
+# pipeline the stub universe instead. Note we leave `dynamic_discovery` ON: with
+# no fixed watchlist, turning it off halts the run by design, so this stub is
+# what keeps the check exercising the full pipeline. The orchestrator imports
+# `discover_candidates` at call time, so patching the module attribute works.
+from data import screener as _screener
+_screener.discover_candidates = lambda cfg, provider, n=20: list(StubProvider.PRICES)
+
+
+async def run_recommend_check() -> None:
+    """Run one full recommend cycle offline and assert zero trading side effects,
+    plus that the configured exit parameters reach the decision agent."""
     import json
 
     with tempfile.TemporaryDirectory() as tmp:
         config = load_config()
         config.set_mode("recommend")
-        # Keep this offline check deterministic — no network discovery.
-        config.raw.setdefault("discovery", {})["dynamic_discovery"] = False
         config.raw.setdefault("execution", {})["read_live_account"] = False
         config.raw["storage"]["db_path"] = str(Path(tmp) / "trading.db")
         config.raw.setdefault("recommend", {})["hypothetical_cash"] = 10_000.0
-        # Lower the buy bar so the offline policy actually recommends something
-        # (the momentum profile overlay re-raises its own, stricter bar).
+        # Lower the buy bar so the offline policy actually recommends something.
         config.raw["strategy"]["min_score_to_buy"] = 55
-        config.apply_profile(profile)
 
         orch = Orchestrator(config, provider=StubProvider())
         await orch.run_cycle()
@@ -117,7 +122,7 @@ async def run_profile_check(profile: str) -> None:
         decisions = db.query("SELECT COUNT(*) n FROM decisions")[0]["n"]
         agents = db.query("SELECT COUNT(*) n FROM agent_outputs")[0]["n"]
 
-        print(f"\n----- RECOMMEND CHECK [{profile}] -----")
+        print("\n----- RECOMMEND CHECK -----")
         print(f"decisions logged: {decisions}")
         print(f"agent_outputs:    {agents}")
         print(f"fills:            {fills} (expect 0)")
@@ -134,45 +139,39 @@ async def run_profile_check(profile: str) -> None:
         assert pnl == 0, "hypothetical equity must NOT be snapshotted into pnl"
         assert positions == 0, "hypothetical positions must NOT be snapshotted"
 
-        # The run must be attributed to the profile in the audit trail.
-        notes = db.query("SELECT notes FROM runs ORDER BY started_ts DESC LIMIT 1")[0]["notes"]
-        assert f"profile={profile}" in (notes or ""), f"run notes missing profile: {notes!r}"
-
-        if profile == "momentum":
-            # Overlay must reach the decision agent end-to-end.
-            row = db.query(
-                "SELECT input_json, output_json FROM agent_outputs "
-                "WHERE agent='decision' ORDER BY ts DESC LIMIT 1")[0]
-            payload = json.loads(row["input_json"])
-            strat = payload.get("strategy", {})
-            assert strat.get("max_holding_days") == 10, strat
-            assert strat.get("default_stop_loss_pct") == 0.05, strat
-            # Proposed buys must carry momentum plan levels (~5% stop / ~8% target).
-            orders = (json.loads(row["output_json"]) or {}).get("orders", [])
-            buys = [o for o in orders
-                    if o.get("action") == "buy" and o.get("price")
-                    and o.get("suggested_stop_loss") and o.get("take_profit")]
-            assert buys, "momentum run should propose at least one buy with a plan"
-            for o in buys:
-                stop_ratio = o["suggested_stop_loss"] / o["price"]
-                tp_ratio = o["take_profit"] / o["price"]
-                assert abs(stop_ratio - 0.95) < 0.01, (o["ticker"], stop_ratio)
-                assert abs(tp_ratio - 1.08) < 0.01, (o["ticker"], tp_ratio)
-            print("momentum overlay verified: horizon 10d, stop ~5%, target ~8%")
+        # The configured exit parameters must reach the decision agent end-to-end.
+        # Stops are now VOLATILITY-based: stop = price - k*ATR, floored so the loss
+        # never exceeds max_loss_pct, and the target sits at a fixed reward:risk
+        # (target_r_multiple). Assert those invariants rather than a flat percent.
+        row = db.query(
+            "SELECT input_json, output_json FROM agent_outputs "
+            "WHERE agent='decision' ORDER BY ts DESC LIMIT 1")[0]
+        payload = json.loads(row["input_json"])
+        strat = payload.get("strategy", {})
+        assert strat.get("max_holding_days") == 60, strat
+        target_r = strat.get("target_r_multiple", 2.5)
+        max_loss = strat.get("max_loss_pct", strat.get("default_stop_loss_pct", 0.10))
+        orders = (json.loads(row["output_json"]) or {}).get("orders", [])
+        buys = [o for o in orders
+                if o.get("action") == "buy" and o.get("price")
+                and o.get("suggested_stop_loss") and o.get("take_profit")]
+        assert buys, "run should propose at least one buy with a plan"
+        for o in buys:
+            price, stop, take = o["price"], o["suggested_stop_loss"], o["take_profit"]
+            assert stop < price < take, (o["ticker"], stop, price, take)
+            # Loss is capped: the stop never sits below the max-loss floor.
+            assert stop >= price * (1 - max_loss) - 0.01, (o["ticker"], stop / price)
+            # Reward:risk equals the configured R-multiple.
+            r = (take - price) / (price - stop)
+            assert abs(r - target_r) < 0.05, (o["ticker"], r)
+        print(f"exit parameters verified: ATR stop capped at {max_loss:.0%} loss, "
+              f"target ~{target_r:g}R")
 
 
 async def main() -> int:
-    # Unknown profiles must fail loudly, not run with the wrong parameters.
-    try:
-        load_config().apply_profile("bogus")
-        raise AssertionError("apply_profile('bogus') should have raised")
-    except ValueError:
-        pass
-
-    for profile in ("swing", "momentum"):
-        await run_profile_check(profile)
-    print("\n✅ RECOMMEND CHECK PASSED — both profiles ran end-to-end with "
-          "zero trading side effects.")
+    await run_recommend_check()
+    print("\n✅ RECOMMEND CHECK PASSED — ran end-to-end with zero trading "
+          "side effects.")
     return 0
 
 

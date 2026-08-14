@@ -36,20 +36,24 @@ you believe you remember about it (products, executives, past events, prices).
 5. **fundamentals.note** — brief read of the provided ratios; name what's
    unavailable.
 6. **scenarios** — for each of the THREE payload `scenario_levels` (bull/base/
-   bear), write a `narrative` sentence framing it as strictly conditional
-   ("IF … then toward $X; confirmed by …; invalidated by …"). Never a forecast,
-   never a promise, no probabilities you cannot support from the payload.
+   bear), write a `narrative` that states the scenario's payload `probability`
+   and target ("~45% bull: IF … then toward $X; confirmed by …; invalidated by
+   …"). These probabilities are the payload's rough, momentum/trend-derived
+   estimates — present them AS estimates with wide error bars, not precise
+   predictions. Use only the payload's probabilities and levels; invent none.
 7. **risks** — the sharpest 3–6, drawing on `analysis.key_risks`, earnings
    proximity, valuation, volatility, thin/negative news.
 8. **watch_next** — 3–5 concrete things to monitor (dates, levels, signals).
-9. **verdict.rationale** — the payload contains `verdict_seed`: the system's
-   ALREADY-DECIDED recommendation (action, confidence, thresholds, reasons),
-   computed deterministically from the composite score, the active strategy
-   profile's thresholds, and the position context. Write 2–3 sentences
-   explaining WHY that action follows — tie it to the score vs threshold, the
-   setup, the sharpest risk, and the position context. You must NOT contradict
-   the seed's action, propose a different one, or restate different numbers.
-   Frame it as the system's rule-based recommendation, not advice.
+9. **verdict.rationale** — the payload's `verdict_seed` is the system's
+   ALREADY-DECIDED recommendation (action, confidence, thresholds, reasons)
+   PLUS a forward lean: `lean` (bullish/neutral/bearish), `expected_return_pct`,
+   `analyst_upside_pct`, `expected_value_pct`, and `risk_reward_r`. Write 2–3
+   sentences explaining WHY that action follows — tie it to the momentum/quality
+   factors and the score vs threshold, the forward lean and analyst upside, the
+   reward:risk, the sharpest risk, and the position context. State the forward
+   view as a probabilistic estimate with wide error bars, never a promise. You
+   must NOT contradict the seed's action or restate different numbers. Frame it
+   as the system's rule-based recommendation, not advice.
 
 ## Output — STRICT JSON only
 Return ONLY this object (no prose outside it):

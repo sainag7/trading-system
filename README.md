@@ -160,7 +160,7 @@ trading modes to `agentic`, so **autonomous orders never touch your main book**:
 
 ```bash
 python orchestrator.py --mode recommend --account individual   # advice on the big book
-python orchestrator.py --mode live --yes --profile momentum --account agentic   # trade the small book
+python orchestrator.py --mode live --yes --account agentic   # trade the small book
 ```
 
 The `agentic` role also carries a **per-account risk overlay** (`accounts.agentic.risk`)
@@ -179,20 +179,6 @@ Each account keeps its **own** equity history / drawdown high-water mark, and a
 **read-sanity gate** skips a live cycle if the (model-mediated) account read looks
 like it under-reported holdings — so a bad read never trades on stale positions.
 
-### Strategy profiles (`--profile`, orthogonal to `--mode`)
-
-Independent of the mode, a **strategy profile** selects the parameter set the
-agents run with (horizon, exit rules, scoring weights, screener appetite):
-
-```bash
-python orchestrator.py --mode recommend                      # swing (default)
-python orchestrator.py --profile momentum --mode recommend   # quick-profit ideas
-```
-
-Profiles live in `config.yaml → strategy_profiles:` and only overlay soft
-strategy/analysis/discovery parameters — **the hard `risk:` limits are never
-touched by a profile**. See "Momentum profile" below.
-
 ---
 
 ## Deep research on one stock (`--mode explain`)
@@ -205,8 +191,8 @@ A read-only, single-ticker briefing — the ticker does **not** need to be in yo
 watchlist. Every report ends with a **🎯 verdict** (buy / watch / avoid — or
 add / hold / trim / sell when you already hold the name), derived
 deterministically from the analysis composite score and *your* configured
-strategy thresholds (profile-aware: `--profile momentum` applies its stricter
-bar), with a confidence score whose dampeners (earnings event risk, high
+strategy thresholds, with a confidence score whose dampeners (earnings event
+risk, high
 volatility, thin news, missing data) are listed explicitly. A buy verdict
 includes informational stop/target levels — nothing is planned or ordered.
 It also covers: what the company does (sourced from provider data),
@@ -230,38 +216,53 @@ price targets; nothing here is financial advice.
 
 ---
 
-## Momentum profile (quick-profit ideas)
+## The strategy — momentum + quality, factor-ranked, risk-managed
 
-`--profile momentum` re-tunes the same pipeline for **short-horizon momentum
-trades: a few days to ~2 weeks**, aiming to surface names likely to move soon
-and get in and out fast:
+**No system predicts stock prices.** The durable edge is *factor exposure* +
+*risk management* + *consistency* — probabilistic, and it can underperform for
+long stretches. This system is built around the best-evidenced version of that,
+not a crystal ball. Set `strategy.methodology` back to `legacy` to restore the
+old technical/fundamental/sentiment blend + fixed-% stops.
 
-- **Leans on the discovery screener** (`max_discovered: 10`) — momentum,
-  breakouts, volume spikes, gainers — and **weights technicals 65%** of the
-  composite (fundamentals drop to 10%; news sentiment 25%).
-- **Fast, tight exits**, all config-driven under `strategy_profiles.momentum`:
-  | Param | Momentum | Swing (base) |
-  |---|---|---|
-  | `default_stop_loss_pct` | **5%** | 8% |
-  | `default_take_profit_pct` | **8%** | 20% |
-  | `max_holding_days` (time-stop) | **10** | 120 |
-  | `min_score_to_buy` | **70** | 65 |
-  | `target_portfolio_size` | **5** | 10 |
-- Exits are stored **per position at entry** (`trade_plans`), so a momentum
-  position keeps its tight stop/target/time-stop even if your next run uses the
-  swing profile — and vice versa.
+**Scoring is a cross-sectional factor model** (`agents/analysis_agent.py`). Each
+name gets five smooth 0–100 factor scores, then they're **z-scored across the
+run's universe** so selection is *relative* (own the strongest names), tilted on
+top of an absolute score so a broken name is never bought just for being the
+"least bad". Momentum + quality carry the weight (`analysis.factor_weights`):
 
-**Same pipeline, same safety.** Research → Analysis → Decision → **Guardrails**
-→ Execution is unchanged; there is no path to an order that skips the risk
-layer. Profiles may only *tighten* per-position exits; every hard limit in
-`risk:` (position/sector caps, per-trade $, daily trade cap, cash floor,
-drawdown halt, kill switch) applies identically.
+| Factor | Default weight | Signals |
+|---|---|---|
+| Momentum | **0.30** | 12-1 return, trend vs 50/200-SMA, proximity to highs |
+| Quality | **0.25** | margins, free cash flow, low leverage |
+| Value | 0.15 | forward P/E, P/S, upside to the analyst target |
+| Growth | 0.15 | revenue / EPS growth |
+| Sentiment | 0.15 | news + analyst recommendation |
+
+**Risk is volatility-based, not a flat percentage** (`strategy:`):
+- **Stops** = `price − stop_atr_mult·ATR`, but **never risking more than
+  `max_loss_pct` (10%)** — the hard cap that prevents a −42%-style hold.
+- **Targets** sit at a fixed `target_r_multiple` (2.5×) reward:risk.
+- **Trailing (chandelier):** each day the stop is raised to
+  `peak − trail_atr_mult·ATR` and **never lowered**, so winners' stops ratchet up
+  and losers are cut early. Persisted in `trade_plans.peak_price`.
+- **Graded exits:** a broken downtrend (below the 200-SMA / large loss) is a full
+  exit; a quality name merely *pulling back* to its trailing stop scales out to
+  half. This is the difference between correctly dumping a −42% name and knifing a
+  healthy pullback.
+- **Sizing** shrinks high-ATR names (`vol_target_sizing`) so dollar risk is
+  roughly constant across the book.
+
+Deep-research briefings (`--mode explain`) are now **forward-informed**: a
+directional **lean** (bullish/neutral/bearish), a rough **expected-return
+estimate**, **analyst upside**, forward P/E, a probability-weighted **scenario
+expected value**, and the trade's **reward:risk (R-multiple)** — all clearly
+labeled estimates with wide error bars, not predictions. Numbers stay
+deterministic; the model only narrates.
 
 **Limitations — read this:** the system runs on **daily** data, once per day.
-This is days-to-2-weeks *idea generation*, **not** intraday day-trading. Prices
-gap overnight — a 5% stop does not guarantee a −5% worst case. Short-horizon
-momentum trading has higher turnover and is riskier than swing holding; evaluate
-it in `recommend` mode first, like everything else.
+This is *idea generation*, **not** intraday day-trading. Prices gap overnight —
+a stop does not guarantee its level as a worst case. The forward numbers are
+estimates, not promises. Evaluate any change in `recommend` mode first.
 
 ### Kill switch (emergency stop)
 
@@ -529,19 +530,19 @@ and a cron alternative. Before enabling the live job, **commission it once**:
 
 ```bash
 # Supervised: proposes an order on the $100 book and asks y/N before placing.
-python orchestrator.py --mode preview --profile momentum --account agentic
+python orchestrator.py --mode preview --account agentic
 ```
 
 Confirm a single small order lands in the Agentic account, then
 `install.sh --enable-live`.
 
 Repeated runs are safe by construction: `recommend` writes only advice (zero
-trading side effects); in preview/live the `daily_max_trades` budget is shared
-across profiles, held names are never re-bought as fresh positions (the decision
-agent sees your positions; position/sector caps bound adds), and the executor's
-idempotency key (plus the MCP `ref_id`) prevents double-submitting an order. Each
-position's exit plan is stored at entry, so mixing profiles across runs never
-mixes up exits.
+trading side effects); in preview/live the `daily_max_trades` budget bounds the
+day, held names are never re-bought as fresh positions (the decision agent sees
+your positions; position/sector caps bound adds), and the executor's idempotency
+key (plus the MCP `ref_id`) prevents double-submitting an order. Each position's
+exit plan is stored at entry, so retuning the config later never rewrites the
+exits on positions you already hold.
 
 Promote to `--mode preview` only once you trust the recommendations, and to
 `--mode live` only with eyes open and the kill switch within reach.
@@ -561,3 +562,24 @@ backoff; an **ambiguous fill is never blindly retried** — it is flagged
 > Confirm the exact Robinhood MCP tool names against your connected server and
 > set them in `RobinhoodMCPBroker` if they differ from the defaults.
 ```
+
+### Troubleshooting: "Could not read the account from the broker"
+
+The account read reaches Robinhood through the Agent SDK inheriting Claude Code's
+OAuth'd `robinhood-trading` connection (`setting_sources=["local"]`). That session
+can lapse (it survives a day or so, then the background/subprocess path stops
+returning data even while interactive Claude Code still works). Symptoms: the read
+returns no data and preview/live abort (they never fall back to a hypothetical
+book — that would be unsafe). To fix:
+
+```bash
+python orchestrator.py --check-broker              # tests the connection, prints the real error
+# if it reports "needs re-authentication":
+#   start an interactive `claude` session from this repo, run  /mcp,
+#   reconnect robinhood-trading, then re-run.
+```
+
+The failure is logged as `robinhood_mcp_no_response` (with the underlying error)
+vs `robinhood_read_unparseable` (rare, stochastic — just re-run). For **scheduled
+autonomous** runs, set `notifications.enabled: true` so a lapse is reported in the
+daily brief instead of silently skipping the run.

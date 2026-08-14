@@ -62,16 +62,16 @@ export const api = {
   unhideTicker: (t: string) => post(`/deepdive/${encodeURIComponent(t)}/unhide`),
 
   // engine jobs
-  scan: (profile?: string, account?: string) => post("/scan", { profile, account }),
+  scan: (account?: string) => post("/scan", { account }),
   research: (ticker: string) => post("/deepdive/research", { ticker }),
 
   // trading
-  tradePlan: (mode: string, profile?: string, account?: string) =>
-    post("/trade/plan", { mode, profile, account }),
+  tradePlan: (mode: string, account?: string) =>
+    post("/trade/plan", { mode, account }),
   tradeExecute: (plan_id: string, approved_indices: number[]) =>
     post("/trade/execute", { plan_id, approved_indices }),
-  tradeLive: (confirm: string, profile?: string, account?: string) =>
-    post("/trade/live", { confirm, profile, account }),
+  tradeLive: (confirm: string, account?: string) =>
+    post("/trade/live", { confirm, account }),
   tradeDiscard: (plan_id: string) => post("/trade/discard", { plan_id }),
   tradePending: () => get("/trade/pending"),
 

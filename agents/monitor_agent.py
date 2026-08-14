@@ -61,6 +61,7 @@ def _deterministic_exits(positions: list[dict], strategy: dict) -> list[dict]:
     exits: list[dict] = []
     today = _today()
     default_exit_below = strategy.get("exit_below_score", 35)
+    graded = bool(strategy.get("graded_stops", True))
 
     for p in positions:
         price = p.get("current_price") or p.get("price") or 0.0
@@ -77,10 +78,22 @@ def _deterministic_exits(positions: list[dict], strategy: dict) -> list[dict]:
         sentiment = p.get("sentiment_score")
         half = round(shares / 2, 6)
 
-        # 1) STOP-LOSS — protect capital first.
+        # 1) STOP (trailing) — protect capital first. Graded: a broken DOWNTREND
+        # (below the 200-SMA, or a large loss) is a full exit; a still-intact
+        # UPTREND merely pulling back to its trailing stop scales out to half and
+        # keeps trailing the rest — the difference between dumping NBIS at -42%
+        # (correct) and knifing a healthy pullback (churn).
         if stop and price <= stop + 1e-9:
-            exits.append(_exit(p, "exit_full", None, "stop_loss",
-                               f"price ${price:.2f} <= stop ${stop:.2f} — cut losses", 0.95))
+            up_pnl = p.get("unrealized_pnl_pct")
+            uptrend_intact = bool(p.get("above_sma200")) and (p.get("ret_3m") or 0) > 0
+            modest_loss = up_pnl is None or up_pnl > -8
+            if graded and uptrend_intact and modest_loss:
+                exits.append(_exit(p, "exit_partial", half, "stop_trail",
+                    f"price ${price:.2f} hit the trailing stop ${stop:.2f} but the uptrend "
+                    "is intact — trim to half and keep trailing the rest", 0.7))
+            else:
+                exits.append(_exit(p, "exit_full", None, "stop_loss",
+                    f"price ${price:.2f} <= stop ${stop:.2f} — cut losses", 0.95))
             continue
 
         # 2) TIME-STOP — swing horizon elapsed.

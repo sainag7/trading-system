@@ -18,7 +18,7 @@ export function Ideas() {
         <div>
           <h1>Ideas</h1>
           <p>{data?.has_data
-            ? `Latest ${data.run.profile} scan · ${data.run.mode} mode · ${data.run.ts_display}`
+            ? `Latest scan · ${data.run.mode} mode · ${data.run.ts_display}`
             : "Ranked recommendations from your latest scan."}</p>
         </div>
         <button className="btn btn-sm" onClick={reload}><RefreshCw size={14} /> Refresh</button>

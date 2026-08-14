@@ -8,11 +8,9 @@ export interface Status {
   healthy: boolean;
   warnings: string[];
   mode: string;
-  profile: string;
-  profiles: string[];
   kill_switch: { engaged: boolean; pinned: boolean };
   accounts: { role: string; number: string | null; label: string }[];
-  latest_run: { run_id: string; mode: string; profile: string; ts_display: string } | null;
+  latest_run: { run_id: string; mode: string; ts_display: string } | null;
 }
 
 const Ctx = createContext<{ status: Status | null; reload: () => void }>({

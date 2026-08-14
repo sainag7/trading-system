@@ -11,7 +11,6 @@ export function Trade() {
   const { status, reload } = useStatus();
   const { runJob, busy } = useJob();
   const [account, setAccount] = useState<string>("");
-  const [profile, setProfile] = useState<string>("");
   const [plan, setPlan] = useState<any>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [halt, setHalt] = useState<string | null>(null);
@@ -21,7 +20,6 @@ export function Trade() {
 
   const acct = account || (status?.accounts.find((a) => a.role === "agentic")?.role)
     || status?.accounts[0]?.role || "";
-  const prof = profile || status?.profile || "swing";
 
   // Recover a pending plan after a refresh.
   useEffect(() => {
@@ -35,8 +33,8 @@ export function Trade() {
 
   const doPlan = () => {
     setHalt(null); setResult(null); setPlan(null);
-    runJob(() => api.tradePlan("preview", prof, acct), {
-      label: `${prof} plan`,
+    runJob(() => api.tradePlan("preview", acct), {
+      label: "preview plan",
       onDone: (job) => {
         if (job.status === "error") return;
         const r = job.result;
@@ -66,7 +64,7 @@ export function Trade() {
 
   const doLive = () => {
     setLiveOpen(false); setConfirmText(""); setHalt(null); setResult(null);
-    runJob(() => api.tradeLive("I UNDERSTAND", prof, acct), {
+    runJob(() => api.tradeLive("I UNDERSTAND", acct), {
       label: "placing LIVE orders",
       onDone: (job) => {
         if (job.status === "error") return;
@@ -104,13 +102,6 @@ export function Trade() {
                   <option key={a.role} value={a.role}>{a.label}</option>
                 ))}
                 {!status?.accounts.length && <option value="">default</option>}
-              </select>
-            </label>
-            <label className="field" style={{ margin: 0 }}>
-              <span>Profile</span>
-              <select className="input" style={{ width: 160 }} value={prof}
-                onChange={(e) => setProfile(e.target.value)}>
-                {(status?.profiles ?? ["swing"]).map((p) => <option key={p} value={p}>{p}</option>)}
               </select>
             </label>
             <div className="row" style={{ alignSelf: "flex-end", gap: 10 }}>
@@ -216,7 +207,7 @@ export function Trade() {
         <Modal title="Confirm live trading" onClose={() => setLiveOpen(false)}>
           <Callout kind="danger"><Zap size={16} />
             <div>This places <strong>real orders with real money</strong> via Robinhood on the{" "}
-              <strong>{acct || "default"}</strong> account ({prof} profile). They have passed the
+              <strong>{acct || "default"}</strong> account. They have passed the
               guardrails, but you are responsible.</div></Callout>
           <label className="field" style={{ marginTop: 16 }}>
             <span>Type <strong>I UNDERSTAND</strong> to proceed</span>

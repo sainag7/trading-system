@@ -44,7 +44,7 @@ def _make_db(tmp_path, *, verdicts, holdings, analysis=None, exits=None):
     c.executescript(_SCHEMA)
     for rid, ts in ((PREV, "2026-07-28T12:00:00+00:00"), (RUN, "2026-07-29T12:00:00+00:00")):
         c.execute("insert into runs values (?,?,?,?,?)",
-                  (rid, ts, ts, "recommend", "profile=swing"))
+                  (rid, ts, ts, "recommend", "backend=stub"))
     for t, shares, avg, mv in holdings:
         c.execute("insert into positions (run_id,ticker,shares,avg_cost,market_value,sector,"
                   "account) values (?,?,?,?,?,?,?)",

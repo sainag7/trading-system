@@ -44,6 +44,11 @@ class RiskLimits:
     max_position_pct: float = 0.15
     max_sector_pct: float = 0.40
     per_trade_max_usd: float = 500.0
+    # Per-trade cap as a FRACTION OF EQUITY, so sizing scales with the book
+    # instead of staying frozen at a dollar figure chosen for its starting
+    # value. The effective cap is min(per_trade_max_usd, pct * equity); the
+    # 1.0 default makes this a no-op unless a config sets it.
+    per_trade_max_pct: float = 1.0
     daily_max_trades: int = 5
     min_cash_reserve_pct: float = 0.10
     max_account_drawdown_halt_pct: float = 0.15
@@ -59,6 +64,7 @@ class RiskLimits:
             max_position_pct=float(d.get("max_position_pct", 0.15)),
             max_sector_pct=float(d.get("max_sector_pct", 0.40)),
             per_trade_max_usd=float(d.get("per_trade_max_usd", 500.0)),
+            per_trade_max_pct=float(d.get("per_trade_max_pct", 1.0)),
             daily_max_trades=int(d.get("daily_max_trades", 5)),
             min_cash_reserve_pct=float(d.get("min_cash_reserve_pct", 0.10)),
             max_account_drawdown_halt_pct=float(
@@ -93,33 +99,6 @@ class Config:
         if mode not in VALID_MODES:
             raise ValueError(f"Invalid mode {mode!r}; expected one of {VALID_MODES}")
         self.raw["mode"] = mode
-
-    # -- strategy profiles ---------------------------------------------------
-    @property
-    def profile(self) -> str:
-        """The active strategy profile name (default ``swing``)."""
-        return str(self.raw.get("profile", "swing")).lower()
-
-    def valid_profiles(self) -> tuple[str, ...]:
-        names = {"swing", *self.raw.get("strategy_profiles", {}).keys()}
-        return tuple(sorted(str(n).lower() for n in names))
-
-    def apply_profile(self, name: str) -> None:
-        """Overlay ``strategy_profiles.<name>`` onto strategy/analysis/discovery.
-
-        Profiles only ever adjust soft strategy parameters — the hard ``risk:``
-        limits are deliberately NOT touched by a profile, so guardrails are
-        identical across profiles. Unknown names raise with the valid choices.
-        """
-        name = str(name).lower()
-        valid = self.valid_profiles()
-        if name not in valid:
-            raise ValueError(f"Invalid profile {name!r}; expected one of {valid}")
-        overlay = self.raw.get("strategy_profiles", {}).get(name) or {}
-        for key in ("strategy", "analysis", "discovery"):
-            if key in overlay:
-                self.raw[key] = _deep_merge(self.raw.get(key, {}), overlay[key])
-        self.raw["profile"] = name
 
     # -- brokerage accounts (multi-account routing) ------------------------
     @property

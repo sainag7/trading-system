@@ -22,7 +22,9 @@ Enforcement (thresholds read from ``config.yaml`` via :class:`config.RiskLimits`
   3. malformed qty      — REJECT zero / negative / missing quantities or prices.
   4. no_trade_list      — REJECT buys/adds on listed names (see note below).
   5. max_positions      — REJECT a buy that would OPEN a brand-new name past the cap.
-  6. per_trade_max_usd  — RESIZE the order down to the cap (do NOT reject).
+  6. per-trade cap      — RESIZE the order down to the cap (do NOT reject). The
+                          cap is min(per_trade_max_usd, per_trade_max_pct * equity),
+                          so it scales with the account.
   7. max_position_pct   — REJECT a buy that would push a single name over the cap.
   8. max_sector_pct     — REJECT a buy that would push a sector over the cap.
   9. min_cash_reserve   — REJECT a buy that would spend below the cash floor.
@@ -37,7 +39,7 @@ Design note — three distinct stops:
     risk, which contradicts "favour rejecting" — the safer choice is to permit
     de-risking sells.
 
-Only ``per_trade_max_usd`` resizes; every other breach REJECTS the order so the
+Only the per-trade cap resizes; every other breach REJECTS the order so the
 upstream Decision Agent is forced to size within the caps.
 """
 from __future__ import annotations
@@ -445,20 +447,29 @@ def validate_order(
         checks.append(CheckOutcome("requested_usd", False, "requested USD is zero"))
         return reject()
 
-    # --- per_trade_max_usd: the ONLY cap that resizes (down) ---------------
+    # --- per-trade cap: the ONLY cap that resizes (down) --------------------
+    # Effective cap is the tighter of the absolute dollar ceiling and the
+    # equity-scaled percentage, so a small book stays proportionally sized and
+    # the cap grows with the account instead of needing a manual edit.
+    per_trade_cap = min(
+        float(limits.per_trade_max_usd),
+        float(limits.per_trade_max_pct) * account.equity,
+    )
     approved_usd = requested_usd
     resized = False
-    if approved_usd > limits.per_trade_max_usd + EPS:
-        approved_usd = float(limits.per_trade_max_usd)
+    if approved_usd > per_trade_cap + EPS:
+        approved_usd = per_trade_cap
         resized = True
         reasons.append(
-            f"resized to per-trade cap ${limits.per_trade_max_usd:,.2f} "
+            f"resized to per-trade cap ${per_trade_cap:,.2f} "
             f"(requested ${requested_usd:,.2f})"
         )
     checks.append(CheckOutcome(
         "per_trade_max_usd", True,
-        f"per-trade cap ${limits.per_trade_max_usd:,.2f}; sizing ${approved_usd:,.2f}",
-        cap_usd=limits.per_trade_max_usd,
+        f"per-trade cap ${per_trade_cap:,.2f} "
+        f"(min of ${limits.per_trade_max_usd:,.2f} and "
+        f"{limits.per_trade_max_pct:.0%} of equity); sizing ${approved_usd:,.2f}",
+        cap_usd=per_trade_cap,
     ))
 
     # Convert to shares (honour the fractional-shares setting) BEFORE the

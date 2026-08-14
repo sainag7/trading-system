@@ -24,7 +24,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from agents.llm import generate_json, load_prompt
+from agents.llm import generate_json, last_error, load_prompt
 
 SYSTEM_PROMPT = load_prompt("decision_agent")
 
@@ -39,12 +39,42 @@ def _score_of(item: dict, default: float = 50.0) -> float:
     return float(item.get("composite_score", item.get("score", default)) or default)
 
 
-def _plan_levels(price: float | None, stop_pct: float, tp_pct: float,
-                 max_days: int) -> tuple[float | None, float | None, str]:
-    stop = round(price * (1 - stop_pct), 2) if price else None
-    take = round(price * (1 + tp_pct), 2) if price else None
-    until = (datetime.now(timezone.utc).date() + timedelta(days=max_days)).isoformat()
-    return stop, take, until
+def _until(strategy: dict) -> str:
+    days = int(strategy.get("max_holding_days", 60))
+    return (datetime.now(timezone.utc).date() + timedelta(days=days)).isoformat()
+
+
+def _plan_levels(price: float | None, atr: float | None,
+                 strategy: dict) -> tuple[float | None, float | None, str]:
+    """Entry stop/target as a function of VOLATILITY, not a flat percentage.
+
+    stop  = price − stop_atr_mult·ATR, but never risking more than max_loss_pct
+            (so a high-ATR name can't set a 40%-wide stop and ride to −42%).
+    target = price + target_r_multiple·(risk), a fixed reward:risk ratio.
+    Falls back to a plain max_loss_pct stop when ATR is unavailable.
+    """
+    until = _until(strategy)
+    if not price:
+        return None, None, until
+    max_loss = float(strategy.get("max_loss_pct",
+                                  strategy.get("default_stop_loss_pct", 0.10)))
+    if atr and atr > 0:
+        stop = price - float(strategy.get("stop_atr_mult", 2.5)) * atr
+        stop = max(stop, price * (1 - max_loss))   # cap the loss (stop floor)
+    else:
+        stop = price * (1 - max_loss)
+    risk = max(price - stop, 0.01)
+    take = price + float(strategy.get("target_r_multiple", 2.5)) * risk
+    return round(stop, 2), round(take, 2), until
+
+
+def _vol_size_factor(atr_pct: float | None, ref: float = 4.0) -> float:
+    """Volatility-target multiplier: keep roughly constant dollar risk by shrinking
+    the size of high-ATR names. 1.0 at/below the reference ATR%, tapering to a 0.3
+    floor for very volatile names (a 10%-ATR name gets ~40% of a calm name's size)."""
+    if not atr_pct or atr_pct <= ref:
+        return 1.0
+    return max(0.3, ref / atr_pct)
 
 
 def _order(ticker, action, side, *, confidence, target_usd, price, sector,
@@ -78,18 +108,28 @@ def _offline_decision(
     held = {t for t, p in positions.items() if float(p.get("shares", 0) or 0) > 0}
     open_count = len(held)
 
-    target = strategy.get("target_portfolio_size", 10)
+    # Never aim past the hard position cap — proposing an Nth name the
+    # guardrail will reject on max_positions just manufactures a doomed order.
+    target = min(int(strategy.get("target_portfolio_size", 10)),
+                 int(limits.get("max_positions", 15)))
     buy_th = strategy.get("min_score_to_buy", 65)
     add_th = strategy.get("min_score_to_add", 70)
     trim_th = strategy.get("trim_below_score", 45)
-    stop_pct = strategy.get("default_stop_loss_pct", 0.08)
-    tp_pct = strategy.get("default_take_profit_pct", 0.20)
-    max_days = strategy.get("max_holding_days", 120)
+    vol_sizing = bool(strategy.get("vol_target_sizing", True))
 
-    per_trade = float(limits.get("per_trade_max_usd", 500))
+    # Mirror the guardrail's effective per-trade cap (the tighter of the dollar
+    # ceiling and the equity-scaled pct). Proposing above it just gets resized.
+    per_trade = min(
+        float(limits.get("per_trade_max_usd", 500)),
+        float(limits.get("per_trade_max_pct", 1.0)) * equity,
+    )
     max_pos_pct = float(limits.get("max_position_pct", 0.15))
     max_sector_pct = float(limits.get("max_sector_pct", 0.40))
     min_cash_pct = float(limits.get("min_cash_reserve_pct", 0.10))
+    # The smallest order worth placing. Reading this from the limits (rather
+    # than hardcoding 50) is what keeps sizing consistent on the agentic book,
+    # which overrides min_trade_usd down to 1.
+    min_trade = float(limits.get("min_trade_usd", 50))
 
     # Running state we keep within configured caps as we propose.
     deployable = max(0.0, cash - min_cash_pct * equity)
@@ -115,7 +155,7 @@ def _offline_decision(
         pos_val = float(pos.get("market_value", 0) or 0)
         shares = float(pos.get("shares", 0) or 0)
         price = a.get("_price") or (pos_val / shares if shares else None)
-        stop, take, until = _plan_levels(price, stop_pct, tp_pct, max_days)
+        stop, take, until = _plan_levels(price, a.get("_atr"), strategy)
 
         if score <= trim_th and budget > 0:
             trim_usd = round(pos_val * 0.5, 2)
@@ -135,11 +175,13 @@ def _offline_decision(
             can_add = (
                 budget > 0
                 and pos_val < max_pos_pct * equity * 0.9
-                and deployable >= max(50.0, per_trade * 0.5)
+                and deployable >= max(min_trade, per_trade * 0.5)
                 and sector_val.get(sector, 0.0) + per_trade * 0.5 <= max_sector_pct * equity
             )
             add_usd = round(min(per_trade * 0.5, max_pos_pct * equity - pos_val, deployable), 2)
-            if can_add and add_usd >= 50:
+            if vol_sizing:
+                add_usd = round(add_usd * _vol_size_factor(a.get("_atr_pct")), 2)
+            if can_add and add_usd >= min_trade:
                 orders.append(_order(
                     t, "add", "BUY",
                     confidence=_clamp(score - 10),
@@ -171,7 +213,7 @@ def _offline_decision(
         setup = a.get("swing_setup", "none")
 
         room = (score >= buy_th and open_count < target and budget > 0
-                and deployable >= 50
+                and deployable >= min_trade
                 and sector_val.get(sector, 0.0) < max_sector_pct * equity)
         if not room:
             orders.append(_pass(t, score, buy_th, open_count, target))
@@ -183,9 +225,19 @@ def _offline_decision(
         slice_usd = min(per_trade, max_pos_pct * equity, deployable)
         conf = _clamp(score + {"breakout": 5, "pullback-in-uptrend": 5,
                                "oversold-reversal": 0, "none": -10}.get(setup, 0))
-        # Conservative sizing: scale 50–100% of the slice by confidence.
-        size = round(max(50.0, min(slice_usd, slice_usd * (0.5 + 0.5 * conf / 100))), 2)
-        stop, take, until = _plan_levels(price, stop_pct, tp_pct, max_days)
+        # Conservative sizing: scale 50–100% of the slice by confidence. Never
+        # clamp UP to a floor here — doing so proposes a size the per-trade cap
+        # will only resize back down. If the slice is too small to be worth
+        # trading, pass instead.
+        size = round(slice_usd * (0.5 + 0.5 * conf / 100), 2)
+        if vol_sizing:  # shrink high-ATR names to keep dollar risk roughly constant
+            size = round(size * _vol_size_factor(a.get("_atr_pct")), 2)
+        if size < min_trade:
+            orders.append(_pass(
+                t, score, buy_th, open_count, target,
+                reason=f"size ${size:,.2f} is below the ${min_trade:,.2f} minimum trade"))
+            continue
+        stop, take, until = _plan_levels(price, a.get("_atr"), strategy)
         sub = a.get("score_breakdown", {})
         orders.append(_order(
             t, "buy", "BUY",
@@ -253,11 +305,7 @@ def _normalize(order: dict, meta: dict, strategy: dict) -> dict:
     take = order.get("take_profit")
     until = order.get("max_hold_until")
     if action in ACTIONABLE and price and (stop is None or take is None or not until):
-        d_stop, d_take, d_until = _plan_levels(
-            price, strategy.get("default_stop_loss_pct", 0.08),
-            strategy.get("default_take_profit_pct", 0.20),
-            strategy.get("max_holding_days", 120),
-        )
+        d_stop, d_take, d_until = _plan_levels(price, a.get("_atr"), strategy)
         stop = stop if stop is not None else d_stop
         take = take if take is not None else d_take
         until = until or d_until
@@ -297,7 +345,16 @@ async def run_decision(
     if isinstance(parsed, list):
         parsed = {"market_view": "", "orders": parsed, "notes": "llm intents"}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("orders"), list):
+        # NEVER fall back silently: an unexplained switch to the deterministic
+        # policy looks like normal operation while quietly ignoring the model.
+        why = last_error() or "model returned an unexpected shape"
+        print(f"\n⚠️  DECISION AGENT FELL BACK to the deterministic policy — {why}")
+        if db and run_id:
+            db.audit(run_id, "WARN", "decision_llm_fallback",
+                     {"reason": why, "model": model,
+                      "raw_preview": (raw or "")[:2000]})
         parsed = _offline_decision(analysis, account_summary, limits, strategy, trades_remaining)
+        parsed["market_view"] = f"Deterministic fallback policy — {why}"
         raw = raw or "(offline fallback)"
 
     meta = {a["ticker"]: a for a in analysis}

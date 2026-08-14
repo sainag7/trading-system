@@ -402,6 +402,8 @@ class DataProvider:
         "ps_ratio", "debt_to_equity", "free_cash_flow", "next_earnings_date",
         "market_cap", "beta", "analyst_target", "week52_high", "week52_low",
         "industry", "name", "description",
+        # Forward-looking valuation + analyst consensus (used by the factor model).
+        "forward_pe", "forward_eps", "recommendation_mean", "num_analysts",
     )
 
     def get_fundamentals(self, ticker: str) -> dict:
@@ -489,6 +491,11 @@ class DataProvider:
             "week52_high": _to_float(info.get("fiftyTwoWeekHigh")),
             "week52_low": _to_float(info.get("fiftyTwoWeekLow")),
             "next_earnings_date": self._yf_next_earnings(t),
+            # Forward-looking valuation + analyst consensus.
+            "forward_pe": _to_float(info.get("forwardPE")),
+            "forward_eps": _to_float(info.get("forwardEps")),
+            "recommendation_mean": _to_float(info.get("recommendationMean")),
+            "num_analysts": _to_float(info.get("numberOfAnalystOpinions")),
         }
         self.cache.set(cache_key, out)
         return out

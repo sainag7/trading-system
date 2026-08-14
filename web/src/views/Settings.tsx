@@ -95,14 +95,12 @@ function SectionCard({ title, children, footer, err }: any) {
 // ---- sections -------------------------------------------------------------
 function General({ cfg, onSaved }: any) {
   const [mode, setMode] = useState(cfg.general.mode);
-  const [profile, setProfile] = useState(cfg.general.profile);
   const s = useSaver(onSaved);
   return (
     <SectionCard title="General" err={s.err}
-      footer={<SaveBtn onClick={() => s.save({ mode, profile })} saving={s.saving} done={s.done} />}>
+      footer={<SaveBtn onClick={() => s.save({ mode })} saving={s.saving} done={s.done} />}>
       <div className="grid grid-2">
         <Sel label="Default mode (CLI runs)" value={mode} options={cfg.general.modes} onChange={setMode} />
-        <Sel label="Default profile" value={profile} options={cfg.general.profiles} onChange={setProfile} />
       </div>
       {mode === "live" && <div style={{ marginTop: 10 }}>
         <Callout kind="warn">Default <code>live</code> mode affects scheduled/CLI runs. Dashboard scans stay advice-only.</Callout></div>}

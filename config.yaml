@@ -20,13 +20,6 @@
 mode: recommend
 
 # ----------------------------------------------------------------------------
-# Strategy profile. CLI flag --profile overrides this value. Orthogonal to
-# `mode` (e.g. `--profile momentum --mode recommend`). See strategy_profiles:
-# below for what each profile changes.
-# ----------------------------------------------------------------------------
-profile: swing
-
-# ----------------------------------------------------------------------------
 # GLOBAL KILL SWITCH
 # If true (or if the file at kill_switch_file exists), the orchestrator halts
 # ALL trading before any order is placed, in every mode. Flip this to stop the
@@ -52,89 +45,100 @@ risk:
 
 # ----------------------------------------------------------------------------
 # Strategy / scoring parameters (used by the analysis & decision agents)
+#
+# ONE strategy, no profiles. The holding horizon is set primarily by execution
+# friction: at the 0.5%-per-side limit slippage configured below, a 10-day
+# time-stop implies ~25 round trips a year and ~25%/yr of pure slippage drag —
+# more than three times a realistic edge. A ~60-day ceiling cuts that to ~4%/yr.
+#
+# Horizon and the fundamental weight in `analysis:` are COUPLED. A 10-day hold
+# can ignore fundamentals (nothing about a business changes in 10 days); a
+# 60-day hold cannot. Do not shorten one without revisiting the other.
 # ----------------------------------------------------------------------------
 strategy:
-  holding_period_days_min: 14        # swing horizon: ~2 weeks ...
-  holding_period_days_max: 120       # ... to ~4 months
-  target_portfolio_size: 10          # aim for ~10 names (within 5-15 band)
+  holding_period_days_min: 10        # horizon: ~2 weeks ...
+  holding_period_days_max: 60        # ... to ~3 months
+  target_portfolio_size: 5           # aim (per-account max_positions may cap lower)
   min_score_to_buy: 65               # 0-100 composite score required to open
   min_score_to_add: 70               # higher bar to add to a winner
-  trim_below_score: 45               # consider trimming when score decays
-  exit_below_score: 35               # thesis-break exit threshold
-  # Default per-position exit rules (decision agent may tighten, never loosen)
-  default_stop_loss_pct: 0.08        # 8% below entry
-  default_take_profit_pct: 0.20      # 20% above entry
-  max_holding_days: 120              # time-based exit if thesis hasn't played out
+  trim_below_score: 48               # consider trimming when score decays
+  exit_below_score: 38               # thesis-break exit threshold
+  # Default per-position exit rules (decision agent may tighten, never loosen).
+  # The screener surfaces names averaging ~44% annualised volatility, so a tight
+  # stop fires on noise rather than on a broken thesis. 12% over a 60-day hold is
+  # still inside one sigma for the more volatile names — the volatility ceiling
+  # in `discovery:` is what keeps the worst offenders out of the universe.
+  default_stop_loss_pct: 0.12        # legacy/fallback stop (used only when ATR is unavailable)
+  default_take_profit_pct: 0.20      # legacy/fallback target (monitor fallback only)
+  max_holding_days: 60               # time-based exit if thesis hasn't played out
 
-# ----------------------------------------------------------------------------
-# STRATEGY PROFILES. The base config above IS the `swing` profile. Selecting a
-# profile (via `profile:` above or the --profile CLI flag) overlays ONLY the
-# keys listed here onto strategy / analysis / discovery for that run.
-#
-# Profiles may TIGHTEN per-position exits (smaller stop/target, shorter
-# time-stop); the hard `risk:` limits above are NEVER touched by a profile and
-# always apply unchanged.
-# ----------------------------------------------------------------------------
-strategy_profiles:
-  swing: {}                          # base config unchanged (the default)
-
-  # Short-horizon momentum / quick-profit ideas: names likely to move over the
-  # next few days to ~2 weeks. Leans on the discovery screener + technicals,
-  # down-weights slow fundamentals, and exits fast (tight stop, small target,
-  # short time-stop). Daily-cadence data — this is NOT intraday day-trading.
-  momentum:
-    strategy:
-      holding_period_days_min: 2     # horizon: a few days ...
-      holding_period_days_max: 10    # ... to ~2 trading weeks
-      target_portfolio_size: 5       # fewer, faster names
-      min_score_to_buy: 70           # demand stronger setups for fast trades
-      min_score_to_add: 75
-      trim_below_score: 50           # cut laggards sooner
-      exit_below_score: 40
-      default_stop_loss_pct: 0.05    # tighter stop (tightens, never loosens)
-      default_take_profit_pct: 0.08  # smaller, faster profit target
-      max_holding_days: 10           # time-stop: out if the move hasn't happened
-    analysis:
-      weights:
-        technical: 0.65              # momentum lives in the technicals
-        fundamental: 0.10            # slow fundamentals matter little at this horizon
-        sentiment: 0.25              # fresh news still moves names fast
-    discovery:
-      max_discovered: 10             # lean harder on the momentum screener
+  # -- Methodology: momentum + quality factor model with volatility-based risk --
+  # Master switch. "momentum_quality" (default) uses the factor scoring + ATR
+  # trailing stops below; "legacy" reverts to the old technical/fundamental/
+  # sentiment blend + the fixed-% stops above. Evidence-based edge: ride uptrends
+  # in quality names, cut/avoid downtrends. No system predicts prices — the edge
+  # is factor exposure + disciplined risk, and it is probabilistic.
+  methodology: momentum_quality
+  # Volatility-based exits (replace the flat percentages above in this mode):
+  stop_atr_mult: 2.5                 # entry stop = price − 2.5·ATR ...
+  max_loss_pct: 0.10                 # ... but NEVER risk more than 10% (hard loss cap;
+                                     #     this is what stops a −42% NBIS-style hold)
+  target_r_multiple: 2.5             # target = 2.5× the risk (fixed reward:risk)
+  use_trailing_stop: true            # chandelier: raise the stop to peak − trail_atr_mult·ATR
+  trail_atr_mult: 3.0                #   each day (never lowered) so winners' stops ratchet up
+  graded_stops: true                 # a quality uptrend pulling back to its stop scales out to
+                                     #   half (not a full dump); a broken downtrend exits fully
+  vol_target_sizing: true            # shrink high-ATR names so dollar risk is roughly constant
 
 # ----------------------------------------------------------------------------
 # Analysis scoring. The analysis agent blends three deterministic 0-100
-# sub-scores into a composite. Swing trading leans more technical than
-# long-term investing. Weights are renormalised automatically if they don't
-# sum to 1.0.
+# sub-scores into a composite. Weights are renormalised automatically if they
+# don't sum to 1.0.
+#
+# Tilted technical because the discovery screener surfaces names on momentum and
+# technicals are what time the entry — but fundamentals are held at 20% rather
+# than token weight, because positions are held up to 60 days. Measured against
+# real run data, this weighting clears more candidates than either a 40/35/25 or
+# a 65/10/25 split, and it keeps fundamentally weak names (weak margins, heavy
+# leverage) from ranking on technicals alone.
 # ----------------------------------------------------------------------------
 analysis:
+  # Legacy blend (methodology: legacy only).
   weights:
-    technical: 0.40        # trend / momentum / volatility / location
-    fundamental: 0.35      # growth / profitability / valuation / balance sheet
+    technical: 0.55        # trend / momentum / volatility / location
+    fundamental: 0.20      # growth / profitability / valuation / balance sheet
     sentiment: 0.25        # aggregate news sentiment
+  # Factor model (methodology: momentum_quality, the default). Evidence-based
+  # factors — momentum + quality tilted (the best-supported long-run drivers) —
+  # each z-scored across the run's universe for a cross-sectional tilt on top of
+  # the absolute score. Retune to change the strategy's character.
+  factor_weights:
+    momentum: 0.30         # 12-1 return, trend, proximity to highs
+    quality: 0.25          # margins, free cash flow, low leverage
+    value: 0.15            # forward P/E, P/S, upside to analyst target
+    growth: 0.15           # revenue / EPS growth
+    sentiment: 0.15        # news + analyst recommendation
 
 # ----------------------------------------------------------------------------
-# Universe / watchlist. The research agent only ever looks at these tickers.
-# Keep it focused; a wide universe burns the Alpha Vantage free-tier quota.
+# Universe / watchlist — INTENTIONALLY EMPTY.
+#
+# There is no fixed watchlist. Every ticker researched in a run comes from the
+# `discovery:` market scan below, so the agents always look at what the market
+# is actually doing rather than at a list someone typed months ago. A static
+# universe of large caps used to dominate the composite ranking every run and
+# crowd out the names the screener surfaced.
+#
+# NOTE: the pipeline no longer reads this key — adding tickers here has NO
+# effect. The key is kept only so the dashboard and config API keep working.
+# To change what gets researched, tune `discovery:` below.
 # ----------------------------------------------------------------------------
-universe:
-  - AAPL
-  - MSFT
-  - NVDA
-  - GOOGL
-  - AMZN
-  - META
-  - JPM
-  - V
-  - UNH
-  - XOM
-  - CAT
-  - COST
+universe: []
 
-# Optional sector map override. If a ticker isn't listed here the data provider
-# fills it in from fundamentals; this map guarantees correct sector grouping
-# for the max_sector_pct guardrail even when the API is unavailable.
+# Optional sector map. Purely a hint — it is NOT a watchlist and does not cause
+# these tickers to be researched (the screener may still surface them). If a
+# ticker isn't listed here the data provider fills the sector in from
+# fundamentals; this map guarantees correct sector grouping for the
+# max_sector_pct guardrail even when the API is unavailable.
 sectors:
   AAPL: Technology
   MSFT: Technology
@@ -150,19 +154,28 @@ sectors:
   COST: Consumer Staples
 
 # ----------------------------------------------------------------------------
-# Dynamic discovery (screener). Before researching the fixed universe above, an
-# optional lightweight step scans FREE sources (yfinance screeners, Yahoo
-# trending, Reddit) for trending/most-active names, pre-filters them with
-# yfinance only (NO Alpha Vantage quota cost), and appends the top few to the
-# universe FOR THAT RUN ONLY. It is additive: if it fails or finds nothing the
-# system silently researches just the fixed universe.
+# Dynamic discovery (screener). This is now the ONLY source of tickers: each
+# run scans FREE sources (yfinance screeners, Yahoo trending, Reddit) for
+# trending/most-active names, pre-filters them with yfinance only (NO Alpha
+# Vantage quota cost), and researches the strongest by 1-month momentum.
+#
+# FAIL-CLOSED: if discovery fails or finds nothing there is no watchlist to
+# fall back to — the run halts and trades nothing. Setting dynamic_discovery
+# to false therefore disables trading entirely; it does not revert to a
+# static universe.
 # ----------------------------------------------------------------------------
 discovery:
-  dynamic_discovery: true     # master on/off toggle
-  max_discovered: 5           # cap appended per run
+  dynamic_discovery: true     # master on/off toggle (false == trade nothing)
+  max_discovered: 20          # tickers researched per run
   min_avg_volume: 500000      # pre-filter: require > this avg daily volume
   min_price: 2                # pre-filter: price band (avoid penny stocks ...)
   max_price: 500              #             ... and very high-priced names
+  # Volatility ceiling (annualised, from 3 months of daily returns). On a
+  # concentrated 3-name book a name at 87% annualised vol cannot be risk-managed
+  # by any stop setting — the stop sits far inside normal daily drift, so it
+  # exits on noise and pays the round-trip slippage each time. Screen them out
+  # rather than trying to size around them.
+  max_annualized_vol: 0.60
   use_yfinance_screeners: true   # yfinance most_actives / day_gainers
   use_yahoo_trending: true       # Yahoo Finance trending endpoint
   use_reddit: true               # r/wallstreetbets + r/stocks hot.json mentions
@@ -173,15 +186,17 @@ discovery:
 # final capital-allocation decision.
 # ----------------------------------------------------------------------------
 # Fast preset: Haiku for the high-volume / supporting agents, Sonnet for the
-# final capital-allocation decision. Bump decision to claude-opus-4-8 if you want
-# maximum reasoning depth on the one decision call (slower).
+# final capital-allocation decision. NOTE: decision_agent is ALSO the model the
+# Robinhood MCP broker uses for every account read (a best-of-3 loop) and order
+# placement — so it runs several times per cycle, not once. Keep it on Sonnet;
+# Opus (claude-opus-5 / claude-opus-4-8) is far more expensive here for little
+# gain, since the decision is bounded by the deterministic guardrails.
 models:
   research_agent: "claude-haiku-4-5-20251001"
   analysis_agent: "claude-haiku-4-5-20251001"
   decision_agent: "claude-sonnet-4-6"
   monitor_agent: "claude-haiku-4-5-20251001"
   # Deep-research briefings (--mode explain): one read-heavy call per run.
-  # Bump to claude-opus-4-8 for maximum depth (slower).
   explain_agent: "claude-sonnet-4-6"
 
 # ----------------------------------------------------------------------------
@@ -275,9 +290,21 @@ accounts:
     # every percentage ceiling explicit.
     risk:
       min_trade_usd: 1          # allow small/fractional orders (a floor, not a risk ceiling)
-      per_trade_max_usd: 25     # cap any single order (far tighter than the base $500)
+      # Per-trade cap is the TIGHTER of these two. The pct is what binds on a
+      # small book ($100 equity -> $30) and it scales as the account grows, so
+      # sizing stays proportional without anyone editing a dollar figure.
+      per_trade_max_pct: 0.30
+      per_trade_max_usd: 500    # absolute ceiling; only binds once equity > ~$1,667
       max_position_pct: 0.34    # allow a few concentrated momentum names on a tiny book
-      max_positions: 5          # momentum: few, fast names
+      max_positions: 3          # concentrated: 3 x ~30% = the full deployable book
+      # Sector cap disabled for this account ON PURPOSE. Screener-discovered
+      # tickers often have no sector from the provider, so they all collapse
+      # into one "Unknown" bucket and the 2nd buy gets rejected for a breach
+      # that is really just missing metadata. On a 3-name book with a 34%
+      # position cap, the sector cap adds no protection the position cap
+      # doesn't already give. The base risk: block keeps 0.40 for the
+      # individual (advice-only) account.
+      max_sector_pct: 1.0
 
 # ----------------------------------------------------------------------------
 # Recommend mode: when no real account is connected, recommendations are sized

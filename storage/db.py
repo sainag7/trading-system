@@ -152,10 +152,11 @@ CREATE TABLE IF NOT EXISTS trade_plans (
     ticker         TEXT PRIMARY KEY,    -- one active plan per held name
     entry_date     TEXT,                -- date the position was opened (for time-stop)
     entry_price    REAL,
-    stop_loss      REAL,                -- price level set by the decision agent
+    stop_loss      REAL,                -- price level (raised as the trailing stop ratchets up)
     take_profit    REAL,                -- price level set by the decision agent
     max_hold_until TEXT,                -- ISO date swing time-stop
     thesis         TEXT,                -- original entry thesis (for the Monitor)
+    peak_price     REAL,                -- highest price seen since entry (chandelier trail)
     run_id         TEXT,
     updated_ts     TEXT
 );
@@ -197,6 +198,7 @@ class Database:
     def _migrate(self) -> None:
         """Add columns introduced after the initial schema (no-op if present)."""
         for table, col, decl in [("trade_plans", "thesis", "TEXT"),
+                                  ("trade_plans", "peak_price", "REAL"),
                                   ("positions", "account", "TEXT"),
                                   ("pnl", "account", "TEXT")]:
             try:
@@ -418,10 +420,12 @@ class Database:
         self, *, ticker: str, run_id: str, entry_price: float | None = None,
         stop_loss: float | None = None, take_profit: float | None = None,
         max_hold_until: str | None = None, thesis: str | None = None,
+        peak_price: float | None = None,
     ) -> None:
-        """Record/refresh a position's exit plan. ``entry_date`` and ``thesis``
-        are set once, on first open, so the Monitor's time-stop measures from the
-        real entry and the original thesis is preserved for thesis-break checks."""
+        """Record/refresh a position's exit plan. ``entry_date``, ``thesis`` and
+        ``peak_price`` are set once, on first open, so the Monitor's time-stop
+        measures from the real entry, the original thesis is preserved, and the
+        chandelier trail starts from the entry price."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with self._cursor() as c:
             exists = c.execute(
@@ -435,18 +439,35 @@ class Database:
                        max_hold_until=COALESCE(?, max_hold_until),
                        entry_price=COALESCE(entry_price, ?),
                        thesis=COALESCE(thesis, ?),
+                       peak_price=COALESCE(peak_price, ?),
                        run_id=?, updated_ts=? WHERE ticker=?""",
                     (stop_loss, take_profit, max_hold_until, entry_price, thesis,
-                     run_id, _now(), ticker),
+                     peak_price, run_id, _now(), ticker),
                 )
             else:
                 c.execute(
                     """INSERT INTO trade_plans(ticker, entry_date, entry_price,
-                       stop_loss, take_profit, max_hold_until, thesis, run_id, updated_ts)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                       stop_loss, take_profit, max_hold_until, thesis, peak_price,
+                       run_id, updated_ts)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (ticker, today, entry_price, stop_loss, take_profit,
-                     max_hold_until, thesis, run_id, _now()),
+                     max_hold_until, thesis, peak_price, run_id, _now()),
                 )
+
+    def update_trail(self, ticker: str, *, stop_loss: float | None = None,
+                     peak_price: float | None = None) -> None:
+        """Ratchet a position's chandelier trail: raise ``stop_loss`` and
+        ``peak_price`` but NEVER lower them (a trailing stop only moves up). Called
+        each monitor cycle. ``MAX(existing, new)`` keeps the higher; when either
+        side is NULL the COALESCE chain falls back so nothing is clobbered."""
+        with self._cursor() as c:
+            c.execute(
+                """UPDATE trade_plans SET
+                   stop_loss  = COALESCE(MAX(stop_loss, ?), ?, stop_loss),
+                   peak_price = COALESCE(MAX(peak_price, ?), ?, peak_price),
+                   updated_ts = ? WHERE ticker=?""",
+                (stop_loss, stop_loss, peak_price, peak_price, _now(), ticker),
+            )
 
     def get_trade_plans(self) -> dict[str, dict]:
         """All stored exit plans, keyed by ticker."""

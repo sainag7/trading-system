@@ -115,6 +115,9 @@ def _build_technicals(series: list[dict] | None, quote: dict | None, fund: dict)
         "distance_from_52w_high_pct": None, "distance_from_52w_low_pct": None,
         "volume": None, "avg_volume_50d": None, "volume_vs_avg": None,
         "trend": "sideways", "trend_strength": 50,
+        # Time-series momentum features (percent returns) for the factor model.
+        "ret_1m": None, "ret_3m": None, "ret_6m": None, "ret_12m": None,
+        "ret_12_1": None, "above_sma200": None,
     }
     if not series:
         price = (quote or {}).get("price")
@@ -164,19 +167,39 @@ def _build_technicals(series: list[dict] | None, quote: dict | None, fund: dict)
     trend, strength = _trend(price, sma50, sma200, t["rsi14"])
     t["trend"] = trend
     t["trend_strength"] = strength
+
+    # Momentum: percent returns over standard swing/position horizons (~21 trading
+    # days per month) plus the classic 12-1 momentum factor.
+    t["ret_1m"] = _r(indicators.pct_return(closes, 21))
+    t["ret_3m"] = _r(indicators.pct_return(closes, 63))
+    t["ret_6m"] = _r(indicators.pct_return(closes, 126))
+    t["ret_12m"] = _r(indicators.pct_return(closes, 252))
+    t["ret_12_1"] = _r(indicators.momentum_12_1(closes))
+    if price and sma200:
+        t["above_sma200"] = bool(price >= sma200)
     return t
 
 
-def _build_fundamentals(fund: dict) -> dict:
+def _build_fundamentals(fund: dict, price: float | None = None) -> dict:
     """Pass through the provider's fundamentals to the public schema shape."""
     keys = (
         "revenue_ttm", "revenue_growth_yoy", "eps_ttm", "eps_growth_yoy",
         "gross_margin", "operating_margin", "profit_margin", "pe_ratio",
         "ps_ratio", "debt_to_equity", "free_cash_flow", "next_earnings_date",
         "market_cap", "beta", "industry", "name", "description",
+        # Forward-looking fields (previously fetched but dropped here): analyst
+        # consensus and forward valuation, used by the factor model + briefing.
+        "analyst_target", "week52_high", "week52_low",
+        "forward_pe", "forward_eps", "recommendation_mean", "num_analysts",
     )
     out = {k: fund.get(k) for k in keys}
     out["sector"] = fund.get("sector", "Unknown")
+    # Implied upside to the analyst consensus target (a genuine forward signal).
+    tgt = out.get("analyst_target")
+    if isinstance(tgt, (int, float)) and isinstance(price, (int, float)) and price > 0:
+        out["analyst_upside_pct"] = round((tgt / price - 1) * 100, 2)
+    else:
+        out["analyst_upside_pct"] = None
     return out
 
 
@@ -324,7 +347,7 @@ async def research_ticker(
 
     sector = fund.get("sector", "Unknown")
     technicals = _build_technicals(series, quote, fund)
-    fundamentals = _build_fundamentals(fund)
+    fundamentals = _build_fundamentals(fund, price=technicals.get("price"))
     news = _build_news(news_raw)
     as_of = series[-1]["date"] if series else (quote or {}).get("as_of")
     news["as_of"] = as_of

@@ -140,14 +140,13 @@ def api_deepdive_unhide(ticker: str) -> dict:
 # ==========================================================================
 @app.post("/api/scan")
 async def api_scan(body: dict = Body(default={})) -> dict:
-    profile = body.get("profile")
     account = body.get("account")
 
     async def factory(job):
-        return await engine.run_scan(profile, account)
+        return await engine.run_scan(account)
 
     try:
-        job = manager.start_engine("scan", f"{profile or 'default'} scan", factory)
+        job = manager.start_engine("scan", f"{account or 'default'} scan", factory)
     except EngineBusy as e:
         raise HTTPException(status_code=409, detail=str(e))
     return job.status_dict()
@@ -178,10 +177,10 @@ async def api_trade_plan(body: dict = Body(default={})) -> dict:
     mode = (body.get("mode") or "preview").lower()
     if mode not in ("preview", "live"):
         raise HTTPException(status_code=400, detail="mode must be 'preview' or 'live'")
-    profile, account = body.get("profile"), body.get("account")
+    account = body.get("account")
 
     async def factory(job):
-        return await trading.build(mode, profile, account)
+        return await trading.build(mode, account)
 
     try:
         job = manager.start_engine("plan", f"{mode} plan", factory)
@@ -218,10 +217,10 @@ async def api_trade_live(body: dict = Body(default={})) -> dict:
         raise HTTPException(
             status_code=400,
             detail="live trading requires confirm='I UNDERSTAND'")
-    profile, account = body.get("profile"), body.get("account")
+    account = body.get("account")
 
     async def factory(job):
-        return await trading.live(profile, account)
+        return await trading.live(account)
 
     try:
         job = manager.start_engine("live", "placing LIVE orders", factory)

@@ -20,14 +20,38 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
+# Default output ceiling for a single agent call. This is a CAP, not a spend —
+# you are billed for tokens actually generated. It must be large enough for the
+# biggest JSON an agent can legitimately return: too small and the response is
+# silently truncated mid-object, `extract_json` returns None, and the caller
+# degrades to its offline heuristic for what looks like no reason.
+DEFAULT_MAX_TOKENS = 16000
+
 # Cache backend availability so we only probe once per process.
 _SDK_OK: bool | None = None
 _ANTHROPIC_OK: bool | None = None
+
+# Why the most recent backend call failed, so a caller that falls back to a
+# deterministic heuristic can say WHY instead of failing silently.
+_LAST_ERROR: str | None = None
+
+
+def last_error() -> str | None:
+    """Reason the most recent LLM call failed, or ``None`` if it succeeded."""
+    return _LAST_ERROR
+
+
+def _record_error(where: str, exc: Exception) -> None:
+    """Remember and surface a backend failure. Never raises."""
+    global _LAST_ERROR
+    _LAST_ERROR = f"{where}: {type(exc).__name__}: {exc}"
+    print(f"⚠️  LLM call failed ({_LAST_ERROR})", file=sys.stderr)
 
 
 def load_prompt(name: str) -> str:
@@ -77,6 +101,7 @@ async def generate_text(
     allowed_tools: list[str] | None = None,
     max_turns: int = 1,
     setting_sources: list[str] | None = None,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> str | None:
     """Return the model's text output, or ``None`` if no backend is available.
 
@@ -90,10 +115,13 @@ async def generate_text(
     Speed: pure text-in/JSON-out agents (no MCP, no inheritance) use the
     lightweight Anthropic Messages API FIRST — far faster than the Agent SDK.
     """
+    global _LAST_ERROR
+    _LAST_ERROR = None
     force_sdk = mcp_servers is not None or setting_sources is not None
     # Pure agents: prefer the fast Messages API.
     if not force_sdk and _anthropic_available():
-        text = await _via_anthropic(system_prompt, user_prompt, model)
+        text = await _via_anthropic(system_prompt, user_prompt, model,
+                                    max_tokens=max_tokens)
         if text is not None:
             return text
     # MCP flows (or no API key) go through the Agent SDK.
@@ -105,7 +133,10 @@ async def generate_text(
         )
     # Last resort (e.g. MCP requested but SDK unavailable): try the API anyway.
     if not force_sdk and _anthropic_available():
-        return await _via_anthropic(system_prompt, user_prompt, model)
+        return await _via_anthropic(system_prompt, user_prompt, model,
+                                    max_tokens=max_tokens)
+    if _LAST_ERROR is None:
+        _LAST_ERROR = "no LLM backend available (no ANTHROPIC_API_KEY and no Agent SDK)"
     return None
 
 
@@ -141,25 +172,35 @@ async def _via_agent_sdk(
                 final = message.result
         text = "".join(chunks).strip()
         return text or (final.strip() if final else None)
-    except Exception:
+    except Exception as e:
+        _record_error("claude_agent_sdk", e)
         return None
 
 
-async def _via_anthropic(system_prompt: str, user_prompt: str, model: str) -> str | None:
+async def _via_anthropic(system_prompt: str, user_prompt: str, model: str, *,
+                         max_tokens: int = DEFAULT_MAX_TOKENS) -> str | None:
     try:
         import anthropic
 
         client = anthropic.AsyncAnthropic()
         resp = await client.messages.create(
             model=model,
-            max_tokens=2048,
+            max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        # A truncated response is unparseable JSON downstream, which used to
+        # look like "no LLM backend". Name it explicitly instead.
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            global _LAST_ERROR
+            _LAST_ERROR = (f"anthropic_api: {model} hit max_tokens={max_tokens} "
+                           f"and the response was truncated")
+            print(f"⚠️  {_LAST_ERROR}", file=sys.stderr)
         return "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
-    except Exception:
+    except Exception as e:
+        _record_error("anthropic_api", e)
         return None
 
 
@@ -199,6 +240,7 @@ async def generate_json(
     allowed_tools: list[str] | None = None,
     max_turns: int = 1,
     setting_sources: list[str] | None = None,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> tuple[Any | None, str | None]:
     """Generate and parse JSON. Returns ``(parsed_or_None, raw_text_or_None)``."""
     user_prompt = (
@@ -208,6 +250,12 @@ async def generate_json(
     raw = await generate_text(
         system_prompt, user_prompt, model,
         mcp_servers=mcp_servers, allowed_tools=allowed_tools, max_turns=max_turns,
-        setting_sources=setting_sources,
+        setting_sources=setting_sources, max_tokens=max_tokens,
     )
-    return extract_json(raw), raw
+    parsed = extract_json(raw)
+    if parsed is None and raw:
+        global _LAST_ERROR
+        _LAST_ERROR = (_LAST_ERROR
+                       or f"model returned text but no parseable JSON "
+                          f"({len(raw)} chars)")
+    return parsed, raw

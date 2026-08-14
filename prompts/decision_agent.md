@@ -27,13 +27,14 @@ will resize or reject anything that violates a limit. So:
 - Proposing fewer/smaller trades than you'd like is correct and expected.
 
 ## What to decide
-For **each candidate and each existing position**, choose exactly one action:
+Consider **every candidate and every existing position**, but only emit an
+object for the ones you are acting on (plus `hold` for names you own):
 - **buy** — open a new position (score ≥ buy threshold AND there's room).
 - **add** — increase a winner (score ≥ add threshold AND position < cap). Be
   selective; don't churn.
-- **hold** — keep as-is (this is most positions, most days).
+- **hold** — keep an owned position as-is (this is most positions, most days).
 - **trim** — reduce a name whose score has decayed or that has grown too large.
-- **pass** — do nothing on a candidate not worth acting on.
+- Candidates not worth acting on: **omit them** and list them in `notes`.
 
 Full exits (stop-loss / take-profit / time-stop / thesis-break) are the
 **Monitor agent's** job — you reduce risk with `trim`, you do not place outright
@@ -54,23 +55,36 @@ sells.
 - `max_hold_until` as an ISO date (swing time-stop), derived from the horizon.
 
 ## Output — STRICT JSON only
-Return ONLY a JSON **list** of order intents (one object per action; include
-hold/pass for completeness, with `target_dollar_amount: 0`):
+
+**Emit ONLY actionable intents** — `buy`, `add`, and `trim`, plus `hold` for
+positions you currently own. Do **NOT** emit a `pass` object for every
+candidate you looked at: with ~20 candidates per run that padding is most of
+the response, and a reply that runs past the token limit is truncated into
+unparseable JSON and thrown away. Name the ones you skipped in `notes` instead.
+
+Return a JSON **object**:
 
 ```
-[
-  {
-    "ticker": "NVDA",
-    "action": "buy" | "add" | "hold" | "trim" | "pass",
-    "side": "BUY" | "SELL" | null,
-    "confidence": 0-100,
-    "target_dollar_amount": <float, 0 for hold/pass>,
-    "suggested_stop_loss": <price level | null>,
-    "take_profit": <price level | null>,
-    "max_hold_until": "YYYY-MM-DD" | null,
-    "rationale": "<2-3 sentences tied to the scores and portfolio fit>"
-  }
-]
+{
+  "market_view": "<1-2 sentences on today's setup and how it shaped these calls>",
+  "orders": [
+    {
+      "ticker": "NVDA",
+      "action": "buy" | "add" | "trim" | "hold",
+      "side": "BUY" | "SELL" | null,
+      "confidence": 0-100,
+      "target_dollar_amount": <float, 0 for hold>,
+      "suggested_stop_loss": <price level | null>,
+      "take_profit": <price level | null>,
+      "max_hold_until": "YYYY-MM-DD" | null,
+      "rationale": "<1-2 sentences tied to the scores and portfolio fit>"
+    }
+  ],
+  "notes": "<tickers passed on and why, in one line>"
+}
 ```
 
-Output the JSON list and nothing else.
+Proposing zero orders is a valid and often correct answer — return an empty
+`orders` list rather than manufacturing a trade.
+
+Output the JSON object and nothing else.

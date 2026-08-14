@@ -61,8 +61,6 @@ def config_view() -> dict:
     return {
         "general": {
             "mode": cfg.mode,
-            "profile": cfg.profile,
-            "profiles": list(cfg.valid_profiles()),
             "modes": list(VALID_MODES),
         },
         "universe": cfg.universe,
@@ -84,17 +82,17 @@ def config_view() -> dict:
 
 def apply_overrides(patch: dict) -> dict:
     """Deep-merge ``patch`` into the current overlay and persist it, but only for
-    recognised top-level keys (``mode``, ``profile``, ``universe`` and the
+    recognised top-level keys (``mode``, ``universe`` and the
     :data:`EDITABLE_SECTIONS`). Validates by reloading; rolls back on any error.
 
     Returns ``{"ok": True}`` or ``{"ok": False, "error": ...}``.
     """
-    allowed = {"mode", "profile", "universe", "dashboard", *EDITABLE_SECTIONS}
+    allowed = {"mode", "universe", "dashboard", *EDITABLE_SECTIONS}
     clean = {k: v for k, v in (patch or {}).items() if k in allowed}
     if not clean:
         return {"ok": False, "error": "no editable keys in patch"}
 
-    # Guard the two mode/profile scalars against invalid values before writing.
+    # Guard the mode scalar against invalid values before writing.
     if "mode" in clean and str(clean["mode"]).lower() not in VALID_MODES:
         return {"ok": False, "error": f"invalid mode {clean['mode']!r}"}
 

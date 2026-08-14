@@ -123,6 +123,41 @@ def test_per_trade_one_cent_over_resizes():
     assert res.approved_usd == pytest.approx(500.0)
 
 
+def test_per_trade_pct_binds_when_tighter_than_usd_ceiling():
+    """On a small book the equity-scaled pct is what caps the order."""
+    res = validate_order(buy(usd=80), account(equity=100, cash=100),
+                         default_limits(per_trade_max_usd=500,
+                                        per_trade_max_pct=0.30,
+                                        max_position_pct=1.0,
+                                        min_trade_usd=1))
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(30.0)
+
+
+def test_per_trade_usd_binds_when_tighter_than_pct():
+    """On a large book the absolute dollar ceiling is what caps the order."""
+    res = validate_order(buy(usd=800), account(equity=100_000, cash=100_000),
+                         default_limits(per_trade_max_usd=500,
+                                        per_trade_max_pct=0.30))
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(500.0)
+
+
+def test_per_trade_pct_scales_with_equity():
+    """The cap grows with the account — no manual edit needed as it compounds."""
+    limits = default_limits(per_trade_max_usd=500, per_trade_max_pct=0.30,
+                            max_position_pct=1.0, min_trade_usd=1)
+    res = validate_order(buy(usd=1000), account(equity=1000, cash=1000), limits)
+    assert res.approved_usd == pytest.approx(300.0)
+
+
+def test_per_trade_pct_defaults_to_noop():
+    """Configs that never set the pct keep pure per_trade_max_usd behaviour."""
+    res = validate_order(buy(usd=800), account(equity=100_000, cash=100_000),
+                         default_limits(per_trade_max_usd=500))
+    assert res.approved_usd == pytest.approx(500.0)
+
+
 # ===========================================================================
 # max_position_pct  (REJECT, not resize)
 # ===========================================================================

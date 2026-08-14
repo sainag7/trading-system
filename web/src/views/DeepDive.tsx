@@ -167,7 +167,7 @@ function Report({ report }: { report: any }) {
           <Callout kind={verdictKind as any}>
             <div>
               <strong style={{ textTransform: "uppercase" }}>{v.action}</strong>
-              {" "}· confidence {v.confidence ?? "—"} · {v.profile ?? "swing"} profile
+              {" "}· confidence {v.confidence ?? "—"}
               {v.rationale && <div style={{ marginTop: 4, color: "var(--text)" }}>{v.rationale}</div>}
             </div>
           </Callout>

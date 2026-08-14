@@ -1,7 +1,7 @@
 """In-process orchestrator runners for the web API.
 
-Thin wrappers that build a ``Config`` with the same mode/profile/account routing
-as ``orchestrator.main()`` and drive the orchestrator directly (no subprocess), so
+Thin wrappers that build a ``Config`` with the same mode/account routing as
+``orchestrator.main()`` and drive the orchestrator directly (no subprocess), so
 the job manager can capture output and — for trading — so per-order approval can
 be injected. Nothing here bypasses guardrails or the kill switch: every path goes
 through ``Orchestrator``.
@@ -13,22 +13,18 @@ import orchestrator as orch_mod
 
 
 class ConfigError(ValueError):
-    """A user-facing configuration problem (bad account, invalid profile, …)."""
+    """A user-facing configuration problem (bad account, bad mode, …)."""
 
 
-def prepare_config(*, mode: str, profile: str | None = None,
+def prepare_config(*, mode: str,
                    account: str | None = None) -> tuple[Config, str | None, dict | None]:
-    """Load config and apply mode/profile/account exactly like ``orchestrator.main``.
+    """Load config and apply mode/account exactly like ``orchestrator.main``.
 
     Advice modes default to the ``individual`` account, trading modes to
     ``agentic`` — so autonomous orders never touch the individual book. Trading
     modes REQUIRE a real, configured account number (matches the CLI guard)."""
     cfg = load_config()
     cfg.set_mode(mode)
-    try:
-        cfg.apply_profile(profile or cfg.profile)
-    except ValueError as e:
-        raise ConfigError(str(e))
 
     role = account
     if role is None and cfg.accounts:
@@ -48,13 +44,12 @@ def prepare_config(*, mode: str, profile: str | None = None,
     return cfg, role, active
 
 
-async def run_scan(profile: str | None = None, account: str | None = None) -> dict:
+async def run_scan(account: str | None = None) -> dict:
     """Recommend-mode scan (advice only — never trades)."""
-    cfg, role, _ = prepare_config(mode="recommend", profile=profile, account=account)
+    cfg, role, _ = prepare_config(mode="recommend", account=account)
     orch = orch_mod.Orchestrator(cfg)
     await orch.run_cycle()
-    return {"run_id": orch.run_id, "mode": "recommend",
-            "profile": cfg.profile, "account": role}
+    return {"run_id": orch.run_id, "mode": "recommend", "account": role}
 
 
 async def run_research(ticker: str) -> dict:
