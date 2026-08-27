@@ -290,20 +290,29 @@ accounts:
     # every percentage ceiling explicit.
     risk:
       min_trade_usd: 1          # allow small/fractional orders (a floor, not a risk ceiling)
-      # Per-trade cap is the TIGHTER of these two. The pct is what binds on a
-      # small book ($100 equity -> $30) and it scales as the account grows, so
-      # sizing stays proportional without anyone editing a dollar figure.
-      per_trade_max_pct: 0.30
-      per_trade_max_usd: 500    # absolute ceiling; only binds once equity > ~$1,667
-      max_position_pct: 0.34    # allow a few concentrated momentum names on a tiny book
-      max_positions: 3          # concentrated: 3 x ~30% = the full deployable book
+      # SIZING IS THE DECISION AGENT'S CALL ON THIS ACCOUNT, ON PURPOSE.
+      # Every percentage ceiling below is set to "no cap" so the agent's own
+      # conviction sizing reaches the broker unmodified. A fixed fraction of
+      # equity (formerly 0.30 -> $30 on a $100 book) silently resized the agent's
+      # judgement down; worse, a ceiling the agent exceeds does not trim the
+      # order, it REJECTS it outright (only the per-trade cap resizes — see the
+      # enforcement list in risk/guardrails.py), so a high-conviction idea was
+      # dropped entirely rather than placed smaller.
+      #
+      # What still bounds this account: `per_trade_max_usd`, `max_positions`,
+      # available buying power, `max_equity_guard` above, and the kill switch.
+      # This is a deliberately unconstrained $100 sandbox — the individual
+      # account is untouched and keeps the strict base limits.
+      per_trade_max_pct: 1.0    # no per-trade percentage cap
+      per_trade_max_usd: 500    # absolute ceiling; only binds once equity > $500
+      max_position_pct: 1.0     # no per-name cap — one name may take the whole book
+      min_cash_reserve_pct: 0.0 # no cash floor — the book may run fully invested
+      max_positions: 3          # the one structural limit kept: at most 3 names open
       # Sector cap disabled for this account ON PURPOSE. Screener-discovered
       # tickers often have no sector from the provider, so they all collapse
       # into one "Unknown" bucket and the 2nd buy gets rejected for a breach
-      # that is really just missing metadata. On a 3-name book with a 34%
-      # position cap, the sector cap adds no protection the position cap
-      # doesn't already give. The base risk: block keeps 0.40 for the
-      # individual (advice-only) account.
+      # that is really just missing metadata. The base risk: block keeps 0.40
+      # for the individual (advice-only) account.
       max_sector_pct: 1.0
 
 # ----------------------------------------------------------------------------

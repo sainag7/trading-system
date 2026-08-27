@@ -106,7 +106,7 @@ if [ "$ENABLE_LIVE" = "1" ]; then
     printf "Installing agentic autonomous job (live, %02d:%02d %s, weekdays)...\n" \
       "$HOUR_LIVE" "$MIN_LIVE" "$LOCAL_TZ"
     write_plist "$LABEL_LIVE" "$HOUR_LIVE" "$MIN_LIVE" \
-      --mode live --yes --profile momentum --account agentic
+      --mode live --yes --account agentic
   else
     echo "Confirmation not given — live job NOT installed."
   fi

@@ -54,6 +54,20 @@ def _quantize_shares(qty: float) -> float:
     return math.floor(float(qty) * _QTY_SCALE) / _QTY_SCALE
 
 
+def _f_or_none(v) -> float | None:
+    """Parse a broker-reported number, or ``None`` when it is absent/unusable.
+
+    Distinguishes "the broker did not tell us" from "the broker said zero", so a
+    missing fill price is never silently replaced by a reference price."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
 def _fmt_qty(qty: float) -> str:
     """Render a quantity for the broker order instruction: quantized to <=8
     decimals, no trailing zeros and never scientific notation (e.g.
@@ -306,20 +320,47 @@ class RobinhoodMCPBroker:
         return best
 
     async def place_order(self, *, ticker: str, side: Side, qty: float, limit_price: float,
-                          order_type: str = "limit", ref_id: str | None = None) -> OrderResult:
+                          order_type: str = "limit", ref_id: str | None = None,
+                          dollar_amount: float | None = None) -> OrderResult:
         acct = self.account_number
         acct_clause = (
             f'in Robinhood account number "{acct}" (pass account_number="{acct}") '
             if acct else ""
         )
         ref_clause = f'Pass ref_id="{ref_id}" for idempotency. ' if ref_id else ""
+        # A market order takes no limit_price — passing one is an invalid
+        # combination at the broker. The reference price is passed along only so
+        # the response can be sanity-checked against it, never as an order field.
+        if order_type == "market":
+            price_clause = (
+                'as a MARKET order with market_hours="regular_hours". '
+                "Do NOT pass limit_price. The current reference price is "
+                f"~${limit_price:.2f}"
+            )
+        else:
+            price_clause = f"at limit price {limit_price:.2f}"
+        # A fractional quantity can only go out as a market order, which has no
+        # price protection: between sizing and fill the price can move and a
+        # share-based order spends whatever it costs. Sending the approved
+        # NOTIONAL instead caps the spend exactly — the broker derives the share
+        # count itself. Buys only: a sell needs to move an exact share count
+        # (closing a position), and its risk is smaller proceeds, not overspend.
+        if dollar_amount is not None:
+            size_clause = (f'for dollar_amount="{dollar_amount:.2f}" of {ticker} '
+                           f"(pass dollar_amount, NOT quantity; this caps the spend "
+                           f"at ${dollar_amount:.2f})")
+        else:
+            size_clause = f"for {_fmt_qty(qty)} shares of {ticker}"
         instruction = (
             f"Using place_equity_order, place EXACTLY ONE {order_type} {side.value} "
-            f"order {acct_clause}for {_fmt_qty(qty)} shares of {ticker} at limit price "
-            f"{limit_price:.2f}. {ref_clause}Do not place any other order and do not "
+            f"order {acct_clause}{size_clause} "
+            f"{price_clause}. {ref_clause}Do not place any other order and do not "
             "use any other account. If the order is accepted, return STRICT JSON: "
             '{"status": "submitted"|"filled", "order_id": "<id>", '
             '"filled_qty": <float>, "fill_price": <float>}. '
+            "Report filled_qty and fill_price ONLY as the broker actually reports "
+            "them; OMIT either field if the broker did not report it. Do NOT infer, "
+            "estimate or echo back the reference price. "
             "If it is rejected or anything is unclear, return "
             '{"status": "rejected"|"unclear", "detail": "<why>"} and do NOT retry.'
         )
@@ -333,11 +374,28 @@ class RobinhoodMCPBroker:
                                detail={"raw": raw, "note": "unparseable broker response"})
         status = str(parsed.get("status", "unclear")).lower()
         if status in ("submitted", "filled"):
+            reported_qty = _f_or_none(parsed.get("filled_qty"))
+            reported_price = _f_or_none(parsed.get("fill_price"))
+            # NEVER substitute the reference price for a fill the broker did not
+            # report — that writes an invented cost basis into the ledger and
+            # produces P&L computed against a price nothing traded at. Unknown
+            # stays 0.0 and is flagged, so the fills row is skipped and the
+            # trades row keeps its "intended" price under a non-filled status.
+            detail = dict(parsed)
+            if reported_price is None:
+                detail["fill_price_reported"] = False
+            # A share count may be assumed only for a share-based order the
+            # broker says is FILLED. A "submitted" order has no fill yet, and a
+            # dollar-based order's share count is the broker's to determine.
+            if reported_qty is None and status == "filled" and dollar_amount is None:
+                reported_qty = qty
+            elif reported_qty is None:
+                detail["filled_qty_reported"] = False
             return OrderResult(
                 ok=True, status=status,
-                filled_qty=float(parsed.get("filled_qty", qty) or qty),
-                fill_price=float(parsed.get("fill_price", limit_price) or limit_price),
-                broker_order_id=str(parsed.get("order_id", "")) or None, detail=parsed,
+                filled_qty=reported_qty or 0.0,
+                fill_price=reported_price or 0.0,
+                broker_order_id=str(parsed.get("order_id", "")) or None, detail=detail,
             )
         if status == "rejected":
             return OrderResult(ok=False, status="rejected", detail=parsed)
@@ -362,16 +420,59 @@ class Executor:
 
     @staticmethod
     def _default_confirm(order: dict) -> bool:
+        # Say what will actually be sent. "@ ~$X" on a market order reads as a
+        # price guarantee the order does not carry; the honest bound on a
+        # dollar-capped market buy is the spend, not the price.
+        if order.get("order_type") == "market":
+            if order.get("dollar_amount"):
+                price_txt = (f"as MARKET, spend capped at ${order['dollar_amount']:.2f} "
+                             f"(ref ~${order['limit_price']:.2f}, no price protection)")
+            else:
+                price_txt = (f"as MARKET @ ~${order['limit_price']:.2f} "
+                             f"(reference only — NO price protection)")
+        else:
+            price_txt = f"@ limit ${order['limit_price']:.2f}"
         ans = input(
             f"  >> CONFIRM {order['side']} {order['qty']:g} {order['ticker']} "
-            f"@ ~${order['limit_price']:.2f} (${order['notional']:.2f})? [y/N] "
+            f"{price_txt} (${order['notional']:.2f})? [y/N] "
         ).strip().lower()
         return ans in ("y", "yes")
 
-    def _limit_price(self, side: Side, ref_price: float) -> float:
-        slip = self.cfg.get("limit_slippage_pct", 0.005)
-        if self.cfg.get("order_type", "limit") == "market":
+    def _dollar_amount(self, side: Side, order_type: str,
+                       notional: float) -> float | None:
+        """The notional to send instead of a share count, or ``None``.
+
+        A market order carries no price protection, so a share-based buy spends
+        whatever the shares cost at fill. Sending the approved notional caps the
+        spend exactly and lets the broker derive the shares. Buys only — a sell
+        must move a specific share count, and its downside is smaller proceeds
+        rather than an overspend."""
+        if order_type != "market" or side != Side.BUY:
+            return None
+        return notional if notional and notional > 0 else None
+
+    def _effective_order_type(self, qty: float) -> str:
+        """The order type actually sendable for ``qty`` shares.
+
+        Robinhood permits fractional quantities ONLY on market orders during
+        regular hours; a fractional LIMIT order is rejected outright (HTTP 400
+        "fractional share quantities are not permitted on limit orders"). Because
+        orders are sized in dollars, a small book produces a fractional quantity
+        almost every time — so a configured ``limit`` would reject every buy.
+
+        Fall back to ``market`` only when the quantity is genuinely fractional;
+        whole-share orders keep the configured limit protection, so the account
+        regains price protection by itself as it grows into whole-share sizes.
+        """
+        configured = self.cfg.get("order_type", "limit")
+        if configured == "limit" and qty != math.floor(qty):
+            return "market"
+        return configured
+
+    def _limit_price(self, side: Side, ref_price: float, order_type: str | None = None) -> float:
+        if (order_type or self.cfg.get("order_type", "limit")) == "market":
             return ref_price  # informational; broker treats as market
+        slip = self.cfg.get("limit_slippage_pct", 0.005)
         # Buy a touch above, sell a touch below, to improve fill odds.
         return ref_price * (1 + slip) if side == Side.BUY else ref_price * (1 - slip)
 
@@ -403,8 +504,16 @@ class Executor:
             return OrderResult(ok=False, status="skipped",
                                detail={"reason": "quantity rounds to zero shares"})
 
-        limit_price = self._limit_price(side, ref_price)
-        order_type = self.cfg.get("order_type", "limit")
+        # Resolve the order type AFTER quantizing, since it depends on whether the
+        # final tradeable quantity is fractional, then price it accordingly.
+        order_type = self._effective_order_type(qty)
+        if order_type != self.cfg.get("order_type", "limit"):
+            self.db.audit(self.run_id, "INFO", "order_type_fallback_fractional",
+                          {"ticker": ticker, "qty": qty,
+                           "configured": self.cfg.get("order_type", "limit"),
+                           "used": order_type,
+                           "reason": "fractional quantity is only tradeable as a market order"})
+        limit_price = self._limit_price(side, ref_price, order_type)
         client_oid = self._client_oid(ticker, side, qty)
         order_row = self.db.log_order(
             self.run_id, self.mode, ticker=ticker, side=side.value, order_type=order_type,
@@ -426,7 +535,10 @@ class Executor:
         # ----- PREVIEW: confirm, then place live ---------------------------
         if self.mode == "preview":
             approved = self.confirm({"ticker": ticker, "side": side.value, "qty": qty,
-                                     "limit_price": limit_price, "notional": notional})
+                                     "limit_price": limit_price, "notional": notional,
+                                     "order_type": order_type,
+                                     "dollar_amount": self._dollar_amount(
+                                         side, order_type, notional)})
             if not approved:
                 self.db.update_order_status(order_row, "skipped", detail={"reason": "user declined"})
                 self.db.finish_trade(trade_id, "skipped", price=limit_price, qty=0.0,
@@ -438,9 +550,14 @@ class Executor:
 
         # ----- LIVE (or confirmed preview): place via broker w/ retries ----
         res = await self._place_live(order_row, ticker, side, qty, limit_price, order_type,
-                                     ref_id=self._ref_id(client_oid))
+                                     ref_id=self._ref_id(client_oid),
+                                     dollar_amount=self._dollar_amount(side, order_type, notional))
+        # Only a broker-reported fill updates price/qty. Passing None leaves the
+        # row's reserved intent values in place (finish_trade COALESCEs) under a
+        # status that says the order is not confirmed filled — rather than
+        # overwriting them with numbers nothing actually traded at.
         self.db.finish_trade(trade_id, res.status, broker_order_id=res.broker_order_id,
-                             price=res.fill_price or limit_price, qty=res.filled_qty or qty,
+                             price=res.fill_price or None, qty=res.filled_qty or None,
                              simulated=False, detail=res.detail)
         # ----- IDEMPOTENCY/SAFETY: never blind-retry an unclear fill -------
         if res.status == "needs_review":
@@ -448,14 +565,15 @@ class Executor:
         return res
 
     async def _place_live(self, order_row, ticker, side, qty, limit_price, order_type,
-                          *, ref_id: str | None = None) -> OrderResult:
+                          *, ref_id: str | None = None,
+                          dollar_amount: float | None = None) -> OrderResult:
         retries = int(self.cfg.get("max_order_retries", 2))
         backoff = float(self.cfg.get("retry_backoff_seconds", 5))
         attempt = 0
         while True:
             res = await self.broker.place_order(
                 ticker=ticker, side=side, qty=qty, limit_price=limit_price,
-                order_type=order_type, ref_id=ref_id,
+                order_type=order_type, ref_id=ref_id, dollar_amount=dollar_amount,
             )
             # Retry ONLY transient submission errors. Never retry an ambiguous
             # fill (needs_review) or a rejection — that risks a double fill.

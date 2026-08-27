@@ -45,19 +45,20 @@ def test_agentic_overlay_applies_100dollar_risk():
         r = cfg.risk
         # The $100 overlay must take effect for the agentic account.
         assert r.min_trade_usd == 1.0, r.min_trade_usd
-        assert r.max_position_pct == 0.34, r.max_position_pct
-        assert r.max_positions == 3, r.max_positions
-        # Per-trade sizing is equity-scaled: the pct binds on a small book and
-        # grows with the account, so it is never a stale dollar figure.
-        assert r.per_trade_max_pct == 0.30, r.per_trade_max_pct
-        assert min(r.per_trade_max_usd, r.per_trade_max_pct * 100.0) == 30.0
+        # Sizing on this account is the decision agent's call: EVERY percentage
+        # ceiling is off. A ceiling the agent exceeds does not trim the order, it
+        # rejects it outright (only the per-trade cap resizes), so a cap here
+        # would drop high-conviction ideas rather than place them smaller.
+        assert r.per_trade_max_pct == 1.0, r.per_trade_max_pct
+        assert r.max_position_pct == 1.0, r.max_position_pct
+        assert r.min_cash_reserve_pct == 0.0, r.min_cash_reserve_pct
         # Discovered tickers often have no sector, so they all collapse into one
         # "Unknown" bucket; the sector cap is disabled here on purpose.
         assert r.max_sector_pct == 1.0, r.max_sector_pct
-        # The concentrated book must fit inside the cash floor exactly.
-        assert r.max_positions * 30.0 == (100.0 - r.min_cash_reserve_pct * 100.0)
-        # Overrides that were NOT specified inherit the base limits.
-        assert r.min_cash_reserve_pct == 0.10
+        # max_positions is the one structural limit kept, alongside the absolute
+        # dollar ceiling, buying power and max_equity_guard.
+        assert r.max_positions == 3, r.max_positions
+        assert min(r.per_trade_max_usd, r.per_trade_max_pct * 100.0) == 100.0
         # Routing metadata is resolved.
         assert active["role"] == "agentic"
         assert cfg.account_number == cfg.accounts["agentic"]["number"]

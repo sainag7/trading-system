@@ -220,3 +220,61 @@ def test_dataprovider_series_skips_alphavantage():
         dp2._alpha_vantage = lambda params: calls2.append(params) or None
         dp2.get_daily_series("AAPL", 260)
         assert calls2 and calls2[0]["function"] == "TIME_SERIES_DAILY"
+
+
+# --------------------------------------------------------------------------- #
+# Unquotable symbols: blacklist only on real evidence, and never re-ask
+# --------------------------------------------------------------------------- #
+def _provider_with(responses):
+    """Provider whose quotes call returns each queued response in turn."""
+    inner = FakeInner()
+    p = RobinhoodDataProvider(inner, model="test")
+    p.ask_calls = []
+    queue = list(responses)
+
+    async def _ask(instruction, max_turns=8):
+        p.ask_calls.append(instruction)
+        return queue.pop(0) if queue else {}
+
+    p._ask = _ask
+    return p
+
+
+def test_symbol_absent_from_a_real_payload_is_blacklisted_once():
+    """A successful quotes payload that omits a symbol is proof the broker has no
+    instrument for it (delisted/acquired). Record it and stop asking — re-asking
+    cannot change the answer and burns an LLM round-trip each time."""
+    p = _provider_with([{"AAPL": {"price": 100.0, "prev_close": 99.0}}])
+    asyncio.run(p.prefetch(["AAPL", "WBS"]))
+    assert "WBS" in p._unavailable
+    assert "AAPL" not in p._unavailable
+    quote_calls = [c for c in p.ask_calls if "get_equity_quotes" in c]
+    assert len(quote_calls) == 1          # no pointless retry
+
+    # A later prefetch must not ask about the known-unavailable symbol again.
+    p.ask_calls.clear()
+    p._prefetched.clear()
+    asyncio.run(p.prefetch(["WBS"]))
+    assert [c for c in p.ask_calls if "get_equity_quotes" in c] == []
+
+
+def test_error_shaped_response_does_not_blacklist_the_batch():
+    """Being a dict is not proof of a quotes payload. An error body or wrapped
+    envelope resolves nothing — that must trigger a retry, not permanently
+    blacklist every symbol in the batch."""
+    p = _provider_with([
+        {"error": "rate limited"},                              # garbage, retry
+        {"AAPL": {"price": 100.0}, "MSFT": {"price": 200.0}},   # real payload
+    ])
+    asyncio.run(p.prefetch(["AAPL", "MSFT"]))
+    assert p._unavailable == set()        # nothing wrongly blacklisted
+    assert p._quotes["AAPL"]["price"] == 100.0
+    assert p._quotes["MSFT"]["price"] == 200.0
+    assert len([c for c in p.ask_calls if "get_equity_quotes" in c]) == 2   # retried
+
+
+def test_all_garbage_responses_leave_symbols_retryable():
+    """Two unusable responses must not poison the symbols permanently."""
+    p = _provider_with([{"error": "boom"}, {"error": "boom"}])
+    asyncio.run(p.prefetch(["AAPL"]))
+    assert p._unavailable == set()

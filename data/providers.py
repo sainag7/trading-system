@@ -23,6 +23,7 @@ they return ``None``/empty and the caller decides what to do):
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -293,12 +294,27 @@ class DataProvider:
                 # Enough history for a 200-day SMA when a long lookback is asked.
                 period = "2y" if lookback > 150 else f"{max(lookback, 60)}d"
                 hist = yf.Ticker(ticker).history(period=period)
-                rows = [
-                    {"date": str(idx.date()), "open": float(r["Open"]),
-                     "high": float(r["High"]), "low": float(r["Low"]),
-                     "close": float(r["Close"]), "volume": float(r["Volume"])}
-                    for idx, r in hist.iterrows()
-                ][-lookback:]
+                # yfinance occasionally emits an all-NaN bar for a date with no
+                # trade (halts, bad upstream data). A single NaN close poisons
+                # every downstream indicator — RSI sums to NaN — so drop those
+                # rows here rather than letting bad data into the pipeline.
+                rows = []
+                for idx, r in hist.iterrows():
+                    bar = {"date": str(idx.date()), "open": float(r["Open"]),
+                           "high": float(r["High"]), "low": float(r["Low"]),
+                           "close": float(r["Close"]), "volume": float(r["Volume"])}
+                    if not all(math.isfinite(bar[k])
+                               for k in ("open", "high", "low", "close")):
+                        continue
+                    rows.append(bar)
+                # Trailing zero-volume bars are yfinance padding a symbol that
+                # has stopped trading forward at its last close. Serving them
+                # would report a frozen price as current and flatten every
+                # volatility estimate. Drop them; the caller sees the real last
+                # traded bar and can judge staleness from its date.
+                while rows and rows[-1]["volume"] == 0:
+                    rows.pop()
+                rows = rows[-lookback:]
                 self.cache.set(cache_key, rows)
                 return rows
             except Exception:  # pragma: no cover

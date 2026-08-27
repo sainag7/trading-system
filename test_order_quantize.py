@@ -84,6 +84,8 @@ class _FakeDB:
     def __init__(self):
         self.orders: list[dict] = []
         self.trades: list[dict] = []
+        self.finished: list[dict] = []
+        self.fills: list[dict] = []
 
     def audit(self, *a, **k):
         pass
@@ -97,21 +99,26 @@ class _FakeDB:
         return len(self.trades), True, None
 
     def finish_trade(self, *a, **k):
-        pass
+        self.finished.append(k)
 
     def update_order_status(self, *a, **k):
         pass
 
     def log_fill(self, *a, **k):
-        pass
+        self.fills.append(k)
 
 
 class _RecordingBroker:
     def __init__(self):
         self.qty = None
+        self.dollar_amount = None
+        self.order_type = None
 
-    async def place_order(self, *, ticker, side, qty, limit_price, order_type, ref_id=None):
+    async def place_order(self, *, ticker, side, qty, limit_price, order_type,
+                          ref_id=None, dollar_amount=None):
         self.qty = qty
+        self.dollar_amount = dollar_amount
+        self.order_type = order_type
         from execution.executor import OrderResult
         return OrderResult(ok=True, status="submitted", filled_qty=qty,
                            fill_price=limit_price, broker_order_id="test")
@@ -149,3 +156,96 @@ def test_fmt_qty_clean_string():
     s = _fmt_qty(0.000000019)                              # 1.9e-8
     assert "e" not in s.lower()
     assert _decimals(float(s)) <= 8
+
+
+# ---------------------------------------------------------------------------
+# Market-order spend protection and fill honesty
+# ---------------------------------------------------------------------------
+def _run_order(cfg, *, side=Side.BUY, qty=0.07434944237918216, ref_price=337.93,
+               notional=25.0):
+    from execution.executor import Executor
+    db, broker = _FakeDB(), _RecordingBroker()
+    ex = Executor(broker, "live", db, "run-test", cfg, kill_switch_check=lambda: False)
+    asyncio.run(ex.execute_order(ticker="AAPL", side=side, qty=qty,
+                                 ref_price=ref_price, notional=notional))
+    return db, broker
+
+
+def test_fractional_buy_is_sent_as_capped_dollar_amount():
+    """A fractional qty can only go out as a market order, which has no price
+    protection. The spend must instead be bounded by sending the approved
+    notional, so a price move between sizing and fill cannot overspend."""
+    _db, broker = _run_order({"order_type": "limit"})
+    assert broker.order_type == "market"          # fractional forces market
+    assert broker.dollar_amount == 25.0           # spend capped at the approved notional
+
+
+def test_fractional_sell_still_sends_share_quantity():
+    """A sell must move an exact share count (closing a position); its risk is
+    smaller proceeds, not an overspend, so it keeps quantity semantics."""
+    _db, broker = _run_order({"order_type": "limit"}, side=Side.SELL)
+    assert broker.dollar_amount is None
+    assert broker.qty == 0.07434944
+
+
+def test_whole_share_order_keeps_limit_protection():
+    _db, broker = _run_order({"order_type": "limit"}, qty=3.0, notional=1013.79)
+    assert broker.order_type == "limit"
+    assert broker.dollar_amount is None
+
+
+def test_unreported_fill_price_is_never_replaced_by_reference_price():
+    """A 'submitted' response carrying no fill price must not have the stale
+    prefetch price recorded as the fill — that invents a cost basis and produces
+    P&L against a price nothing traded at."""
+    broker = RobinhoodMCPBroker(mcp_url="http://test.invalid/mcp", model="test-model",
+                                account_number="123456789")
+
+    async def fake_ask(instruction, tools, max_turns=6):
+        return {"status": "submitted", "order_id": "x"}, instruction
+
+    broker._ask = fake_ask
+    res = asyncio.run(broker.place_order(ticker="AAPL", side=Side.BUY, qty=2.0,
+                                         limit_price=337.93, order_type="market"))
+    assert res.fill_price == 0.0                      # NOT 337.93
+    assert res.detail["fill_price_reported"] is False
+    assert res.filled_qty == 0.0                      # 'submitted' is not a fill
+    assert res.detail["filled_qty_reported"] is False
+
+
+def test_unconfirmed_fill_does_not_write_a_fills_row():
+    """No broker-reported fill -> no fabricated fills row and no invented
+    price/qty overwriting the trades row."""
+    from execution.executor import Executor, OrderResult
+
+    class _NoFillBroker:
+        async def place_order(self, **k):
+            return OrderResult(ok=True, status="submitted", filled_qty=0.0,
+                               fill_price=0.0, broker_order_id="x",
+                               detail={"fill_price_reported": False})
+
+    db = _FakeDB()
+    ex = Executor(_NoFillBroker(), "live", db, "run-test", {"order_type": "limit"},
+                  kill_switch_check=lambda: False)
+    asyncio.run(ex.execute_order(ticker="AAPL", side=Side.BUY, qty=2.0,
+                                 ref_price=337.93, notional=675.86))
+    assert db.fills == []                              # nothing filled -> no fill row
+    assert db.finished[0]["price"] is None             # do not overwrite with a guess
+    assert db.finished[0]["qty"] is None
+
+
+def test_reported_fill_is_recorded_faithfully():
+    from execution.executor import Executor, OrderResult
+
+    class _FilledBroker:
+        async def place_order(self, **k):
+            return OrderResult(ok=True, status="filled", filled_qty=2.0,
+                               fill_price=340.10, broker_order_id="x")
+
+    db = _FakeDB()
+    ex = Executor(_FilledBroker(), "live", db, "run-test", {"order_type": "limit"},
+                  kill_switch_check=lambda: False)
+    asyncio.run(ex.execute_order(ticker="AAPL", side=Side.BUY, qty=2.0,
+                                 ref_price=337.93, notional=675.86))
+    assert db.finished[0]["price"] == 340.10           # the real fill, not the ref
+    assert db.fills[0]["price"] == 340.10

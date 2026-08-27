@@ -88,6 +88,9 @@ class RobinhoodDataProvider:
         self._quotes: dict[str, dict] = {}
         self._fundamentals: dict[str, dict] = {}
         self._prefetched: set[str] = set()
+        # Symbols a SUCCESSFUL quotes call declined to return — Robinhood has no
+        # tradable instrument for them (delisted, acquired, never carried).
+        self._unavailable: set[str] = set()
 
     # -- delegate the unchanged surface (news, macro, cache, overrides) -----
     @property
@@ -148,28 +151,52 @@ class RobinhoodDataProvider:
                    "fundamentals": len(self._fundamentals)})
 
     async def _prefetch_quotes(self, syms: list[str]) -> None:
-        missing = list(syms)
+        missing = [s for s in syms if s not in self._unavailable]
         for _ in range(2):
             if not missing:
-                break
+                return
             instr = (
                 f"Call get_equity_quotes ONCE with symbols={json.dumps(missing)}. For "
-                "EVERY symbol report its current price and prior close: use "
+                "each symbol report its current price and prior close: use "
                 "quote.last_trade_price for price (fall back to "
                 "quote.last_non_reg_trade_price), and quote.previous_close (or "
-                "results[].close.price) for prev_close. Return STRICT JSON only, "
-                'covering every requested symbol: {"SYM": {"price": <float>, '
-                '"prev_close": <float>}, ...}')
+                "results[].close.price) for prev_close. A symbol absent from "
+                "results has no tradable instrument — OMIT it from your answer "
+                "and do NOT call the tool again to look for it. Return STRICT "
+                'JSON only, for the symbols results covers: {"SYM": '
+                '{"price": <float>, "prev_close": <float>}, ...}')
             parsed = await self._ask(instr, max_turns=6)
-            if isinstance(parsed, dict):
-                for sym in list(missing):
-                    row = parsed.get(sym) or parsed.get(sym.upper())
-                    price = _f((row or {}).get("price"))
-                    if price:
-                        self._quotes[sym] = {
-                            "price": price,
-                            "prev_close": _f(row.get("prev_close")) or price}
-                missing = [s for s in syms if s not in self._quotes]
+            if not isinstance(parsed, dict):
+                # Backend/transport failure — nothing was learned, so one retry
+                # of the same request is worthwhile.
+                continue
+            for sym in list(missing):
+                row = parsed.get(sym) or parsed.get(sym.upper())
+                price = _f((row or {}).get("price"))
+                if price:
+                    self._quotes[sym] = {
+                        "price": price,
+                        "prev_close": _f(row.get("prev_close")) or price}
+            unresolved = [s for s in missing if s not in self._quotes]
+            if len(unresolved) == len(missing):
+                # NOTHING came back keyed by a requested symbol. Being a dict is
+                # not proof of a quotes payload — an error body, a wrapped
+                # envelope or a truncated response all parse as one, and none of
+                # them are evidence that the broker lacks these instruments.
+                # Retry instead of blacklisting the batch for the whole process.
+                self._log("WARN", "robinhood_quotes_unrecognised_response",
+                          {"symbols": missing, "response_keys": sorted(parsed)[:10]})
+                continue
+            if unresolved:
+                # At least one symbol resolved, so this IS a well-formed quotes
+                # payload — the symbols it omitted are ones Robinhood has no
+                # tradable instrument for. Re-asking cannot change that and only
+                # burns another LLM round-trip.
+                self._unavailable.update(unresolved)
+                self._log("WARN", "robinhood_quotes_unavailable",
+                          {"symbols": unresolved})
+            return
+        self._log("WARN", "robinhood_quotes_prefetch_failed", {"symbols": missing})
 
     async def _prefetch_fundamentals(self, syms: list[str]) -> None:
         profiles = await self._fetch_profiles(syms)

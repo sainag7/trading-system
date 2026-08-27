@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import date, timedelta
+
+import market
 
 try:
     import requests
@@ -146,6 +149,22 @@ def _reddit_mentions(limit_posts: int = 50) -> list[str]:
 # ---------------------------------------------------------------------------
 _MOMENTUM_BARS = 21   # ~1 trading month — the window the momentum ranking uses
 
+# A live symbol's most recent bar is today's partial session or the previous
+# trading day. Anything older means the symbol has stopped printing trades.
+# Counted in NYSE trading days, so weekends and exchange holidays cost nothing.
+_MAX_STALE_TRADING_DAYS = 2
+
+
+def _trading_days_since(d: date) -> int:
+    """NYSE trading days from ``d`` (exclusive) to today ET (inclusive)."""
+    today = market.now_et().date()
+    n, cur = 0, d + timedelta(days=1)
+    while cur <= today:
+        if market.is_trading_day(cur):
+            n += 1
+        cur += timedelta(days=1)
+    return n
+
 
 def _passes_filter(ticker: str, min_vol: float, min_p: float, max_p: float,
                    max_vol_ann: float):
@@ -164,12 +183,42 @@ def _passes_filter(ticker: str, min_vol: float, min_p: float, max_p: float,
     if hist is None or getattr(hist, "empty", True):
         return False, "no price data", None
     try:
-        closes = [float(x) for x in hist["Close"].tolist() if x == x]
-        vols = [float(x) for x in hist["Volume"].tolist() if x == x]
+        # Build (date, close, volume) together. Filtering Close and Volume in
+        # separate passes desynchronises them whenever a row has a NaN price but
+        # a real volume (or vice versa), silently pairing each close with some
+        # other day's volume.
+        bars = [
+            (idx.date(), float(c), float(v))
+            for idx, c, v in zip(hist.index, hist["Close"].tolist(),
+                                 hist["Volume"].tolist())
+            if c == c and v == v
+        ]
     except Exception:
         return False, "bad data", None
-    if not closes or not vols:
+    if not bars:
         return False, "no price data", None
+
+    # Liveness. yfinance pads a delisted/halted ticker forward with zero-volume
+    # bars repeating its final close. Those bars have zero variance, so a dead
+    # ticker measures as ultra-low-volatility and ranks BETTER the longer it has
+    # been dead — while the broker cannot trade it at all. Trim the padding and
+    # judge recency on the last genuinely traded bar.
+    padded = 0
+    while bars and bars[-1][2] == 0:
+        bars.pop()
+        padded += 1
+    if not bars:
+        return False, "no traded bars", None
+    # One trailing zero-volume bar can be a pre-open or partial session; a run of
+    # them is padding over a symbol that has stopped trading.
+    if padded >= 2:
+        return False, f"{padded} zero-volume bars since {bars[-1][0]} — not trading", None
+    stale = _trading_days_since(bars[-1][0])
+    if stale > _MAX_STALE_TRADING_DAYS:
+        return False, f"last traded {bars[-1][0]} ({stale} trading days stale)", None
+
+    closes = [c for _, c, _ in bars]
+    vols = [v for _, _, v in bars]
     price = closes[-1]
     # Volume over the recent window, matching the pre-3mo behaviour.
     recent_vols = vols[-_MOMENTUM_BARS:]

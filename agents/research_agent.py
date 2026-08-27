@@ -21,6 +21,7 @@ plus internal ``_sector`` / ``_price`` keys the downstream agents use.
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any
 
 from agents.llm import generate_json, load_prompt
@@ -97,8 +98,9 @@ def _trend(price, sma50, sma200, rsi14) -> tuple[str, int]:
             base = 50
     else:
         return "sideways", 50
-    # Nudge by RSI distance from the midline.
-    if isinstance(rsi14, (int, float)):
+    # Nudge by RSI distance from the midline. NaN is a float and would pass a
+    # bare isinstance check, then blow up in int() — require a finite value.
+    if isinstance(rsi14, (int, float)) and math.isfinite(rsi14):
         base += int((rsi14 - 50) * 0.4)
     strength = max(0, min(100, base))
     trend = "up" if strength >= 60 else "down" if strength <= 40 else "sideways"
