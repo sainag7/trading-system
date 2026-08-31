@@ -28,6 +28,7 @@ from risk.guardrails import (  # noqa: E402
     OrderIntent,
     Position,
     Side,
+    sweep_to_budget,
     validate_batch,
     validate_order,
 )
@@ -320,6 +321,21 @@ def test_max_positions_allows_add_to_existing():
         default_limits(),
     )
     assert res.approved
+
+
+def test_max_positions_none_means_unlimited():
+    """`max_positions: null` lets the decision agent choose the book's size."""
+    positions = {
+        f"T{i}": Position(f"T{i}", shares=1, avg_cost=10, market_value=10, sector="Technology")
+        for i in range(15)
+    }
+    res = validate_order(
+        buy(ticker="NEW", usd=100, price=100),
+        account(equity=100_000, cash=100_000, positions=positions),
+        default_limits(max_positions=None),
+    )
+    assert res.approved
+    assert any(c.name == "max_positions" and "unlimited" in c.detail for c in res.checks)
 
 
 # ===========================================================================
@@ -706,6 +722,117 @@ def test_validation_is_pure_and_repeatable():
     assert r1.approved == r2.approved
     assert r1.approved_usd == pytest.approx(r2.approved_usd)
     assert r1.reasons == r2.reasons
+
+
+# ===========================================================================
+# sweep_to_budget — deploy idle cash across the approved buys
+# ===========================================================================
+def _sweep_limits(**overrides) -> RiskLimits:
+    """The agentic-account shape: every percentage ceiling off, no position cap."""
+    base = dict(
+        max_positions=None, max_position_pct=1.0, max_sector_pct=1.0,
+        per_trade_max_usd=500.0, per_trade_max_pct=1.0, min_cash_reserve_pct=0.0,
+        min_trade_usd=1.0, daily_max_trades=5, sweep_cash_to_buys=True,
+    )
+    base.update(overrides)
+    return default_limits(**base)
+
+
+def test_sweep_deploys_the_idle_remainder():
+    """The 2026-08-28 case: $103.21 book, two $34 buys, $35.21 left idle."""
+    acct = account(equity=103.21, cash=103.21)
+    limits = _sweep_limits()
+    results = validate_batch(
+        [buy(ticker="NVDA", usd=34.0, price=212.03, sector="Technology"),
+         buy(ticker="AMZN", usd=34.0, price=259.945, sector="Consumer")],
+        acct, limits,
+    )
+    assert sum(r.approved_usd for r in results) == pytest.approx(68.0, abs=0.01)
+
+    sweep_to_budget(results, acct, limits)
+    total = sum(r.approved_usd for r in results)
+    # Fractional flooring leaves at most a few cents unspent.
+    assert total == pytest.approx(103.21, abs=0.05)
+    assert all(r.resized for r in results)
+    assert all(any(c.name == "cash_sweep" for c in r.checks) for r in results)
+
+
+def test_sweep_preserves_relative_conviction_weighting():
+    """Scaling is proportional: the smaller position stays the smaller one."""
+    acct = account(equity=300.0, cash=300.0)
+    limits = _sweep_limits()
+    results = validate_batch(
+        [buy(ticker="AAA", usd=60.0, price=10.0, sector="A"),
+         buy(ticker="BBB", usd=30.0, price=10.0, sector="B")],
+        acct, limits,
+    )
+    sweep_to_budget(results, acct, limits)
+    big, small = results[0].approved_usd, results[1].approved_usd
+    assert sum((big, small)) == pytest.approx(300.0, abs=0.05)
+    assert big == pytest.approx(2 * small, rel=0.02)   # 2:1 ratio preserved
+
+
+def test_sweep_is_a_noop_without_approved_buys():
+    """Proposing nothing is how the agent holds cash — that must survive."""
+    acct = account(equity=100.0, cash=100.0)
+    limits = _sweep_limits()
+    results = validate_batch([], acct, limits)
+    assert sweep_to_budget(results, acct, limits) == []
+
+
+def test_sweep_never_revives_a_rejected_order():
+    acct = account(equity=100.0, cash=100.0)
+    limits = _sweep_limits(no_trade_list=("BAD",))
+    results = validate_batch([buy(ticker="BAD", usd=20.0, price=10.0)], acct, limits)
+    assert results[0].rejected
+    sweep_to_budget(results, acct, limits)
+    assert results[0].rejected
+    assert results[0].approved_usd == pytest.approx(0.0)
+
+
+def test_sweep_respects_per_trade_cap():
+    """Headroom is bounded by per_trade_max_usd even with cash to spare."""
+    acct = account(equity=1_000.0, cash=1_000.0)
+    limits = _sweep_limits(per_trade_max_usd=100.0)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=50.0, price=10.0, sector="A")], acct, limits)
+    sweep_to_budget(results, acct, limits)
+    assert results[0].approved_usd == pytest.approx(100.0, abs=0.01)
+
+
+def test_sweep_respects_max_position_pct():
+    acct = account(equity=1_000.0, cash=1_000.0)
+    limits = _sweep_limits(max_position_pct=0.20)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=50.0, price=10.0, sector="A")], acct, limits)
+    sweep_to_budget(results, acct, limits)
+    assert results[0].approved_usd == pytest.approx(200.0, abs=0.01)
+
+
+def test_sweep_honours_the_cash_reserve():
+    acct = account(equity=1_000.0, cash=1_000.0)
+    # per_trade cap lifted so the RESERVE is what binds, not the dollar ceiling.
+    limits = _sweep_limits(min_cash_reserve_pct=0.10, per_trade_max_usd=10_000.0)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=100.0, price=10.0, sector="A")], acct, limits)
+    sweep_to_budget(results, acct, limits)
+    assert results[0].approved_usd == pytest.approx(900.0, abs=0.01)
+
+
+def test_sweep_does_not_spend_same_batch_sell_proceeds():
+    """Sell proceeds are unsettled on a cash account — not spendable today."""
+    acct = account(equity=200.0, cash=50.0,
+                   positions=pos("HELD", shares=10, market_value=150, sector="A"))
+    limits = _sweep_limits()
+    results = validate_batch(
+        [sell(ticker="HELD", shares=10, price=15.0),
+         buy(ticker="AAA", usd=20.0, price=10.0, sector="B")],
+        acct, limits,
+    )
+    sweep_to_budget(results, acct, limits)
+    the_buy = next(r for r in results if r.intent.side == Side.BUY)
+    # Budget is the $50 already settled, NOT $50 + $150 of sale proceeds.
+    assert the_buy.approved_usd == pytest.approx(50.0, abs=0.01)
 
 
 if __name__ == "__main__":

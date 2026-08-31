@@ -55,9 +55,14 @@ def test_agentic_overlay_applies_100dollar_risk():
         # Discovered tickers often have no sector, so they all collapse into one
         # "Unknown" bucket; the sector cap is disabled here on purpose.
         assert r.max_sector_pct == 1.0, r.max_sector_pct
-        # max_positions is the one structural limit kept, alongside the absolute
-        # dollar ceiling, buying power and max_equity_guard.
-        assert r.max_positions == 3, r.max_positions
+        # No position-count cap either: the decision agent chooses how many names
+        # to hold. A fixed count was read as portfolio shape and became a sizing
+        # anchor (equity/max_positions), stranding cash whenever fewer candidates
+        # qualified than there were slots.
+        assert r.max_positions is None, r.max_positions
+        # So the remainder cannot sit idle, approved buys are scaled up to use
+        # the deployable balance.
+        assert r.sweep_cash_to_buys is True
         assert min(r.per_trade_max_usd, r.per_trade_max_pct * 100.0) == 100.0
         # Routing metadata is resolved.
         assert active["role"] == "agentic"

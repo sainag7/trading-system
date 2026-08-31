@@ -285,12 +285,16 @@ def check_max_positions(intent: OrderIntent, account: AccountState, limits) -> C
     )
     count = account.open_position_count()
     would_open_new = not already_held
-    ok = (not would_open_new) or count < limits.max_positions
+    # ``None`` == no cap: the decision agent decides how many names to hold, so a
+    # new position can never be blocked on count alone.
+    unlimited = limits.max_positions is None
+    ok = unlimited or (not would_open_new) or count < limits.max_positions
+    cap_txt = "unlimited" if unlimited else str(limits.max_positions)
     return CheckOutcome(
         name="max_positions",
         passed=ok,
         detail=(
-            f"{count} open positions vs limit {limits.max_positions}; "
+            f"{count} open positions vs limit {cap_txt}; "
             f"{'new position' if would_open_new else 'existing position (add)'}"
         ),
     )
@@ -633,4 +637,131 @@ def validate_batch(
                 pos.market_value = max(0.0, pos.market_value - res.approved_usd)
                 if pos.shares <= EPS:
                     pos.shares = 0.0
+    return results
+
+
+def sweep_to_budget(
+    results: list[GuardrailResult],
+    account: AccountState,
+    limits,
+    *,
+    epsilon: float = 0.01,
+    max_rounds: int = 10,
+) -> list[GuardrailResult]:
+    """Scale approved BUYs UP so they consume the deployable cash.
+
+    The decision agent sizes each name itself, and it has repeatedly anchored
+    that size to the position-count cap (``equity / max_positions``) rather than
+    to the cash actually available — so a day with fewer qualifying candidates
+    than slots left the difference sitting idle. This redistributes the unspent
+    remainder across the names the agent DID choose.
+
+    Deliberate properties:
+      * **Only scales up.** A rejection stays rejected and a per-trade resize-down
+        is never undone; this runs strictly after :func:`validate_batch` and can
+        only raise an already-approved buy toward its own caps.
+      * **Preserves the agent's relative weighting.** The remainder is split in
+        proportion to the approved sizes, so a name it sized small stays smaller
+        than one it sized large — this tops the book up, it does not re-rank it.
+      * **No approved buys means no sweep.** Proposing nothing is how the agent
+        legitimately holds cash, and that must survive untouched.
+      * **Ignores same-batch sell proceeds.** Only cash/buying power that is
+        already settled is treated as spendable; proceeds from a sell placed in
+        this same cycle are not available to spend today on a cash account.
+    """
+    buys = [
+        r for r in results
+        if r.approved and r.intent.side == Side.BUY
+        and not r.intent.protective_exit
+        and (r.intent.price or 0.0) > EPS
+    ]
+    if not buys:
+        return results
+
+    reserve = float(limits.min_cash_reserve_pct) * account.equity
+    budget = max(0.0, min(account.cash, account.buying_power) - reserve)
+    leftover = budget - sum(r.approved_usd for r in buys)
+    if leftover <= epsilon:
+        return results
+
+    per_trade_cap = min(
+        float(limits.per_trade_max_usd),
+        float(limits.per_trade_max_pct) * account.equity,
+    )
+    max_position_value = float(limits.max_position_pct) * account.equity
+    max_sector_value = float(limits.max_sector_pct) * account.equity
+
+    # Sector exposure the book already carries, plus what this batch adds. The
+    # sector cap is a portfolio-level ceiling, so it is tracked across orders
+    # rather than per order.
+    sector_val: dict[str, float] = {}
+    for p in account.positions.values():
+        s = p.sector or "Unknown"
+        sector_val[s] = sector_val.get(s, 0.0) + p.market_value
+    for r in buys:
+        s = _resolve_sector(r.intent, account) or "Unknown"
+        sector_val[s] = sector_val.get(s, 0.0) + r.approved_usd
+
+    def headroom(r: GuardrailResult) -> float:
+        """How much more USD this order can absorb before it breaches a cap."""
+        sector = _resolve_sector(r.intent, account) or "Unknown"
+        held = account.position_value(r.intent.ticker)
+        return max(0.0, min(
+            per_trade_cap - r.approved_usd,
+            max_position_value - held - r.approved_usd,
+            max_sector_value - sector_val.get(sector, 0.0),
+        ))
+
+    # Water-fill: hand out the remainder in proportion to current size, clamp any
+    # order that hits a cap, and re-share its overflow among those still open.
+    # Bounded rounds so this always terminates even with pathological caps.
+    added: dict[int, float] = {id(r): 0.0 for r in buys}
+    for _ in range(max_rounds):
+        active = [r for r in buys if headroom(r) - added[id(r)] > epsilon]
+        if not active or leftover <= epsilon:
+            break
+        # Weight by approved size; fall back to an even split when every
+        # approved size is zero (nothing to take a proportion of).
+        total = sum(r.approved_usd for r in active)
+        for r in active:
+            share = (leftover * (r.approved_usd / total)) if total > EPS \
+                else (leftover / len(active))
+            room = headroom(r) - added[id(r)]
+            take = min(share, room)
+            if take <= 0:
+                continue
+            added[id(r)] += take
+            sector = _resolve_sector(r.intent, account) or "Unknown"
+            sector_val[sector] = sector_val.get(sector, 0.0) + take
+        spent = sum(added.values())
+        leftover = budget - sum(r.approved_usd for r in buys) - spent
+
+    for r in buys:
+        extra = added[id(r)]
+        if extra <= epsilon:
+            continue
+        before = r.approved_usd
+        target_usd = before + extra
+        price = float(r.intent.price)
+        # Re-derive shares from the new notional, matching the sizing convention
+        # used above: floor to 8 decimals, then recompute the notional so the
+        # recorded size is exactly what is tradeable.
+        if limits.allow_fractional_shares:
+            shares = math.floor(target_usd / price * 1e8) / 1e8
+        else:
+            shares = math.floor(target_usd / price)
+        if shares <= 0:
+            continue
+        r.approved_shares = shares
+        r.approved_usd = shares * price
+        r.resized = True
+        r.reasons.append(
+            f"cash sweep ${before:,.2f} -> ${r.approved_usd:,.2f} "
+            f"(deploying idle cash across {len(buys)} approved buy(s))"
+        )
+        r.checks.append(CheckOutcome(
+            "cash_sweep", True,
+            f"scaled up from ${before:,.2f} to use the ${budget:,.2f} deployable "
+            f"balance", cap_usd=per_trade_cap,
+        ))
     return results

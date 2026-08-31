@@ -42,6 +42,10 @@ risk:
   min_trade_usd: 50                  # don't bother with orders smaller than this
   allow_fractional_shares: true      # Robinhood supports fractional equity
   no_trade_list: []                  # tickers to NEVER touch (buys blocked)
+  # Scale approved BUYs up so they consume the deployable cash instead of leaving
+  # an unspent remainder. OFF by default: on a book with a real cash reserve,
+  # partial deployment is a legitimate outcome. Enabled per-account below.
+  sweep_cash_to_buys: false
 
 # ----------------------------------------------------------------------------
 # Strategy / scoring parameters (used by the analysis & decision agents)
@@ -246,6 +250,12 @@ execution:
   limit_slippage_pct: 0.005          # place limit 0.5% above ask (buy) / below bid (sell)
   max_order_retries: 2               # retries for *submission* errors only, never blind re-fills
   retry_backoff_seconds: 5
+  # place_equity_order returns on ACCEPTANCE, not execution — so a successful
+  # send reports "submitted" with no price and the real fill lands moments later.
+  # Without reading it back the system books the pre-trade reference price as the
+  # cost basis and anchors the stop to it. Read-only; never resubmits. 0 disables.
+  fill_poll_attempts: 5
+  fill_poll_interval_seconds: 2
   # Read your REAL Robinhood holdings (READ-ONLY) in recommend/explain modes, so
   # advice + verdicts are position-aware (hold/trim/sell/add for names you own).
   # Requires the robinhood-trading MCP connected in Claude Code (OAuth). Adds one
@@ -299,15 +309,26 @@ accounts:
       # enforcement list in risk/guardrails.py), so a high-conviction idea was
       # dropped entirely rather than placed smaller.
       #
-      # What still bounds this account: `per_trade_max_usd`, `max_positions`,
-      # available buying power, `max_equity_guard` above, and the kill switch.
-      # This is a deliberately unconstrained $100 sandbox — the individual
-      # account is untouched and keeps the strict base limits.
+      # What still bounds this account: `per_trade_max_usd`, available buying
+      # power, `max_equity_guard` above, and the kill switch. This is a
+      # deliberately unconstrained $100 sandbox — the individual account is
+      # untouched and keeps the strict base limits.
       per_trade_max_pct: 1.0    # no per-trade percentage cap
       per_trade_max_usd: 500    # absolute ceiling; only binds once equity > $500
       max_position_pct: 1.0     # no per-name cap — one name may take the whole book
       min_cash_reserve_pct: 0.0 # no cash floor — the book may run fully invested
-      max_positions: 3          # the one structural limit kept: at most 3 names open
+      # NO position-count cap: the decision agent decides how many names to hold,
+      # based on how many candidates actually clear the buy threshold. A fixed
+      # count was worse than useless here — the agent read `max_positions: 3` as
+      # portfolio shape and sized every name at equity/3, so a day with only two
+      # qualifying candidates left the third "slot" sitting in idle cash.
+      max_positions: null       # unlimited — the agent chooses the count
+      # Force the approved buys to consume the deployable balance. Without this
+      # the agent's own arithmetic decides how much stays in cash, and it has
+      # repeatedly left a slot's worth idle. Only ever scales orders UP, never
+      # past the caps above, and never when the agent proposed no buys at all
+      # (proposing nothing is still how it holds cash).
+      sweep_cash_to_buys: true
       # Sector cap disabled for this account ON PURPOSE. Screener-discovered
       # tickers often have no sector from the provider, so they all collapse
       # into one "Unknown" bucket and the 2nd buy gets rejected for a breach

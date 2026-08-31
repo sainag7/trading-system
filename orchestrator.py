@@ -49,7 +49,7 @@ from config import load_config
 from storage.db import Database
 from data.providers import build_provider
 from risk.guardrails import (
-    AccountState, OrderIntent, Side, validate_batch,
+    AccountState, OrderIntent, Side, validate_batch, sweep_to_budget,
 )
 from execution.executor import Executor, RobinhoodMCPBroker
 from execution.notifier import Notifier
@@ -64,12 +64,18 @@ def _now_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:6]
 
 
-def _account_summary(acct: AccountState) -> dict:
+def _account_summary(acct: AccountState, limits=None) -> dict:
     """Compact, LLM-friendly view of the account for the decision agent."""
+    # Hand the agent the spendable figure directly. Left to derive it, it has
+    # anchored sizing to equity/max_positions instead of to the cash on hand,
+    # which strands a "slot" of cash whenever fewer names qualify than expected.
+    reserve = float(getattr(limits, "min_cash_reserve_pct", 0.0) or 0.0) * acct.equity
+    deployable = max(0.0, min(acct.cash, acct.buying_power) - reserve)
     return {
         "equity": round(acct.equity, 2),
         "cash": round(acct.cash, 2),
         "buying_power": round(acct.buying_power, 2),
+        "deployable_cash": round(deployable, 2),
         "peak_equity": round(acct.peak_equity, 2),
         "drawdown_pct": round(acct.drawdown_pct() * 100, 2),
         "open_positions": acct.open_position_count(),
@@ -445,7 +451,7 @@ class Orchestrator:
         ))
 
         decision = await run_decision(
-            analysis, _account_summary(account), limits_dict, strategy, trades_remaining,
+            analysis, _account_summary(account, limits), limits_dict, strategy, trades_remaining,
             cfg.models.get("decision_agent", "claude-sonnet-4-6"), db=db, run_id=self.run_id,
         )
         buy_intents = self._decision_to_intents(decision.get("orders", []), account)
@@ -467,6 +473,12 @@ class Orchestrator:
                 # Guardrails write every approve/modify/reject to the audit_log table.
                 audit=lambda lvl, ev, det: db.audit(self.run_id, lvl, ev, det),
             )
+            # Top the approved buys up to the deployable balance so a day with
+            # fewer qualifying names than the agent expected does not leave cash
+            # idle. Runs AFTER validation, so it can only raise an already
+            # approved order toward its own caps — never revive a rejected one.
+            if getattr(limits, "sweep_cash_to_buys", False):
+                results = sweep_to_budget(results, account, limits)
             print("\n🛡️  Guardrail review:")
             for res in results:
                 db.log_decision(self.run_id, res)
@@ -769,15 +781,46 @@ class Orchestrator:
             # Monitor enforces the decision's stop / target / time-stop later.
             if result.ok and intent.side == Side.BUY and intent.action in ("buy", "add"):
                 fill = result.fill_price or ref_price
+                stop, take = self._reanchor_levels(intent, ref_price, result.fill_price)
                 self.db.upsert_trade_plan(
                     ticker=intent.ticker, run_id=self.run_id,
-                    entry_price=fill, stop_loss=intent.stop_loss,
-                    take_profit=intent.take_profit, max_hold_until=intent.max_hold_until,
+                    entry_price=fill, stop_loss=stop,
+                    take_profit=take, max_hold_until=intent.max_hold_until,
                     thesis=intent.rationale, peak_price=fill,  # seed the chandelier trail
                 )
             tag = "✓" if result.ok else "✗"
             print(f"   {tag} {intent.side.value} {res.approved_shares:g} {intent.ticker} "
                   f"-> {result.status} @ ${result.fill_price:.2f}")
+
+    def _reanchor_levels(self, intent, ref_price: float,
+                         fill_price: float) -> tuple[float | None, float | None]:
+        """Rescale the stop/target to the price actually paid.
+
+        The decision agent sets absolute levels off a pre-trade REFERENCE price,
+        but a market order (which is what any fractional order must be) fills at
+        whatever the market gives. Keeping the original levels against a slipped
+        fill silently changes the risk: NVDA's stop was sized ~2.4% below a
+        $212.03 reference and the order filled at $224.32, leaving the stop 7.8%
+        below entry — more than three times the intended risk.
+
+        Scaling both levels by fill/ref preserves the intended risk percentage
+        and the reward:risk ratio exactly, and needs no ATR (which OrderIntent
+        does not carry). Unconfirmed fills keep the original levels.
+        """
+        if not fill_price or not ref_price or fill_price <= 0 or ref_price <= 0:
+            return intent.stop_loss, intent.take_profit
+        ratio = fill_price / ref_price
+        if abs(ratio - 1.0) < 1e-9:
+            return intent.stop_loss, intent.take_profit
+        stop = round(intent.stop_loss * ratio, 2) if intent.stop_loss else intent.stop_loss
+        take = round(intent.take_profit * ratio, 2) if intent.take_profit else intent.take_profit
+        self.db.audit(self.run_id, "INFO", "trade_plan_reanchored", {
+            "ticker": intent.ticker, "ref_price": ref_price, "fill_price": fill_price,
+            "slippage_pct": round((ratio - 1.0) * 100, 3),
+            "stop_before": intent.stop_loss, "stop_after": stop,
+            "take_before": intent.take_profit, "take_after": take,
+        })
+        return stop, take
 
     async def _finalize_run(self, broker) -> None:
         """Refresh the positions table from the broker, summarise, and notify."""

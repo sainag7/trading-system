@@ -40,7 +40,10 @@ class RiskLimits:
     relaxes a limit at runtime.
     """
 
-    max_positions: int = 15
+    # ``None`` means NO limit on the number of concurrent positions — the
+    # decision agent chooses how many names to hold. A missing key still
+    # defaults to 15; only an explicit YAML ``null`` disables the cap.
+    max_positions: int | None = 15
     max_position_pct: float = 0.15
     max_sector_pct: float = 0.40
     per_trade_max_usd: float = 500.0
@@ -54,13 +57,20 @@ class RiskLimits:
     max_account_drawdown_halt_pct: float = 0.15
     min_trade_usd: float = 50.0
     allow_fractional_shares: bool = True
+    # Scale approved buys up to consume the deployable cash (see
+    # ``risk.guardrails.sweep_to_budget``). Off unless a config enables it.
+    sweep_cash_to_buys: bool = False
     no_trade_list: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RiskLimits":
         no_trade = tuple(str(t).upper() for t in d.get("no_trade_list", []))
+        # An explicit `max_positions: null` disables the cap; a MISSING key keeps
+        # the default. Reading the raw value first is what keeps those distinct.
+        raw_max_positions = d.get("max_positions", 15)
         return cls(
-            max_positions=int(d.get("max_positions", 15)),
+            max_positions=(None if raw_max_positions is None
+                           else int(raw_max_positions)),
             max_position_pct=float(d.get("max_position_pct", 0.15)),
             max_sector_pct=float(d.get("max_sector_pct", 0.40)),
             per_trade_max_usd=float(d.get("per_trade_max_usd", 500.0)),
@@ -72,6 +82,7 @@ class RiskLimits:
             ),
             min_trade_usd=float(d.get("min_trade_usd", 50.0)),
             allow_fractional_shares=bool(d.get("allow_fractional_shares", True)),
+            sweep_cash_to_buys=bool(d.get("sweep_cash_to_buys", False)),
             no_trade_list=no_trade,
         )
 

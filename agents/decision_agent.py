@@ -21,7 +21,7 @@ single schema before it leaves this module.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from agents.llm import generate_json, last_error, load_prompt
@@ -42,6 +42,35 @@ def _score_of(item: dict, default: float = 50.0) -> float:
 def _until(strategy: dict) -> str:
     days = int(strategy.get("max_holding_days", 60))
     return (datetime.now(timezone.utc).date() + timedelta(days=days)).isoformat()
+
+
+def _valid_until(value: Any, strategy: dict) -> tuple[str, str | None]:
+    """Sanitise an LLM-supplied ``max_hold_until``.
+
+    Returns ``(date, rejected_value)`` — ``rejected_value`` is non-None when the
+    supplied date was unusable and the computed horizon was substituted.
+
+    This is a time-stop the Monitor acts on: a date in the PAST makes it exit the
+    position on the very next run. That is not theoretical — the model emitted
+    "2025-10-24" for days, so every position opened was sold the following
+    morning and rebought, paying a round trip of spread each time. A date beyond
+    the configured horizon is rejected for the mirror reason: it silently
+    disables the time-stop the strategy is supposed to enforce.
+    """
+    fallback = _until(strategy)
+    if not value:
+        return fallback, None
+    try:
+        # `date.fromisoformat` also accepts a full timestamp on 3.11+, so trim to
+        # the date part rather than rejecting an otherwise-valid ISO datetime.
+        supplied = date.fromisoformat(str(value).strip()[:10])
+    except (TypeError, ValueError):
+        return fallback, str(value)
+    today = datetime.now(timezone.utc).date()
+    horizon = today + timedelta(days=int(strategy.get("max_holding_days", 60)))
+    if not (today < supplied <= horizon):
+        return fallback, str(value)
+    return supplied.isoformat(), None
 
 
 def _plan_levels(price: float | None, atr: float | None,
@@ -110,8 +139,12 @@ def _offline_decision(
 
     # Never aim past the hard position cap — proposing an Nth name the
     # guardrail will reject on max_positions just manufactures a doomed order.
-    target = min(int(strategy.get("target_portfolio_size", 10)),
-                 int(limits.get("max_positions", 15)))
+    # A `null` cap means there is no such ceiling, so the strategy's own target
+    # is the only thing shaping the book.
+    _max_positions = limits.get("max_positions", 15)
+    target = int(strategy.get("target_portfolio_size", 10))
+    if _max_positions is not None:
+        target = min(target, int(_max_positions))
     buy_th = strategy.get("min_score_to_buy", 65)
     add_th = strategy.get("min_score_to_add", 70)
     trim_th = strategy.get("trim_below_score", 45)
@@ -304,13 +337,20 @@ def _normalize(order: dict, meta: dict, strategy: dict) -> dict:
     stop = order.get("suggested_stop_loss")
     take = order.get("take_profit")
     until = order.get("max_hold_until")
+    rejected_until = None
     if action in ACTIONABLE and price and (stop is None or take is None or not until):
         d_stop, d_take, d_until = _plan_levels(price, a.get("_atr"), strategy)
         stop = stop if stop is not None else d_stop
         take = take if take is not None else d_take
         until = until or d_until
+    # Sanitise the time-stop on EVERY actionable order, not just ones that
+    # omitted it. A supplied-but-wrong date is the dangerous case: the Monitor
+    # exits on it, so a past date churns the position out the next morning.
+    if action in ACTIONABLE:
+        until, rejected_until = _valid_until(until, strategy)
 
     return {
+        "_rejected_max_hold_until": rejected_until,
         "ticker": ticker,
         "action": action,
         "side": side,
@@ -362,6 +402,18 @@ async def run_decision(
         _normalize(o, meta, strategy) for o in parsed.get("orders", [])
         if o.get("ticker")
     ]
+
+    # A model that starts emitting unusable time-stops must be visible, not
+    # silently corrected — a past date here churns the whole book daily.
+    bad_dates = {o["ticker"]: o["_rejected_max_hold_until"]
+                 for o in parsed["orders"] if o.get("_rejected_max_hold_until")}
+    if bad_dates:
+        print(f"⚠️  Rejected out-of-range max_hold_until from the model: {bad_dates} "
+              f"— substituted the configured horizon.")
+        if db and run_id:
+            db.audit(run_id, "WARN", "max_hold_until_rejected",
+                     {"model": model, "rejected": bad_dates,
+                      "substituted": _until(strategy)})
 
     if db and run_id:
         db.log_agent_output(

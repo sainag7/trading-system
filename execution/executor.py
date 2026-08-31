@@ -401,6 +401,45 @@ class RobinhoodMCPBroker:
             return OrderResult(ok=False, status="rejected", detail=parsed)
         return OrderResult(ok=False, status="needs_review", detail=parsed)
 
+    async def get_order_fill(self, order_id: str) -> dict:
+        """Read one order's CURRENT state back from the broker (read-only).
+
+        ``place_equity_order`` returns as soon as the order is accepted, so its
+        response usually says ``submitted`` with no price — the fill lands
+        milliseconds later. Without this read-back the system never learns what
+        it actually paid and falls back to the pre-trade reference price, which
+        is both a wrong cost basis and a wrongly-anchored stop.
+
+        Returns ``{}`` when the state cannot be read; the caller must treat that
+        as "unknown", never as "not filled".
+        """
+        acct = self.account_number
+        acct_clause = f', account_number="{acct}"' if acct else ""
+        instruction = (
+            f'READ-ONLY. Call get_equity_orders(order_id="{order_id}"{acct_clause}) '
+            "and report that order's CURRENT state. Call no other tool and place "
+            "no orders. Report ONLY what the broker returns — do not infer or "
+            "estimate a price. Map cumulative_quantity -> filled_qty and "
+            "average_price -> fill_price; OMIT a field the broker leaves null. "
+            'Return STRICT JSON only: {"state": "<state>", "filled_qty": <float>, '
+            '"fill_price": <float>}'
+        )
+        try:
+            parsed, raw = await self._ask(instruction, self.read_tools, max_turns=4)
+        except Exception as e:
+            self._log("WARN", "order_readback_failed",
+                      {"order_id": order_id, "error": str(e)})
+            return {}
+        if not isinstance(parsed, dict):
+            self._log("WARN", "order_readback_unparseable",
+                      {"order_id": order_id, "raw": (raw or "")[:500]})
+            return {}
+        return {
+            "state": str(parsed.get("state", "")).lower(),
+            "filled_qty": _f_or_none(parsed.get("filled_qty")),
+            "fill_price": _f_or_none(parsed.get("fill_price")),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Executor (mode-aware orchestration of a single order's lifecycle)
@@ -583,6 +622,7 @@ class Executor:
                               {"ticker": ticker, "attempt": attempt, "detail": res.detail})
                 await asyncio.sleep(backoff)
                 continue
+            res = await self._confirm_fill(res, ticker=ticker)
             self._record_order_fill(order_row, res, ticker=ticker, side=side, simulated=False)
             if res.status == "needs_review":
                 self.db.audit(self.run_id, "ERROR", "order_needs_human_review",
@@ -592,6 +632,72 @@ class Executor:
                               {"ticker": ticker, "side": side.value, "qty": res.filled_qty,
                                "price": res.fill_price, "broker_order_id": res.broker_order_id})
             return res
+
+    # Broker states that mean the order will not change again.
+    _TERMINAL_FILLED = ("filled",)
+    _TERMINAL_DEAD = ("cancelled", "canceled", "rejected", "failed", "voided")
+
+    async def _confirm_fill(self, res: OrderResult, *, ticker: str) -> OrderResult:
+        """Poll the broker until the order settles, so the real fill is recorded.
+
+        ``place_equity_order`` returns on ACCEPTANCE, not on execution, so a
+        successful send usually reports ``submitted`` with no price. Left there,
+        the caller falls back to the pre-trade reference price — which is how a
+        $224.32 NVDA fill came to be booked at $212.03, taking its stop with it.
+
+        Never invents a price: an order still pending when the attempts run out
+        keeps its unconfirmed status and is flagged for review.
+        """
+        attempts = int(self.cfg.get("fill_poll_attempts", 5))
+        interval = float(self.cfg.get("fill_poll_interval_seconds", 2))
+        getter = getattr(self.broker, "get_order_fill", None)
+        # Nothing to confirm: no order id, polling disabled, broker can't read
+        # back, or the send already reported a complete fill.
+        if (not res.ok or not res.broker_order_id or attempts <= 0
+                or getter is None
+                or (res.status == "filled" and res.fill_price > 0)):
+            return res
+
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(interval)
+            info = await getter(res.broker_order_id)
+            state = (info or {}).get("state", "")
+            if not state:
+                continue
+            qty, price = info.get("filled_qty"), info.get("fill_price")
+            if state in self._TERMINAL_DEAD:
+                self.db.audit(self.run_id, "WARN", "order_not_filled",
+                              {"ticker": ticker, "state": state,
+                               "broker_order_id": res.broker_order_id})
+                return OrderResult(
+                    ok=False, status=state, broker_order_id=res.broker_order_id,
+                    detail={**res.detail, "readback_state": state},
+                )
+            if state in self._TERMINAL_FILLED and qty and price:
+                return OrderResult(
+                    ok=True, status="filled", filled_qty=qty, fill_price=price,
+                    broker_order_id=res.broker_order_id,
+                    detail={**res.detail, "readback_state": state,
+                            "fill_confirmed": True},
+                )
+            # A partial fill is real and worth recording, but the order is still
+            # working — keep polling in case it completes within the window.
+            if state == "partially_filled" and qty and price:
+                res = OrderResult(
+                    ok=True, status="partially_filled", filled_qty=qty,
+                    fill_price=price, broker_order_id=res.broker_order_id,
+                    detail={**res.detail, "readback_state": state},
+                )
+
+        if res.fill_price <= 0:
+            self.db.audit(self.run_id, "WARN", "fill_unconfirmed", {
+                "ticker": ticker, "broker_order_id": res.broker_order_id,
+                "polled": attempts,
+                "note": "order accepted but no fill price confirmed — cost basis "
+                        "left unset rather than guessed from the reference price",
+            })
+        return res
 
     async def _read_positions(self) -> dict[str, Position]:
         """Re-read current holdings from the broker (sync or async)."""
