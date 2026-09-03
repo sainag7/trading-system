@@ -819,8 +819,50 @@ def test_sweep_honours_the_cash_reserve():
     assert results[0].approved_usd == pytest.approx(900.0, abs=0.01)
 
 
+def test_sweep_spends_unsettled_buying_power_on_limited_margin():
+    """After the limited-margin upgrade, buying_power includes unsettled proceeds.
+
+    The real 2026-09-03 state: $177 book, only $37.04 settled, $124.92 still
+    settling. Spendable must follow the BROKER's buying power, not settled cash —
+    taking the smaller of the two is what stranded ~70% of the account.
+    """
+    acct = account(equity=177.0, cash=37.04, buying_power=161.96)
+    limits = _sweep_limits()
+    results = validate_batch(
+        [buy(ticker="AAA", usd=25.0, price=10.0, sector="A")], acct, limits)
+    sweep_to_budget(results, acct, limits)
+    assert results[0].approved_usd == pytest.approx(161.96, abs=0.05)
+    # The old min(cash, buying_power) would have capped this at the settled $37.
+    assert results[0].approved_usd > 37.04
+
+
+def test_sweep_unchanged_on_a_cash_account():
+    """Regression: on a cash account buying_power already excludes unsettled
+    funds, so dropping the min() must not change behaviour there."""
+    acct = account(equity=100.0, cash=100.0, buying_power=100.0)
+    limits = _sweep_limits()
+    results = validate_batch(
+        [buy(ticker="AAA", usd=20.0, price=10.0, sector="A")], acct, limits)
+    sweep_to_budget(results, acct, limits)
+    assert results[0].approved_usd == pytest.approx(100.0, abs=0.01)
+
+
+def test_sweep_still_honours_the_reserve_against_buying_power():
+    acct = account(equity=200.0, cash=50.0, buying_power=200.0)
+    limits = _sweep_limits(min_cash_reserve_pct=0.10, per_trade_max_usd=10_000.0)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=20.0, price=10.0, sector="A")], acct, limits)
+    sweep_to_budget(results, acct, limits)
+    assert results[0].approved_usd == pytest.approx(180.0, abs=0.01)   # 200 - 10%
+
+
 def test_sweep_does_not_spend_same_batch_sell_proceeds():
-    """Sell proceeds are unsettled on a cash account — not spendable today."""
+    """A sell in THIS batch has not filled yet, so it cannot fund a buy in it.
+
+    (Under limited margin the proceeds would settle instantly, but the budget is
+    read at the start of the cycle — a failed or partial exit would otherwise
+    leave the buy overcommitted.)
+    """
     acct = account(equity=200.0, cash=50.0,
                    positions=pos("HELD", shares=10, market_value=150, sector="A"))
     limits = _sweep_limits()

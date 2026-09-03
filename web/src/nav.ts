@@ -1,10 +1,11 @@
 import {
   LayoutDashboard, Lightbulb, Search, Wallet, TrendingUp, CalendarClock, Settings2, History,
+  Receipt,
 } from "lucide-react";
 
 export type View =
   | "overview" | "ideas" | "deepdive" | "portfolio" | "trade"
-  | "automation" | "activity" | "settings";
+  | "automation" | "activity" | "usage" | "settings";
 
 export const NAV: { id: View; label: string; icon: any }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -14,6 +15,7 @@ export const NAV: { id: View; label: string; icon: any }[] = [
   { id: "trade", label: "Trade", icon: TrendingUp },
   { id: "automation", label: "Automation", icon: CalendarClock },
   { id: "activity", label: "Activity", icon: History },
+  { id: "usage", label: "Usage", icon: Receipt },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
@@ -25,5 +27,6 @@ export const TITLES: Record<View, string> = {
   trade: "Trade",
   automation: "Automation",
   activity: "Activity",
+  usage: "Usage",
   settings: "Settings",
 };

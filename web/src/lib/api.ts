@@ -47,6 +47,7 @@ export const api = {
   portfolio: (account?: string) =>
     get("/portfolio" + (account ? `?account=${encodeURIComponent(account)}` : "")),
   activity: () => get("/activity"),
+  usage: (days = 30) => get(`/usage?days=${days}`),
   config: () => get("/config"),
 
   // config edit

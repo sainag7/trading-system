@@ -4,6 +4,26 @@ import {
 } from "lucide-react";
 import { useStatus } from "../lib/status";
 import { api } from "../lib/api";
+import { Callout } from "./ui";
+
+/**
+ * Warns that this UI is newer than the server process behind it.
+ *
+ * Rendered inside <main> rather than in the TopBar header, which is a
+ * single-row flex bar. Without this, a stale server's missing endpoints just
+ * 404 and each view renders as though it had no data.
+ */
+export function StaleBanner() {
+  const { stale } = useStatus();
+  if (!stale) return null;
+  return (
+    <Callout kind="warn">
+      This dashboard was rebuilt after the server started, so newer features may
+      have no API behind them and will look empty. Restart it — quit the server
+      and re-run <code>./start.command</code>.
+    </Callout>
+  );
+}
 
 function useTheme() {
   const [theme, setTheme] = useState<string>(

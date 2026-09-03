@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agents.llm import generate_json
+from agents.llm import generate_json, usage_context
 
 _SERVER = "robinhood-trading"
 _TOOLS = [f"mcp__{_SERVER}"]
@@ -119,9 +119,10 @@ class RobinhoodDataProvider:
     async def _ask(self, instruction: str, max_turns: int = 8) -> Any:
         self._log("INFO", "mcp_request",
                   {"server": _SERVER, "kind": "market_data", "instruction": instruction[:300]})
-        parsed, raw = await generate_json(
-            _SYSTEM, instruction, self.model,
-            allowed_tools=_TOOLS, max_turns=max_turns, setting_sources=["local"])
+        with usage_context(agent="market_data"):
+            parsed, raw = await generate_json(
+                _SYSTEM, instruction, self.model,
+                allowed_tools=_TOOLS, max_turns=max_turns, setting_sources=["local"])
         self._log("INFO", "mcp_response",
                   {"parsed_ok": isinstance(parsed, dict), "len": len(raw or "")})
         return parsed

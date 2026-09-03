@@ -69,8 +69,13 @@ def _account_summary(acct: AccountState, limits=None) -> dict:
     # Hand the agent the spendable figure directly. Left to derive it, it has
     # anchored sizing to equity/max_positions instead of to the cash on hand,
     # which strands a "slot" of cash whenever fewer names qualify than expected.
+    #
+    # Spendable is the broker's `buying_power`, not min(cash, buying_power): on a
+    # cash account buying power already excludes unsettled proceeds, and on a
+    # limited-margin account those proceeds ARE spendable, so taking the settled
+    # `cash` instead would strand them (~70% of this book at one point).
     reserve = float(getattr(limits, "min_cash_reserve_pct", 0.0) or 0.0) * acct.equity
-    deployable = max(0.0, min(acct.cash, acct.buying_power) - reserve)
+    deployable = max(0.0, acct.buying_power - reserve)
     return {
         "equity": round(acct.equity, 2),
         "cash": round(acct.cash, 2),
@@ -135,6 +140,18 @@ class Orchestrator:
         # `provider` can be injected for tests; otherwise build the real one.
         self.provider = provider or build_provider(
             config, audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det)
+        )
+        # Token/cost accounting: agents/llm.py emits one record per LLM call and
+        # we persist it. A callback (rather than llm.py importing storage) keeps
+        # the LLM layer dependency-free, same as the `audit=` hooks above.
+        llm.set_usage_sink(self._record_llm_usage)
+
+    def _record_llm_usage(self, rec: dict) -> None:
+        """Persist one LLM usage record. Never raises — see llm._emit_usage."""
+        self.db.log_llm_usage(
+            run_id=rec.pop("run_id", None) or self.run_id,
+            account=rec.pop("account", None) or self.cfg.account_number,
+            **rec,
         )
 
     # -- kill switch -------------------------------------------------------
@@ -391,10 +408,11 @@ class Orchestrator:
         monitor_out: dict = {}
         if account.positions:
             mon_positions = self._positions_for_monitor(account)
-            monitor_out = await run_monitor(
-                mon_positions, strategy, cfg.models.get("monitor_agent", "claude-sonnet-4-6"),
-                db=db, run_id=self.run_id,
-            )
+            with llm.usage_context(agent="monitor"):
+                monitor_out = await run_monitor(
+                    mon_positions, strategy, cfg.models.get("monitor_agent", "claude-sonnet-4-6"),
+                    db=db, run_id=self.run_id,
+                )
             exit_intents = self._exits_to_intents(monitor_out.get("exits", []), account)
             if exit_intents:
                 print(f"\n🔔 Monitor proposes {len(exit_intents)} exit(s).")
@@ -433,28 +451,51 @@ class Orchestrator:
         # RESEARCH -> ANALYSIS -> DECISION
         # =================================================================
         print(f"\n🔬 Researching {len(universe)} tickers (data backend protects AV quota)...")
-        research = await run_research(
-            universe, self.provider,
-            cfg.models.get("research_agent", "claude-haiku-4-5-20251001"),
-            db=db, run_id=self.run_id,
-            llm_enrichment=cfg.research.get("llm_enrichment", False),
-            concurrency=int(cfg.research.get("concurrency", 5)),
-        )
-        analysis = await run_analysis(
-            research, cfg.models.get("analysis_agent", "claude-sonnet-4-6"),
-            strategy, weights=cfg.analysis.get("weights"),
-            factor_weights=cfg.analysis.get("factor_weights"), db=db, run_id=self.run_id,
-        )
+        # The context is entered BEFORE the gather inside run_research: each
+        # per-ticker task copies the context at creation, so every concurrent
+        # call is attributed to "research" without threading a parameter through.
+        with llm.usage_context(agent="research"):
+            research = await run_research(
+                universe, self.provider,
+                cfg.models.get("research_agent", "claude-haiku-4-5-20251001"),
+                db=db, run_id=self.run_id,
+                llm_enrichment=cfg.research.get("llm_enrichment", False),
+                concurrency=int(cfg.research.get("concurrency", 5)),
+            )
+        with llm.usage_context(agent="analysis"):
+            analysis = await run_analysis(
+                research, cfg.models.get("analysis_agent", "claude-sonnet-4-6"),
+                strategy, weights=cfg.analysis.get("weights"),
+                factor_weights=cfg.analysis.get("factor_weights"), db=db, run_id=self.run_id,
+            )
         print("📈 Top composites: " + ", ".join(
             f"{a['ticker']}={a.get('composite_score','?')}({a.get('swing_setup','?')})"
             for a in analysis[:6]
         ))
 
-        decision = await run_decision(
-            analysis, _account_summary(account, limits), limits_dict, strategy, trades_remaining,
-            cfg.models.get("decision_agent", "claude-sonnet-4-6"), db=db, run_id=self.run_id,
-        )
-        buy_intents = self._decision_to_intents(decision.get("orders", []), account)
+        # The Monitor has already decided to close these names today. Offering
+        # them to the decision agent as candidates is how the system ended up
+        # SELLING and RE-BUYING the same ticker inside one cycle (NVDA on both
+        # 2026-08-31 and 2026-09-03, AMZN on 08-31) — a full round trip of
+        # market-order spread for no net change in position. Filtering the
+        # candidate list is better than rejecting the order later: the
+        # contradiction never reaches the model, so it costs no decision quality
+        # and leaves no confusing rejection in the log.
+        exiting = {i.ticker for i in exit_intents}
+        decision_candidates = [a for a in analysis if a.get("ticker") not in exiting]
+        if exiting:
+            db.audit(self.run_id, "INFO", "candidates_excluded_exiting",
+                     {"excluded": sorted(exiting),
+                      "reason": "the Monitor is closing these this cycle"})
+
+        with llm.usage_context(agent="decision"):
+            decision = await run_decision(
+                decision_candidates, _account_summary(account, limits), limits_dict,
+                strategy, trades_remaining,
+                cfg.models.get("decision_agent", "claude-sonnet-4-6"), db=db, run_id=self.run_id,
+            )
+        buy_intents = self._decision_to_intents(decision.get("orders", []), account,
+                                                exiting=exiting)
         print(f"🧠 Decision: {decision.get('market_view','')!r} -> {len(buy_intents)} proposed order(s)")
 
         # =================================================================
@@ -568,28 +609,31 @@ class Orchestrator:
 
         # Research + analysis for exactly this ticker (watchlist not required —
         # sector/fundamentals resolve via the provider, not config `universe`).
-        research_list = await run_research(
-            [ticker], self.provider,
-            cfg.models.get("research_agent", "claude-haiku-4-5-20251001"),
-            db=db, run_id=self.run_id,
-            llm_enrichment=cfg.research.get("llm_enrichment", False), concurrency=1,
-        )
+        with llm.usage_context(agent="research"):
+            research_list = await run_research(
+                [ticker], self.provider,
+                cfg.models.get("research_agent", "claude-haiku-4-5-20251001"),
+                db=db, run_id=self.run_id,
+                llm_enrichment=cfg.research.get("llm_enrichment", False), concurrency=1,
+            )
         research = research_list[0]
-        analysis_items = await run_analysis(
-            research_list, cfg.models.get("analysis_agent", "claude-haiku-4-5-20251001"),
-            cfg.strategy, weights=cfg.analysis.get("weights"),
-            factor_weights=cfg.analysis.get("factor_weights"), db=db, run_id=self.run_id,
-        )
+        with llm.usage_context(agent="analysis"):
+            analysis_items = await run_analysis(
+                research_list, cfg.models.get("analysis_agent", "claude-haiku-4-5-20251001"),
+                cfg.strategy, weights=cfg.analysis.get("weights"),
+                factor_weights=cfg.analysis.get("factor_weights"), db=db, run_id=self.run_id,
+            )
         analysis = analysis_items[0] if analysis_items else {}
 
         position = await self._position_context(ticker)
         series = await asyncio.to_thread(self.provider.get_daily_series, ticker, 260)
         payload = explain_agent.build_payload(
             ticker, research, analysis, series or [], cfg.strategy, position)
-        report = await explain_agent.run_explain(
-            payload, cfg.models.get("explain_agent", "claude-sonnet-4-6"),
-            db=db, run_id=self.run_id,
-        )
+        with llm.usage_context(agent="explain"):
+            report = await explain_agent.run_explain(
+                payload, cfg.models.get("explain_agent", "claude-sonnet-4-6"),
+                db=db, run_id=self.run_id,
+            )
 
         self._print_degraded_warning(
             llm.backend_name() == "offline",
@@ -919,7 +963,9 @@ class Orchestrator:
         q = self.provider.get_quote(ticker)
         return float(q["price"]) if q and q.get("price") else 0.0
 
-    def _decision_to_intents(self, orders: list[dict], account: AccountState) -> list[OrderIntent]:
+    def _decision_to_intents(self, orders: list[dict], account: AccountState,
+                             *, exiting: set[str] | None = None) -> list[OrderIntent]:
+        exiting = exiting or set()
         intents = []
         for o in orders:
             action = str(o.get("action", "")).lower()
@@ -927,6 +973,13 @@ class Orchestrator:
                 continue  # not an order
             ticker = str(o.get("ticker", "")).upper()
             if not ticker:
+                continue
+            # Backstop to the candidate filter above: a model that names a ticker
+            # the Monitor is closing anyway must not turn it into an order.
+            if ticker in exiting:
+                self.db.audit(self.run_id, "WARN", "order_dropped_exiting_ticker",
+                              {"ticker": ticker, "action": action,
+                               "reason": "the Monitor is closing this position this cycle"})
                 continue
             # Side from the explicit field, else inferred from the action.
             side = Side(str(o.get("side") or ("SELL" if action == "trim" else "BUY")).upper())

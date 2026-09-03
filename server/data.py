@@ -8,11 +8,18 @@ float. All functions are read-only.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from config import load_config
 from storage.db import Database
 from server import format as F
 from server import config_io
+
+# When this server process started. The frontend compares its own build stamp
+# against this to detect that it is talking to a server older than itself — the
+# UI is served from disk on every request, so a long-lived process happily
+# serves a newer bundle whose endpoints it does not have.
+_STARTED = datetime.now(timezone.utc).isoformat()
 
 ACTION_LABEL = {"buy": "buy", "add": "add", "trim": "trim", "hold": "hold",
                 "pass": "pass", "sell": "sell"}
@@ -125,6 +132,7 @@ def status() -> dict:
         "data_ok": data_ok,
         "healthy": healthy,
         "warnings": warnings,
+        "server_started_ts": _STARTED,
         "mode": cfg.mode,
         "kill_switch": {
             "engaged": cfg.kill_switch_enabled,
@@ -404,3 +412,70 @@ def activity() -> dict:
         "SELECT ts, level, event, detail FROM audit_log ORDER BY ts DESC LIMIT 300")]
 
     return {"decisions": decisions, "orders": orders, "fills": fills, "audit": audit}
+
+
+# --- LLM token / cost usage -----------------------------------------------
+def _fmt_cost(v: float | None) -> str:
+    """Money at sub-cent resolution — individual calls cost fractions of a cent,
+    and rounding them to $0.00 would make the per-agent table useless."""
+    if v is None:
+        return "—"
+    return f"${v:,.2f}" if v >= 1 else f"${v:.4f}"
+
+
+def _fmt_tokens(n: int | None) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _usage_row(r: dict) -> dict:
+    total_tokens = (int(r.get("input_tokens") or 0) + int(r.get("output_tokens") or 0)
+                    + int(r.get("cache_write_tokens") or 0)
+                    + int(r.get("cache_read_tokens") or 0))
+    return {
+        **r,
+        "total_tokens": total_tokens,
+        "total_tokens_display": _fmt_tokens(total_tokens),
+        "input_display": _fmt_tokens(r.get("input_tokens")),
+        "output_display": _fmt_tokens(r.get("output_tokens")),
+        "cache_read_display": _fmt_tokens(r.get("cache_read_tokens")),
+        "cost_display": _fmt_cost(r.get("cost_usd")),
+    }
+
+
+def usage(days: int = 30) -> dict:
+    """Token + cost totals for the dashboard.
+
+    Note there is no history before this feature shipped — nothing recorded
+    tokens previously, so an empty result means "not yet collected", not "$0".
+    """
+    d = db()
+    daily = [_usage_row(dict(r)) for r in d.usage_daily(days)]
+    for row in daily:
+        row["day_display"] = F.fmt_ts(row["day"], "date") if row.get("day") else ""
+    totals = _usage_row(d.usage_totals(days))
+    all_time = _usage_row(d.usage_totals(None))
+    today = daily[-1] if daily and daily[-1]["day"] == _today() else None
+    return {
+        "days": days,
+        "daily": daily,
+        "by_agent": [_usage_row(dict(r)) for r in d.usage_grouped("agent", days)],
+        "by_model": [_usage_row(dict(r)) for r in d.usage_grouped("model", days)],
+        # Split by backend: the Messages API bills the ANTHROPIC_API_KEY while the
+        # Agent SDK path inherits Claude Code's OAuth and may bill a subscription.
+        # Adding them into one number would be misleading, so the UI shows both.
+        "by_backend": [_usage_row(dict(r)) for r in d.usage_grouped("backend", days)],
+        "totals": totals,
+        "all_time": all_time,
+        "today": today or _usage_row({}),
+        "has_data": bool(all_time.get("calls")),
+    }
+
+
+def _today() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")

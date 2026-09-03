@@ -151,7 +151,7 @@ class RobinhoodMCPBroker:
                 pass
 
     async def _ask(self, instruction: str, tools: list[str], max_turns: int) -> tuple[Any, str | None]:
-        from agents.llm import generate_json
+        from agents.llm import generate_json, usage_context
         # Auditable MCP request log (never logs the bearer token).
         self._log("INFO", "mcp_request",
                   {"server": self.SERVER, "account": self.account_number,
@@ -166,14 +166,15 @@ class RobinhoodMCPBroker:
         # Prefer the OAuth'd server that Claude Code holds (inherit its config via
         # setting_sources=["local"]); fall back to an explicit bearer-token server
         # only when a token was supplied (headless/CI without an interactive login).
-        if self.token:
-            parsed, raw = await generate_json(
-                system, instruction, self.model,
-                mcp_servers=self._server_config(), allowed_tools=tools, max_turns=max_turns)
-        else:
-            parsed, raw = await generate_json(
-                system, instruction, self.model,
-                allowed_tools=tools, max_turns=max_turns, setting_sources=["local"])
+        with usage_context(agent="execution"):
+            if self.token:
+                parsed, raw = await generate_json(
+                    system, instruction, self.model,
+                    mcp_servers=self._server_config(), allowed_tools=tools, max_turns=max_turns)
+            else:
+                parsed, raw = await generate_json(
+                    system, instruction, self.model,
+                    allowed_tools=tools, max_turns=max_turns, setting_sources=["local"])
         self._log("INFO", "mcp_response",
                   {"raw": (raw or "")[:1000], "parsed_ok": isinstance(parsed, (dict, list))})
         return parsed, raw

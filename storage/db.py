@@ -161,9 +161,30 @@ CREATE TABLE IF NOT EXISTS trade_plans (
     updated_ts     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    run_id        TEXT,
+    account       TEXT,
+    agent         TEXT,                -- research|analysis|decision|monitor|explain|market_data|execution
+    model         TEXT,
+    backend       TEXT,                -- anthropic_api|claude_agent_sdk
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    cache_read_tokens  INTEGER,
+    cost_usd      REAL,                -- NULL when the model is not priced (never 0 as a guess)
+    cost_source   TEXT,                -- sdk_reported|computed|unpriced
+    num_turns     INTEGER,
+    duration_ms   INTEGER,
+    ok            INTEGER,             -- 0 for a failed call (it still burned tokens)
+    error         TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(ts);
 CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
 """
 
 
@@ -603,6 +624,82 @@ class Database:
                 (today,),
             )
             return c.fetchone()["n"]
+
+    # -- LLM token / cost accounting ---------------------------------------
+    def log_llm_usage(self, **f: Any) -> int:
+        """Record one LLM call. Tolerant of missing keys — the caller is an
+        observability sink, not a schema-checked writer."""
+        with self._cursor() as c:
+            c.execute(
+                """INSERT INTO llm_usage(ts, run_id, account, agent, model, backend,
+                   input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+                   cost_usd, cost_source, num_turns, duration_ms, ok, error)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (_now(), f.get("run_id"), f.get("account"), f.get("agent"),
+                 f.get("model"), f.get("backend"),
+                 f.get("input_tokens", 0), f.get("output_tokens", 0),
+                 f.get("cache_write_tokens", 0), f.get("cache_read_tokens", 0),
+                 f.get("cost_usd"), f.get("cost_source"),
+                 f.get("num_turns"), f.get("duration_ms"),
+                 f.get("ok", 1), f.get("error")),
+            )
+            return c.lastrowid
+
+    # Shared projection so every usage view reports the same columns. `cost_usd`
+    # is SUMmed separately from `unpriced` calls: a NULL cost means "we don't
+    # know", and folding those into the total as zero would understate spend.
+    _USAGE_COLS = """
+        COUNT(*) AS calls,
+        COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed,
+        COALESCE(SUM(input_tokens), 0)       AS input_tokens,
+        COALESCE(SUM(output_tokens), 0)      AS output_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(cache_read_tokens), 0)  AS cache_read_tokens,
+        COALESCE(SUM(cost_usd), 0.0)         AS cost_usd,
+        COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unpriced_calls
+    """
+
+    # `ts` is an ISO string with a 'T' separator while SQLite's datetime() uses a
+    # space, so the two never compare cleanly. Every window filter therefore
+    # compares DATE PREFIXES (YYYY-MM-DD), which is unambiguous — the same
+    # approach `trades_today` already uses.
+    _SINCE = "substr(ts, 1, 10) >= date('now', ?)"
+
+    def usage_daily(self, days: int = 30) -> list[dict]:
+        """Per-day totals, oldest first, for the dashboard chart."""
+        return [dict(r) for r in self.query(
+            f"""SELECT substr(ts, 1, 10) AS day, {self._USAGE_COLS}
+                FROM llm_usage WHERE {self._SINCE}
+                GROUP BY day ORDER BY day""",
+            (f"-{int(days)} days",),
+        )]
+
+    def usage_grouped(self, by: str, days: int = 30) -> list[dict]:
+        """Totals grouped by ``agent``, ``model`` or ``backend``, biggest spend first."""
+        if by not in ("agent", "model", "backend"):
+            raise ValueError(f"cannot group usage by {by!r}")
+        return [dict(r) for r in self.query(
+            f"""SELECT COALESCE({by}, 'unknown') AS {by}, {self._USAGE_COLS}
+                FROM llm_usage WHERE {self._SINCE}
+                GROUP BY {by} ORDER BY cost_usd DESC""",
+            (f"-{int(days)} days",),
+        )]
+
+    def usage_totals(self, days: int | None = None) -> dict:
+        """Grand totals over ``days`` (all time when ``None``)."""
+        if days is None:
+            rows = self.query(f"SELECT {self._USAGE_COLS} FROM llm_usage")
+        else:
+            rows = self.query(
+                f"SELECT {self._USAGE_COLS} FROM llm_usage WHERE {self._SINCE}",
+                (f"-{int(days)} days",),
+            )
+        return dict(rows[0]) if rows else {}
+
+    def usage_for_run(self, run_id: str) -> dict:
+        rows = self.query(
+            f"SELECT {self._USAGE_COLS} FROM llm_usage WHERE run_id = ?", (run_id,))
+        return dict(rows[0]) if rows else {}
 
     # -- read helpers for the dashboard -----------------------------------
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:

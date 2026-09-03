@@ -665,9 +665,16 @@ def sweep_to_budget(
         than one it sized large — this tops the book up, it does not re-rank it.
       * **No approved buys means no sweep.** Proposing nothing is how the agent
         legitimately holds cash, and that must survive untouched.
-      * **Ignores same-batch sell proceeds.** Only cash/buying power that is
-        already settled is treated as spendable; proceeds from a sell placed in
-        this same cycle are not available to spend today on a cash account.
+      * **Ignores same-batch sell proceeds.** The budget comes from the account
+        as read at the START of the cycle, so a sell placed in this same batch
+        does not fund a buy in it — that sale has not filled yet, and a failed or
+        partial exit would leave the buy overcommitted.
+
+    Spendable is ``buying_power``, which is the broker's own real-time figure for
+    what this account may deploy right now — NOT ``min(cash, buying_power)``. On
+    a cash account buying power already excludes unsettled proceeds, so that
+    ``min`` never bound; on a limited-margin account it is exactly the difference
+    between deploying the book and leaving most of it stranded in settlement.
     """
     buys = [
         r for r in results
@@ -679,7 +686,7 @@ def sweep_to_budget(
         return results
 
     reserve = float(limits.min_cash_reserve_pct) * account.equity
-    budget = max(0.0, min(account.cash, account.buying_power) - reserve)
+    budget = max(0.0, account.buying_power - reserve)
     leftover = budget - sum(r.approved_usd for r in buys)
     if leftover <= epsilon:
         return results

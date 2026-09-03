@@ -17,12 +17,17 @@ let the agent degrade gracefully.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+from agents import pricing
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -52,6 +57,69 @@ def _record_error(where: str, exc: Exception) -> None:
     global _LAST_ERROR
     _LAST_ERROR = f"{where}: {type(exc).__name__}: {exc}"
     print(f"⚠️  LLM call failed ({_LAST_ERROR})", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Token / cost accounting
+#
+# Every LLM call in the system funnels through this module, so both backends are
+# instrumented here and no call site has to change. Attribution (which agent,
+# which run) rides on a contextvar rather than a parameter: the caller sets it
+# once per phase and it propagates into the tasks `asyncio.gather` creates, so
+# concurrently-researched tickers are each attributed correctly.
+#
+# The sink is a callback, so this module never imports storage — the same shape
+# as the `audit=` callbacks the data providers take.
+# ---------------------------------------------------------------------------
+_usage_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "llm_usage_ctx", default={}
+)
+_usage_sink = None
+
+
+def set_usage_sink(fn) -> None:
+    """Register ``fn(record: dict)`` to receive one record per LLM call.
+
+    Pass ``None`` to disable. The sink is called for FAILED calls too — a run
+    that burns tokens and then errors still costs money, and leaving those out
+    would under-report spend exactly where it matters most.
+    """
+    global _usage_sink
+    _usage_sink = fn
+
+
+@contextlib.contextmanager
+def usage_context(**fields):
+    """Tag every LLM call made inside this block (e.g. ``agent="research"``).
+
+    Nests: inner fields are merged over the enclosing context.
+    """
+    token = _usage_ctx.set({**_usage_ctx.get(), **fields})
+    try:
+        yield
+    finally:
+        _usage_ctx.reset(token)
+
+
+def _emit_usage(**record) -> None:
+    """Hand one usage record to the sink. NEVER raises.
+
+    Cost accounting is observability, not trading logic: a broken sink, a schema
+    mismatch or a locked database must not take down a cycle.
+    """
+    if _usage_sink is None:
+        return
+    try:
+        _usage_sink({**_usage_ctx.get(), **record})
+    except Exception:
+        pass
+
+
+def _as_int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def load_prompt(name: str) -> str:
@@ -163,6 +231,8 @@ async def _via_agent_sdk(
         )
         chunks: list[str] = []
         final: str | None = None
+        result: Any = None
+        started = time.monotonic()
         async for message in query(prompt=user_prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
@@ -170,15 +240,57 @@ async def _via_agent_sdk(
                         chunks.append(block.text)
             elif isinstance(message, ResultMessage):
                 final = message.result
+                result = message
         text = "".join(chunks).strip()
-        return text or (final.strip() if final else None)
+        out = text or (final.strip() if final else None)
+        _emit_sdk_usage(result, model, started, ok=out is not None)
+        return out
     except Exception as e:
         _record_error("claude_agent_sdk", e)
+        # A failed tool-using call still consumed tokens (the max-turns failures
+        # are the expensive ones), but the SDK raises before yielding a
+        # ResultMessage, so only the attempt itself can be recorded.
+        _emit_usage(model=model, backend="claude_agent_sdk", ok=0,
+                    cost_source=pricing.UNPRICED, error=str(e)[:200])
         return None
+
+
+def _emit_sdk_usage(result: Any, model: str, started: float, *, ok: bool) -> None:
+    """Record one Agent SDK call from its ResultMessage.
+
+    The SDK computes ``total_cost_usd`` itself, so that figure is preferred over
+    our own pricing table; we only fall back to computing when it is absent.
+    """
+    if result is None:
+        _emit_usage(model=model, backend="claude_agent_sdk", ok=1 if ok else 0,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    cost_source=pricing.UNPRICED)
+        return
+    u = getattr(result, "usage", None) or {}
+    in_tok = _as_int(u.get("input_tokens"))
+    out_tok = _as_int(u.get("output_tokens"))
+    cw = _as_int(u.get("cache_creation_input_tokens"))
+    cr = _as_int(u.get("cache_read_input_tokens"))
+    cost = getattr(result, "total_cost_usd", None)
+    if cost is None:
+        cost, source = pricing.cost_usd(model, in_tok, out_tok, cw, cr)
+    else:
+        source = pricing.SDK_REPORTED
+    _emit_usage(
+        model=model, backend="claude_agent_sdk",
+        input_tokens=in_tok, output_tokens=out_tok,
+        cache_write_tokens=cw, cache_read_tokens=cr,
+        cost_usd=cost, cost_source=source,
+        num_turns=_as_int(getattr(result, "num_turns", None)),
+        duration_ms=_as_int(getattr(result, "duration_ms", None))
+                    or int((time.monotonic() - started) * 1000),
+        ok=0 if getattr(result, "is_error", False) or not ok else 1,
+    )
 
 
 async def _via_anthropic(system_prompt: str, user_prompt: str, model: str, *,
                          max_tokens: int = DEFAULT_MAX_TOKENS) -> str | None:
+    started = time.monotonic()
     try:
         import anthropic
 
@@ -196,12 +308,38 @@ async def _via_anthropic(system_prompt: str, user_prompt: str, model: str, *,
             _LAST_ERROR = (f"anthropic_api: {model} hit max_tokens={max_tokens} "
                            f"and the response was truncated")
             print(f"⚠️  {_LAST_ERROR}", file=sys.stderr)
+        _emit_api_usage(resp, model, started)
         return "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
     except Exception as e:
         _record_error("anthropic_api", e)
+        # No usage is returned on a failed request — record the attempt so the
+        # call count is honest, with cost unknown rather than zero.
+        _emit_usage(model=model, backend="anthropic_api", ok=0,
+                    cost_source=pricing.UNPRICED, error=str(e)[:200],
+                    duration_ms=int((time.monotonic() - started) * 1000))
         return None
+
+
+def _emit_api_usage(resp: Any, model: str, started: float) -> None:
+    """Record one Messages API call from ``resp.usage``."""
+    u = getattr(resp, "usage", None)
+    in_tok = _as_int(getattr(u, "input_tokens", 0))
+    out_tok = _as_int(getattr(u, "output_tokens", 0))
+    cw = _as_int(getattr(u, "cache_creation_input_tokens", 0))
+    cr = _as_int(getattr(u, "cache_read_input_tokens", 0))
+    # Bill against the model the API says served the request, not the one we
+    # asked for — they differ under a server-side fallback.
+    served = getattr(resp, "model", None) or model
+    cost, source = pricing.cost_usd(served, in_tok, out_tok, cw, cr)
+    _emit_usage(
+        model=served, backend="anthropic_api",
+        input_tokens=in_tok, output_tokens=out_tok,
+        cache_write_tokens=cw, cache_read_tokens=cr,
+        cost_usd=cost, cost_source=source, num_turns=1,
+        duration_ms=int((time.monotonic() - started) * 1000), ok=1,
+    )
 
 
 def extract_json(text: str | None) -> Any | None:

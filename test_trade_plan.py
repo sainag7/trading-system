@@ -23,7 +23,7 @@ import pytest
 from agents.decision_agent import _normalize, _until, _valid_until
 from config import load_config
 from execution.executor import Executor, OrderResult
-from risk.guardrails import OrderIntent, Side
+from risk.guardrails import AccountState, OrderIntent, Side
 
 
 STRATEGY = {"max_holding_days": 60, "stop_atr_mult": 2.5, "target_r_multiple": 2.5}
@@ -225,6 +225,61 @@ def test_poll_skipped_for_a_rejected_send():
         rejected = OrderResult(ok=False, status="rejected", broker_order_id=None)
         res = asyncio.run(ex._confirm_fill(rejected, ticker="NVDA"))
         assert res.status == "rejected" and broker.calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# The system must not sell and re-buy the same name in one cycle
+# --------------------------------------------------------------------------- #
+def _buy_order(ticker="NVDA", usd=25.0):
+    return {"ticker": ticker, "action": "buy", "side": "BUY",
+            "target_dollar_amount": usd, "price": 227.91, "confidence": 70}
+
+
+def test_buy_is_dropped_when_the_monitor_is_exiting_that_ticker():
+    """The 2026-08-31 / 09-03 case: Monitor sells NVDA, agent re-buys it same run."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        acct = AccountState(equity=177.0, cash=37.0, buying_power=161.0,
+                            peak_equity=177.0, positions={})
+        intents = orch._decision_to_intents([_buy_order("NVDA")], acct,
+                                            exiting={"NVDA"})
+        assert intents == []
+
+
+def test_buys_for_other_tickers_survive_the_exit_filter():
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        acct = AccountState(equity=177.0, cash=37.0, buying_power=161.0,
+                            peak_equity=177.0, positions={})
+        intents = orch._decision_to_intents(
+            [_buy_order("NVDA"), _buy_order("HPE", 30.0)], acct, exiting={"NVDA"})
+        assert [i.ticker for i in intents] == ["HPE"]
+
+
+def test_no_exits_means_nothing_is_filtered():
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        acct = AccountState(equity=177.0, cash=37.0, buying_power=161.0,
+                            peak_equity=177.0, positions={})
+        intents = orch._decision_to_intents([_buy_order("NVDA")], acct, exiting=set())
+        assert [i.ticker for i in intents] == ["NVDA"]
+
+
+# --------------------------------------------------------------------------- #
+# deployable_cash follows the broker's buying power, not settled cash
+# --------------------------------------------------------------------------- #
+def test_deployable_cash_uses_buying_power_not_settled_cash():
+    """Post-upgrade, unsettled proceeds must reach the decision agent's budget."""
+    from orchestrator import _account_summary
+
+    class _Limits:
+        min_cash_reserve_pct = 0.0
+
+    acct = AccountState(equity=177.0, cash=37.04, buying_power=161.96,
+                        peak_equity=177.0, positions={})
+    summary = _account_summary(acct, _Limits())
+    assert summary["deployable_cash"] == pytest.approx(161.96, abs=0.01)
+    assert summary["cash"] == pytest.approx(37.04, abs=0.01)   # still reported truthfully
 
 
 if __name__ == "__main__":

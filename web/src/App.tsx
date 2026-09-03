@@ -3,7 +3,7 @@ import { CandlestickChart } from "lucide-react";
 import { NAV, TITLES, View } from "./nav";
 import { StatusProvider } from "./lib/status";
 import { JobProvider } from "./lib/useJob";
-import { TopBar } from "./components/TopBar";
+import { TopBar, StaleBanner } from "./components/TopBar";
 import { LogDrawer } from "./components/LogDrawer";
 import { Overview } from "./views/Overview";
 import { Ideas } from "./views/Ideas";
@@ -12,6 +12,7 @@ import { Portfolio } from "./views/Portfolio";
 import { Trade } from "./views/Trade";
 import { Automation } from "./views/Automation";
 import { Activity } from "./views/Activity";
+import { Usage } from "./views/Usage";
 import { Settings } from "./views/Settings";
 
 const validView = (h: string): View => {
@@ -55,6 +56,7 @@ export default function App() {
           <TopBar title={TITLES[view]} />
 
           <main className="main">
+            <StaleBanner />
             <nav className="mobile-nav">
               {NAV.map((n) => (
                 <button key={n.id} className={`nav-item ${view === n.id ? "active" : ""}`}
@@ -82,6 +84,7 @@ function ViewSwitch({ view, onNavigate }: { view: View; onNavigate: (v: View) =>
     case "trade": return <Trade />;
     case "automation": return <Automation />;
     case "activity": return <Activity />;
+    case "usage": return <Usage />;
     case "settings": return <Settings />;
   }
 }

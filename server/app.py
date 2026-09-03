@@ -73,6 +73,11 @@ def api_activity() -> dict:
     return data.activity()
 
 
+@app.get("/api/usage")
+def api_usage(days: int = 30) -> dict:
+    return data.usage(max(1, min(days, 365)))
+
+
 @app.get("/api/config")
 def api_config_get() -> dict:
     return config_io.config_view()
