@@ -49,7 +49,7 @@ from config import load_config
 from storage.db import Database
 from data.providers import build_provider
 from risk.guardrails import (
-    AccountState, OrderIntent, Side, validate_batch, sweep_to_budget,
+    AccountState, OrderIntent, Side, floor_shares, validate_batch, sweep_to_budget,
 )
 from execution.executor import Executor, RobinhoodMCPBroker
 from execution.notifier import Notifier
@@ -64,7 +64,24 @@ def _now_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:6]
 
 
-def _account_summary(acct: AccountState, limits=None) -> dict:
+def _pending_exit_proceeds(exit_intents: list | None) -> float:
+    """Cash the Monitor's exits would free THIS cycle, if they all fill.
+
+    Exits execute before buys, so this money is genuinely available within the
+    same run — but only once those sells actually fill, which is why the buys are
+    re-validated against a fresh account read afterwards rather than trusting
+    this figure."""
+    total = 0.0
+    for i in exit_intents or []:
+        if i.side != Side.SELL:
+            continue
+        shares = i.shares if i.shares is not None else 0.0
+        total += float(shares) * float(i.price or 0.0)
+    return total
+
+
+def _account_summary(acct: AccountState, limits=None,
+                     exit_intents: list | None = None) -> dict:
     """Compact, LLM-friendly view of the account for the decision agent."""
     # Hand the agent the spendable figure directly. Left to derive it, it has
     # anchored sizing to equity/max_positions instead of to the cash on hand,
@@ -76,11 +93,18 @@ def _account_summary(acct: AccountState, limits=None) -> dict:
     # `cash` instead would strand them (~70% of this book at one point).
     reserve = float(getattr(limits, "min_cash_reserve_pct", 0.0) or 0.0) * acct.equity
     deployable = max(0.0, acct.buying_power - reserve)
+    # A fully-invested book reads $0 deployable, and the agent then correctly
+    # concludes it cannot buy — even though the Monitor is about to sell and free
+    # capital in this very cycle. Telling it what the exits will release is what
+    # lets the proceeds be redeployed today instead of sitting idle until tomorrow.
+    pending = _pending_exit_proceeds(exit_intents)
     return {
         "equity": round(acct.equity, 2),
         "cash": round(acct.cash, 2),
         "buying_power": round(acct.buying_power, 2),
         "deployable_cash": round(deployable, 2),
+        "expected_exit_proceeds": round(pending, 2),
+        "deployable_cash_after_exits": round(deployable + pending, 2),
         "peak_equity": round(acct.peak_equity, 2),
         "drawdown_pct": round(acct.drawdown_pct() * 100, 2),
         "open_positions": acct.open_position_count(),
@@ -490,7 +514,8 @@ class Orchestrator:
 
         with llm.usage_context(agent="decision"):
             decision = await run_decision(
-                decision_candidates, _account_summary(account, limits), limits_dict,
+                decision_candidates,
+                _account_summary(account, limits, exit_intents), limits_dict,
                 strategy, trades_remaining,
                 cfg.models.get("decision_agent", "claude-sonnet-4-6"), db=db, run_id=self.run_id,
             )
@@ -563,15 +588,86 @@ class Orchestrator:
             return
 
         # =================================================================
-        # EXECUTION
+        # EXECUTION — sells first, then re-check the account before buying.
         # =================================================================
-        await self._execute(plan.broker, plan.approved, plan.account)
+        await self._execute_staged(plan)
 
         # Post-execution: refresh positions, summarise the run, send the digest.
         await self._finalize_run(plan.broker)
 
         self.db.finish_run(self.run_id)
         print(f"\n✅ Cycle complete (run_id={self.run_id}, mode={self.mode}).")
+
+    async def _execute_staged(self, plan: CyclePlan) -> None:
+        """Execute exits, then re-price the buys against the cash they freed.
+
+        A fully-invested book has $0 buying power, so buys sized against the
+        START-of-cycle account are rejected or shrunk to nothing — while the
+        exits in the very same cycle are about to free capital that then sits
+        idle until tomorrow. So: sell, RE-READ the account, and re-validate the
+        buys against what actually landed.
+
+        Re-reading (rather than assuming the proceeds) is the safety property:
+        on 2026-09-09 an exit was rejected outright by the broker, and a buy
+        sized against its expected proceeds would have overdrawn the account.
+        """
+        exits = [r for r in plan.approved if r.intent.side == Side.SELL]
+        buys = [r for r in plan.approved if r.intent.side == Side.BUY]
+
+        # Nothing to sequence — one pass, exactly as before.
+        if not exits or not buys:
+            await self._execute(plan.broker, plan.approved, plan.account)
+            return
+
+        # ---- Stage 1: exits ------------------------------------------------
+        print(f"\n─── Stage 1 of 2: {len(exits)} exit(s) ───")
+        await self._execute(plan.broker, exits, plan.account)
+
+        # ---- Stage 2: re-read, re-validate, then buy -----------------------
+        print(f"\n─── Stage 2 of 2: re-checking the account before "
+              f"{len(buys)} buy(s) ───")
+        account = await self._read_account(plan.broker)
+        if account is None:
+            # The exits already succeeded; guessing at the balance would be the
+            # only unsafe move here. Leave the cash for the next cycle.
+            self.db.audit(self.run_id, "WARN", "post_exit_read_failed",
+                          {"skipped_buys": [r.intent.ticker for r in buys],
+                           "note": "account unreadable after exits — buys skipped, "
+                                   "cash left for the next cycle"})
+            print("⚠️  Could not re-read the account after the exits — "
+                  "skipping the buys rather than guessing at the balance.")
+            return
+
+        print(f"📊 After exits: equity ${account.equity:,.2f} | "
+              f"buying power ${account.buying_power:,.2f}")
+
+        # Stage 1's fills consumed part of the daily budget; re-count so the
+        # re-validation cannot overspend it.
+        results = validate_batch(
+            [r.intent for r in buys], account, self.cfg.risk, self.db.trades_today(),
+            kill_switch=self.kill_switch_active(),
+            audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
+        )
+        if getattr(self.cfg.risk, "sweep_cash_to_buys", False):
+            results = sweep_to_budget(results, account, self.cfg.risk)
+
+        approved, before = [], {r.intent.ticker: r.approved_usd for r in buys}
+        print("\n🛡️  Guardrail re-check (against real post-exit cash):")
+        for res in results:
+            self.db.log_decision(self.run_id, res)
+            print("   " + res.summary())
+            if res.approved and res.approved_shares > 0:
+                approved.append(res)
+        self.db.audit(self.run_id, "INFO", "buys_revalidated_post_exit", {
+            "before": before,
+            "after": {r.intent.ticker: round(r.approved_usd, 2) for r in approved},
+            "buying_power": round(account.buying_power, 2),
+        })
+
+        if not approved:
+            print("\n✅ No buy cleared the guardrails after the exits.")
+            return
+        await self._execute(plan.broker, approved, account)
 
     async def execute_approved(self, plan: CyclePlan, approved_subset: list, *,
                                confirm_callback=None) -> None:
@@ -583,7 +679,12 @@ class Orchestrator:
         ``assume_yes=True``); ``confirm_callback`` may auto-approve the per-order
         preview confirmation since the UI already collected the user's choice.
         Every order still re-checks the kill switch inside the Executor and only
-        guardrail-approved intents can appear in ``approved_subset``."""
+        guardrail-approved intents can appear in ``approved_subset``.
+
+        NOTE: deliberately single-stage, unlike the CLI's ``_execute_staged``.
+        The dashboard shows you specific orders at specific sizes and places
+        exactly those — re-sizing a buy after the sells filled would place
+        something other than what you approved."""
         await self._execute(plan.broker, approved_subset, plan.account,
                             confirm_callback=confirm_callback)
         await self._finalize_run(plan.broker)
@@ -987,10 +1088,12 @@ class Orchestrator:
             target_usd = float(o.get("target_dollar_amount", o.get("usd_amount", 0)) or 0)
             shares = o.get("shares")
             # For a trim, convert the target $ into shares (capped at held shares).
+            # Floor rather than round: rounding to nearest can land a hair ABOVE
+            # the held quantity, which the broker rejects as an oversell.
             if side == Side.SELL and shares is None and target_usd > 0 and price > 0:
                 held = account.positions.get(ticker)
                 want = target_usd / price
-                shares = round(min(want, held.shares), 6) if held else round(want, 6)
+                shares = floor_shares(min(want, held.shares) if held else want)
             # Confidence may arrive as 0-100 (preferred) or 0-1; store as 0-1.
             conf = float(o.get("confidence", 0) or 0)
             conf = conf / 100 if conf > 1 else conf

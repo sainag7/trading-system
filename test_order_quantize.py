@@ -1,4 +1,8 @@
-"""Unit tests for order-quantity quantization to Robinhood's 8-decimal limit.
+"""Unit tests for order-quantity quantization to the broker's share precision.
+
+The limit is Robinhood's: at most MAX_SHARE_DECIMALS (6) decimal places on a
+fractional quantity. These assertions derive it rather than restating a number —
+hard-coding 8 here is precisely how the code drifted away from the broker.
 
 Run:  python -m pytest test_order_quantize.py -q
 """
@@ -9,6 +13,7 @@ import re
 from decimal import Decimal
 
 from execution.executor import RobinhoodMCPBroker, Side, _quantize_shares, _fmt_qty
+from risk.guardrails import MAX_SHARE_DECIMALS
 
 
 def _decimals(x: float) -> int:
@@ -18,19 +23,19 @@ def _decimals(x: float) -> int:
 def test_quantize_floors_the_live_failure_case():
     # The exact quantity Robinhood rejected.
     q = _quantize_shares(0.07439590524937507)
-    assert q == 0.0743959                       # floored to 8 dp
-    assert _decimals(q) <= 8
+    assert q == 0.074395                        # floored to the broker's precision
+    assert _decimals(q) <= MAX_SHARE_DECIMALS
     assert q <= 0.07439590524937507             # never rounds up
 
 
 def test_quantize_various():
     assert _quantize_shares(1.0) == 1.0
     assert _quantize_shares(2.5) == 2.5
-    assert _quantize_shares(0.123456789) == 0.12345678   # 9th dp dropped, not rounded
-    assert _quantize_shares(3e-9) == 0.0                 # below 1e-8 floors to zero
-    # Any input comes out with <= 8 decimal places.
+    assert _quantize_shares(0.123456789) == 0.123456     # 7th dp dropped, not rounded
+    assert _quantize_shares(3e-9) == 0.0                 # below the precision floors to zero
+    # Any input comes out within the broker's precision.
     for v in (0.07439590524937507, 0.1, 0.999999999, 12.3456789012, 0.000000019):
-        assert _decimals(_quantize_shares(v)) <= 8, v
+        assert _decimals(_quantize_shares(v)) <= MAX_SHARE_DECIMALS, v
 
 
 def _instruction_for(qty: float) -> str:
@@ -54,7 +59,7 @@ def _instruction_for(qty: float) -> str:
     return captured["instruction"]
 
 
-def test_instruction_text_never_exceeds_8_decimals():
+def test_instruction_text_never_exceeds_the_share_precision():
     """Regression for the live HTTP 400: Robinhood rejected an order because the
     QUANTITY IN THE INSTRUCTION had 17 decimals. Quantizing the float is not
     enough on its own — what reaches the broker is this rendered string, so the
@@ -64,8 +69,8 @@ def test_instruction_text_never_exceeds_8_decimals():
     m = re.search(r"for ([0-9.]+) shares of", text)
     assert m, f"quantity not found in instruction: {text!r}"
     rendered = m.group(1)
-    assert _decimals(float(rendered)) <= 8, rendered
-    assert rendered == "0.07434944"
+    assert _decimals(float(rendered)) <= MAX_SHARE_DECIMALS, rendered
+    assert rendered == "0.074349"
     # The raw un-quantized float must not appear anywhere in the instruction.
     assert "0.07434944237918216" not in text
 
@@ -140,22 +145,22 @@ def test_execute_order_quantizes_before_broker_and_db():
         ref_price=337.93, notional=25.0,
     ))
 
-    assert broker.qty == 0.07434944, broker.qty
-    assert _decimals(broker.qty) <= 8
-    assert db.orders[0]["qty"] == 0.07434944
-    assert db.trades[0]["qty"] == 0.07434944
+    assert broker.qty == 0.074349, broker.qty
+    assert _decimals(broker.qty) <= MAX_SHARE_DECIMALS
+    assert db.orders[0]["qty"] == 0.074349
+    assert db.trades[0]["qty"] == 0.074349
 
 
 def test_fmt_qty_clean_string():
-    assert _fmt_qty(0.07439590524937507) == "0.0743959"   # no trailing zeros
+    assert _fmt_qty(0.07439590524937507) == "0.074395"    # no trailing zeros
     assert _fmt_qty(1.0) == "1"                            # whole shares
     assert _fmt_qty(2.50000000) == "2.5"
-    assert _fmt_qty(0.123456789) == "0.12345678"
+    assert _fmt_qty(0.123456789) == "0.123456"
     assert _fmt_qty(0.0) == "0"
-    # Never scientific notation, always <= 8 decimals.
+    # Never scientific notation, always within the broker's precision.
     s = _fmt_qty(0.000000019)                              # 1.9e-8
     assert "e" not in s.lower()
-    assert _decimals(float(s)) <= 8
+    assert _decimals(float(s)) <= MAX_SHARE_DECIMALS
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +190,7 @@ def test_fractional_sell_still_sends_share_quantity():
     smaller proceeds, not an overspend, so it keeps quantity semantics."""
     _db, broker = _run_order({"order_type": "limit"}, side=Side.SELL)
     assert broker.dollar_amount is None
-    assert broker.qty == 0.07434944
+    assert broker.qty == 0.074349
 
 
 def test_whole_share_order_keeps_limit_protection():

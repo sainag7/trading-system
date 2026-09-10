@@ -32,26 +32,20 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from risk.guardrails import AccountState, Position, Side
+from risk.guardrails import (
+    MAX_SHARE_DECIMALS, AccountState, Position, Side, floor_shares,
+)
 
 # Fixed namespace so a logical order's ``ref_id`` is a deterministic UUID — the
 # same client-order-id always maps to the same UUID, giving the Robinhood MCP an
 # idempotency key that survives retries (it never double-places a logical order).
 _REF_ID_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
 
-# Robinhood rejects an order whose quantity has more than 8 decimal places
-# ("Ensure that there are no more than 8 decimal places."). Fractional sizing
-# (approved_usd / price) routinely produces a 17-digit float, so every quantity
-# is quantized here before it reaches the broker.
-_MAX_QTY_DECIMALS = 8
-_QTY_SCALE = 10 ** _MAX_QTY_DECIMALS
-
-
-def _quantize_shares(qty: float) -> float:
-    """Floor a share quantity to Robinhood's 8-decimal limit. Rounding DOWN (not
-    nearest) so a buy never spends beyond the approved notional and a sell never
-    oversells the held quantity."""
-    return math.floor(float(qty) * _QTY_SCALE) / _QTY_SCALE
+# Share precision is defined ONCE, in the risk layer — see
+# `guardrails.MAX_SHARE_DECIMALS`. Keeping a second copy here is what let this
+# drift to 8 while the broker only ever accepted 6.
+_MAX_QTY_DECIMALS = MAX_SHARE_DECIMALS
+_quantize_shares = floor_shares
 
 
 def _f_or_none(v) -> float | None:
@@ -69,9 +63,9 @@ def _f_or_none(v) -> float | None:
 
 
 def _fmt_qty(qty: float) -> str:
-    """Render a quantity for the broker order instruction: quantized to <=8
-    decimals, no trailing zeros and never scientific notation (e.g.
-    0.07439590524937507 -> "0.0743959", 1.0 -> "1")."""
+    """Render a quantity for the broker order instruction: floored to the
+    broker's precision, no trailing zeros and never scientific notation (e.g.
+    0.07439590524937507 -> "0.074395", 1.0 -> "1")."""
     q = _quantize_shares(qty)
     s = f"{q:.{_MAX_QTY_DECIMALS}f}".rstrip("0").rstrip(".")
     return s or "0"

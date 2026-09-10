@@ -879,3 +879,33 @@ def test_sweep_does_not_spend_same_batch_sell_proceeds():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ===========================================================================
+# Share precision — the broker accepts at most MAX_SHARE_DECIMALS places
+# ===========================================================================
+def test_sizing_never_exceeds_the_brokers_share_precision():
+    """Every path that produces a share count must stay inside the limit."""
+    from risk.guardrails import MAX_SHARE_DECIMALS
+    from decimal import Decimal
+
+    def dp(x):
+        return max(0, -Decimal(str(x)).as_tuple().exponent)
+
+    for price in (337.93, 1787.32, 19.7, 0.51, 227.91):
+        res = validate_order(buy(usd=88.93, price=price), account(), default_limits())
+        assert dp(res.approved_shares) <= MAX_SHARE_DECIMALS, (price, res.approved_shares)
+
+
+def test_floor_shares_reproduces_the_live_rejection():
+    """2026-09-09: a half-position trim of HPE computed 0.0626035 (7 dp) and the
+    broker refused it with HTTP 400. It must floor to 6 dp."""
+    from risk.guardrails import floor_shares
+    assert floor_shares(0.125207 / 2) == 0.062603
+
+
+def test_floor_shares_never_rounds_a_sell_above_the_holding():
+    """Rounding to nearest could land above shares held and be an oversell."""
+    from risk.guardrails import floor_shares
+    for held in (0.125207, 0.999999, 1.0000004, 0.0000019):
+        assert floor_shares(held) <= held

@@ -53,6 +53,24 @@ from typing import Callable, Iterable
 # of a cent is treated as equal so price math doesn't cause spurious rejects.
 EPS = 1e-6
 
+# Robinhood accepts at most SIX decimal places on a fractional share quantity;
+# a seventh is refused outright ("quantity cannot include fractional shares",
+# HTTP 400). This lives here, in the lowest layer, because sizing happens in
+# three places (validate_order, sweep_to_budget, the executor) and when they each
+# carried their own copy they drifted to 8 — which silently worked for months,
+# since a FULL exit reuses the broker's own 6-decimal holding figure, and only
+# broke on the first PARTIAL trim (0.125207 / 2 = 0.0626035, seven decimals).
+MAX_SHARE_DECIMALS = 6
+_SHARE_SCALE = 10 ** MAX_SHARE_DECIMALS
+
+
+def floor_shares(qty: float) -> float:
+    """Floor a share count to the broker's tradeable precision.
+
+    Rounds DOWN, never to nearest: a buy must not spend past its approved
+    notional, and a sell must not exceed the shares actually held."""
+    return math.floor(float(qty) * _SHARE_SCALE) / _SHARE_SCALE
+
 
 class Side(str, Enum):
     BUY = "BUY"
@@ -478,11 +496,11 @@ def validate_order(
 
     # Convert to shares (honour the fractional-shares setting) BEFORE the
     # cap checks, since flooring can only reduce the notional. Fractional shares
-    # are floored to 8 decimals — the broker (Robinhood) rejects a quantity with
-    # more than 8 decimal places — and the notional is recomputed to match, so the
-    # recorded decision and the cap checks below use the exact tradeable size.
+    # are floored to the broker's tradeable precision (see MAX_SHARE_DECIMALS)
+    # and the notional is recomputed to match, so the recorded decision and the
+    # cap checks below use the exact size that will be sent.
     if limits.allow_fractional_shares:
-        approved_shares = math.floor(approved_usd / price * 1e8) / 1e8
+        approved_shares = floor_shares(approved_usd / price)
         approved_usd = approved_shares * price
     else:
         approved_shares = math.floor(approved_usd / price)
@@ -751,10 +769,10 @@ def sweep_to_budget(
         target_usd = before + extra
         price = float(r.intent.price)
         # Re-derive shares from the new notional, matching the sizing convention
-        # used above: floor to 8 decimals, then recompute the notional so the
-        # recorded size is exactly what is tradeable.
+        # used above: floor to the broker's precision, then recompute the notional
+        # so the recorded size is exactly what is tradeable.
         if limits.allow_fractional_shares:
-            shares = math.floor(target_usd / price * 1e8) / 1e8
+            shares = floor_shares(target_usd / price)
         else:
             shares = math.floor(target_usd / price)
         if shares <= 0:

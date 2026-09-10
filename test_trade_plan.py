@@ -285,3 +285,125 @@ def test_deployable_cash_uses_buying_power_not_settled_cash():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------- #
+# Sells fund the same cycle's buys
+# --------------------------------------------------------------------------- #
+from risk.guardrails import GuardrailResult  # noqa: E402
+
+
+def _approved(intent, usd, shares) -> GuardrailResult:
+    return GuardrailResult(intent=intent, approved=True, approved_usd=usd,
+                           approved_shares=shares, resized=False,
+                           reasons=[], checks=[])
+
+
+def _exit_intent(ticker="HPE", shares=0.125207, price=48.0):
+    return OrderIntent(ticker=ticker, side=Side.SELL, action="sell",
+                       shares=shares, price=price, protective_exit=True)
+
+
+def test_pending_exit_proceeds_sums_only_sells():
+    from orchestrator import _pending_exit_proceeds
+    intents = [_exit_intent("HPE", 0.5, 40.0), _exit_intent("NVDA", 0.25, 200.0)]
+    assert _pending_exit_proceeds(intents) == pytest.approx(20.0 + 50.0)
+    assert _pending_exit_proceeds([]) == 0.0
+    assert _pending_exit_proceeds(None) == 0.0
+
+
+def test_account_summary_reports_what_the_exits_will_free():
+    """A fully-invested book reads $0 deployable — the agent must still be told
+    that this cycle's exits are about to fund it."""
+    from orchestrator import _account_summary
+
+    class _L:
+        min_cash_reserve_pct = 0.0
+
+    acct = AccountState(equity=275.50, cash=0.0, buying_power=0.0,
+                        peak_equity=275.50, positions={})
+    s = _account_summary(acct, _L(), [_exit_intent("HPE", 0.125207, 48.0)])
+    assert s["deployable_cash"] == 0.0
+    assert s["expected_exit_proceeds"] == pytest.approx(6.01, abs=0.01)
+    assert s["deployable_cash_after_exits"] == pytest.approx(6.01, abs=0.01)
+
+
+def test_account_summary_without_exits_is_unchanged():
+    from orchestrator import _account_summary
+
+    class _L:
+        min_cash_reserve_pct = 0.0
+
+    acct = AccountState(equity=100.0, cash=40.0, buying_power=40.0,
+                        peak_equity=100.0, positions={})
+    s = _account_summary(acct, _L())
+    assert s["expected_exit_proceeds"] == 0.0
+    assert s["deployable_cash_after_exits"] == s["deployable_cash"] == 40.0
+
+
+class _StagedHarness:
+    """Records _execute calls and serves a scripted post-exit account read."""
+
+    def __init__(self, orch, after_account):
+        self.orch, self.after = orch, after_account
+        self.calls = []
+        orch._execute = self._execute            # type: ignore[method-assign]
+        orch._read_account = self._read          # type: ignore[method-assign]
+
+    async def _execute(self, broker, approved, account, **kw):
+        self.calls.append([r.intent.ticker for r in approved])
+
+    async def _read(self, broker):
+        return self.after
+
+
+def _plan(orch, approved, account):
+    from orchestrator import CyclePlan
+    return CyclePlan(account=account, broker=object(), approved=approved)
+
+
+def test_staged_execution_buys_with_the_cash_the_exits_freed():
+    """The 2026-09-09 shape: $0 buying power, an exit pending, a buy that could
+    not have been placed before the sell filled."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        broke = AccountState(equity=275.0, cash=0.0, buying_power=0.0,
+                             peak_equity=275.0, positions={})
+        flush = AccountState(equity=275.0, cash=60.0, buying_power=60.0,
+                             peak_equity=275.0, positions={})
+        approved = [_approved(_exit_intent(), 6.01, 0.125207),
+                    _approved(OrderIntent(ticker="NVDA", side=Side.BUY, action="buy",
+                                          usd_amount=50.0, price=227.91), 50.0, 0.219)]
+        h = _StagedHarness(orch, flush)
+        asyncio.run(orch._execute_staged(_plan(orch, approved, broke)))
+        assert h.calls[0] == ["HPE"], h.calls          # exits first, alone
+        assert h.calls[1] == ["NVDA"], h.calls         # buys after the re-read
+
+
+def test_staged_execution_skips_buys_when_the_reread_fails():
+    """The exits already succeeded; guessing the balance is the unsafe move."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        broke = AccountState(equity=275.0, cash=0.0, buying_power=0.0,
+                             peak_equity=275.0, positions={})
+        approved = [_approved(_exit_intent(), 6.01, 0.125207),
+                    _approved(OrderIntent(ticker="NVDA", side=Side.BUY, action="buy",
+                                          usd_amount=50.0, price=227.91), 50.0, 0.219)]
+        h = _StagedHarness(orch, None)               # re-read returns nothing
+        asyncio.run(orch._execute_staged(_plan(orch, approved, broke)))
+        assert h.calls == [["HPE"]]                  # sells ran, buys did not
+
+
+def test_staged_execution_is_single_pass_when_there_is_nothing_to_sequence():
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        acct = AccountState(equity=275.0, cash=100.0, buying_power=100.0,
+                            peak_equity=275.0, positions={})
+        approved = [_approved(OrderIntent(ticker="NVDA", side=Side.BUY, action="buy",
+                                          usd_amount=50.0, price=227.91), 50.0, 0.219)]
+        h = _StagedHarness(orch, acct)
+        asyncio.run(orch._execute_staged(_plan(orch, approved, acct)))
+        assert h.calls == [["NVDA"]]                 # one pass, no extra read
