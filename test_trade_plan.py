@@ -407,3 +407,93 @@ def test_staged_execution_is_single_pass_when_there_is_nothing_to_sequence():
         h = _StagedHarness(orch, acct)
         asyncio.run(orch._execute_staged(_plan(orch, approved, acct)))
         assert h.calls == [["NVDA"]]                 # one pass, no extra read
+
+
+# --------------------------------------------------------------------------- #
+# Budgets floor; a stage-1 rejection still gets a second look
+# --------------------------------------------------------------------------- #
+from risk.guardrails import CheckOutcome  # noqa: E402
+
+
+def test_account_summary_floors_the_budget_rather_than_rounding_up():
+    """2026-09-10: $3.507702 was reported as $3.51, the agent proposed exactly
+    $3.51, and the guardrails rejected it for spending $0.0023 that never
+    existed. A budget must never overstate the money on hand."""
+    from orchestrator import _account_summary
+
+    class _L:
+        min_cash_reserve_pct = 0.0
+
+    acct = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
+                        peak_equity=280.0, positions={})
+    # The live figures: 0.062604 shares of HPE at $56.03 = $3.5077021200000003.
+    s = _account_summary(acct, _L(), [_exit_intent("HPE", 0.062604, 56.03)])
+    assert s["expected_exit_proceeds"] == 3.50           # NOT 3.51
+    assert s["deployable_cash_after_exits"] == 3.50
+
+
+def test_every_budget_figure_floors_in_the_same_direction():
+    from orchestrator import _account_summary
+
+    class _L:
+        min_cash_reserve_pct = 0.0
+
+    acct = AccountState(equity=100.0, cash=0.0, buying_power=12.99999,
+                        peak_equity=100.0, positions={})
+    s = _account_summary(acct, _L(), [_exit_intent("X", 1.0, 7.999999)])
+    assert s["deployable_cash"] == 12.99
+    assert s["expected_exit_proceeds"] == 7.99
+    assert s["deployable_cash_after_exits"] == 20.99
+
+
+def _rejected(intent, failed_check: str) -> GuardrailResult:
+    return GuardrailResult(
+        intent=intent, approved=False, approved_usd=0.0, approved_shares=0.0,
+        resized=False, reasons=["rejected"],
+        checks=[CheckOutcome(failed_check, False, "no room")],
+    )
+
+
+def _ssl_buy():
+    return OrderIntent(ticker="SSL", side=Side.BUY, action="buy",
+                       usd_amount=3.51, price=14.02, sector="Materials")
+
+
+def test_stage_one_cash_rejection_gets_a_second_look_after_the_exits():
+    """The 2026-09-10 failure mode: SSL was rejected at stage 1 for being $0.0023
+    short, so it never entered plan.approved — `buys` was empty, and the whole
+    two-stage mechanism switched itself off. The rejection disabled the very
+    machinery built to prevent it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        broke = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
+                             peak_equity=264.20, positions={})
+        flush = AccountState(equity=264.20, cash=3.5077021200000003,
+                             buying_power=3.5077021200000003,
+                             peak_equity=264.20, positions={})
+        exit_res = _approved(_exit_intent(), 3.5077021200000003, 0.062604)
+        plan = _plan(orch, [exit_res], broke)
+        plan.results = [exit_res, _rejected(_ssl_buy(), "min_cash_reserve_pct")]
+        h = _StagedHarness(orch, flush)
+        asyncio.run(orch._execute_staged(plan))
+        assert h.calls[0] == ["HPE"], h.calls          # exits first
+        assert h.calls[1] == ["SSL"], h.calls          # revived after the re-read
+
+
+def test_a_rejection_cash_cannot_fix_is_not_carried_forward():
+    """A no-trade-list block has nothing to do with money — re-running it would
+    only add a duplicate decision row saying the same thing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        broke = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
+                             peak_equity=264.20, positions={})
+        flush = AccountState(equity=264.20, cash=60.0, buying_power=60.0,
+                             peak_equity=264.20, positions={})
+        exit_res = _approved(_exit_intent(), 6.01, 0.125207)
+        plan = _plan(orch, [exit_res], broke)
+        plan.results = [exit_res, _rejected(_ssl_buy(), "no_trade_list")]
+        h = _StagedHarness(orch, flush)
+        asyncio.run(orch._execute_staged(plan))
+        assert h.calls == [["HPE"]]                    # single pass, no revival

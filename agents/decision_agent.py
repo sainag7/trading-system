@@ -165,7 +165,16 @@ def _offline_decision(
     min_trade = float(limits.get("min_trade_usd", 50))
 
     # Running state we keep within configured caps as we propose.
-    deployable = max(0.0, cash - min_cash_pct * equity)
+    #
+    # Prefer the budget the orchestrator already computed: it is measured against
+    # buying_power (settled `cash` reads $0.00 on a limited-margin account even
+    # when the book has money), it includes what this cycle's exits will free,
+    # and it is floored to the cent so it never overstates. Falling back to
+    # `cash` keeps this working for a summary built without those keys.
+    deployable = account_summary.get("deployable_cash_after_exits")
+    if deployable is None:
+        deployable = max(0.0, cash - min_cash_pct * equity)
+    deployable = max(0.0, float(deployable))
     sector_val: dict[str, float] = {}
     for p in positions.values():
         s = p.get("sector", "Unknown")

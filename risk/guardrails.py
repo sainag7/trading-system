@@ -22,13 +22,13 @@ Enforcement (thresholds read from ``config.yaml`` via :class:`config.RiskLimits`
   3. malformed qty      — REJECT zero / negative / missing quantities or prices.
   4. no_trade_list      — REJECT buys/adds on listed names (see note below).
   5. max_positions      — REJECT a buy that would OPEN a brand-new name past the cap.
-  6. per-trade cap      — RESIZE the order down to the cap (do NOT reject). The
-                          cap is min(per_trade_max_usd, per_trade_max_pct * equity),
-                          so it scales with the account.
-  7. max_position_pct   — REJECT a buy that would push a single name over the cap.
-  8. max_sector_pct     — REJECT a buy that would push a sector over the cap.
-  9. min_cash_reserve   — REJECT a buy that would spend below the cash floor.
-     buying power       — REJECT a buy that exceeds available buying power.
+  6. per-trade cap      — TRIM the order down to the cap. The cap is
+                          min(per_trade_max_usd, per_trade_max_pct * equity), so
+                          it scales with the account.
+  7. max_position_pct   — TRIM a buy to the room left under the per-name cap.
+  8. max_sector_pct     — TRIM a buy to the room left under the sector cap.
+  9. min_cash_reserve   — TRIM a buy to the spendable balance above the floor.
+     buying power       — TRIM a buy to the available buying power.
 
 Design note — three distinct stops:
   * KILL SWITCH blocks *every* order so the operator can freeze instantly.
@@ -39,8 +39,16 @@ Design note — three distinct stops:
     risk, which contradicts "favour rejecting" — the safer choice is to permit
     de-risking sells.
 
-Only the per-trade cap resizes; every other breach REJECTS the order so the
-upstream Decision Agent is forced to size within the caps.
+Every ceiling in 6-9 is a cap on SIZE, not a veto on the idea: an order larger
+than a cap is trimmed to fit, and only a cap with no tradeable room left rejects
+outright. This used to reject instead, which threw real trades away over rounding
+dust — on 2026-09-10 a $3.51 buy was dropped because $3.5077021200000003 was
+available, stranding the cash for a day. Trimming is strictly more conservative
+than the order requested: the result sits at or under a ceiling that was already
+declared acceptable.
+
+The stops in 0-5 are genuine vetoes and never trim — they are about *whether* to
+trade at all, not how much.
 """
 from __future__ import annotations
 
@@ -469,7 +477,7 @@ def validate_order(
         checks.append(CheckOutcome("requested_usd", False, "requested USD is zero"))
         return reject()
 
-    # --- per-trade cap: the ONLY cap that resizes (down) --------------------
+    # --- per-trade cap ------------------------------------------------------
     # Effective cap is the tighter of the absolute dollar ceiling and the
     # equity-scaled percentage, so a small book stays proportionally sized and
     # the cap grows with the account instead of needing a manual edit.
@@ -494,17 +502,84 @@ def validate_order(
         cap_usd=per_trade_cap,
     ))
 
-    # Convert to shares (honour the fractional-shares setting) BEFORE the
-    # cap checks, since flooring can only reduce the notional. Fractional shares
-    # are floored to the broker's tradeable precision (see MAX_SHARE_DECIMALS)
-    # and the notional is recomputed to match, so the recorded decision and the
-    # cap checks below use the exact size that will be sent.
+    # --- portfolio ceilings: TRIM to fit rather than veto -------------------
+    # Each ceiling below caps how LARGE this order may be, so an order over one
+    # is trimmed down to the room left under it — the same treatment the
+    # per-trade cap already gets. Only a ceiling with nothing left under it
+    # rejects. Rejecting on breach is what this did before, and it discarded
+    # whole trades over rounding dust (see the module docstring).
+    #
+    # Spendable is the broker's own `buying_power`, NOT the settled `cash`
+    # field, matching sweep_to_budget() and the orchestrator's account summary.
+    # On a cash account buying power already excludes unsettled proceeds; on a
+    # limited-margin account `cash` can read $0.00 against a healthy buying
+    # power, and measuring the reserve against it would then reject every buy
+    # the account could comfortably afford.
+    spendable = float(account.buying_power)
+    sector = _resolve_sector(intent, account)
+    max_position_value = float(limits.max_position_pct) * account.equity
+    max_sector_value = float(limits.max_sector_pct) * account.equity
+    cash_floor = float(limits.min_cash_reserve_pct) * account.equity
+    existing_pos = account.position_value(intent.ticker)
+    existing_sector = account.sector_value(sector)
+
+    # (check name, human label for the reason line, room left in USD, detail)
+    ceilings: list[tuple[str, str, float, str]] = [
+        ("max_position_pct", f"the {intent.ticker} position cap",
+         max_position_value - existing_pos,
+         f"{intent.ticker} holds ${existing_pos:,.2f} vs cap "
+         f"{limits.max_position_pct:.0%} = ${max_position_value:,.2f}"),
+        ("max_sector_pct", f"the '{sector or 'Unknown'}' sector cap",
+         max_sector_value - existing_sector,
+         f"sector '{sector or 'Unknown'}' holds ${existing_sector:,.2f} vs cap "
+         f"{limits.max_sector_pct:.0%} = ${max_sector_value:,.2f}"),
+        ("min_cash_reserve_pct", "the cash reserve floor",
+         spendable - cash_floor,
+         f"${spendable:,.2f} spendable vs reserve floor "
+         f"{limits.min_cash_reserve_pct:.0%} = ${cash_floor:,.2f}"),
+        ("buying_power", "buying power", spendable,
+         f"order ${approved_usd:,.2f} vs buying power ${spendable:,.2f}"),
+    ]
+
+    headroom = min(room for _, _, room, _ in ceilings)
+    sizing = min(approved_usd, max(0.0, headroom))
+    for name, _label, room, detail in ceilings:
+        checks.append(CheckOutcome(
+            name, room > EPS,
+            f"{detail}; room ${max(0.0, room):,.2f}, sizing ${sizing:,.2f}",
+            cap_usd=max(0.0, room),
+        ))
+
+    # Name every ceiling that is doing the binding, so the audit line says which
+    # limit actually cost the size rather than leaving it to be inferred.
+    binding = [label for _, label, room, _ in ceilings if room <= headroom + EPS]
+
+    if headroom <= EPS:
+        # Nothing tradeable left. Reject naming the limit — falling through to a
+        # generic "rounds to zero shares" would hide *which* cap is full.
+        reasons.append(
+            f"no room left under {' and '.join(binding)} "
+            f"(${max(0.0, headroom):,.2f} available)"
+        )
+        return reject()
+
+    if approved_usd > headroom + EPS:
+        reasons.append(
+            f"resized to ${headroom:,.2f}, limited by {' and '.join(binding)} "
+            f"(requested ${requested_usd:,.2f})"
+        )
+        approved_usd = headroom
+        resized = True
+
+    # Convert to shares LAST, once every cap has been applied. Flooring can only
+    # reduce the notional, so the recorded size is exactly what will be sent and
+    # is guaranteed to sit under every ceiling above. Fractional shares are
+    # floored to the broker's tradeable precision (see MAX_SHARE_DECIMALS).
     if limits.allow_fractional_shares:
         approved_shares = floor_shares(approved_usd / price)
-        approved_usd = approved_shares * price
     else:
         approved_shares = math.floor(approved_usd / price)
-        approved_usd = approved_shares * price
+    approved_usd = approved_shares * price
     if approved_shares <= 0:
         reasons.append("size rounds to zero shares")
         checks.append(CheckOutcome("share_quantity", False, "0 shares after rounding"))
@@ -516,73 +591,6 @@ def validate_order(
             f"size ${approved_usd:,.2f} is below the minimum trade ${limits.min_trade_usd:,.2f}"
         )
         checks.append(CheckOutcome("min_trade_usd", False, f"${approved_usd:,.2f} < min"))
-        return reject()
-
-    # --- max_position_pct: REJECT if it would push the name over the cap ----
-    max_position_value = limits.max_position_pct * account.equity
-    existing_pos = account.position_value(intent.ticker)
-    projected_pos = existing_pos + approved_usd
-    pos_ok = projected_pos <= max_position_value + EPS
-    checks.append(CheckOutcome(
-        "max_position_pct", pos_ok,
-        f"position would be ${projected_pos:,.2f} vs cap "
-        f"{limits.max_position_pct:.0%} = ${max_position_value:,.2f}",
-        cap_usd=max(0.0, max_position_value - existing_pos),
-    ))
-    if not pos_ok:
-        reasons.append(
-            f"would push {intent.ticker} to ${projected_pos:,.2f} > position cap "
-            f"${max_position_value:,.2f} ({limits.max_position_pct:.0%} of equity)"
-        )
-        return reject()
-
-    # --- max_sector_pct: REJECT if it would push the sector over the cap ----
-    sector = _resolve_sector(intent, account)
-    max_sector_value = limits.max_sector_pct * account.equity
-    existing_sector = account.sector_value(sector)
-    projected_sector = existing_sector + approved_usd
-    sector_ok = projected_sector <= max_sector_value + EPS
-    checks.append(CheckOutcome(
-        "max_sector_pct", sector_ok,
-        f"sector '{sector or 'Unknown'}' would be ${projected_sector:,.2f} vs cap "
-        f"{limits.max_sector_pct:.0%} = ${max_sector_value:,.2f}",
-        cap_usd=max(0.0, max_sector_value - existing_sector),
-    ))
-    if not sector_ok:
-        reasons.append(
-            f"would push sector '{sector or 'Unknown'}' to ${projected_sector:,.2f} > "
-            f"sector cap ${max_sector_value:,.2f} ({limits.max_sector_pct:.0%} of equity)"
-        )
-        return reject()
-
-    # --- min_cash_reserve_pct: REJECT if it would spend below the floor -----
-    cash_floor = limits.min_cash_reserve_pct * account.equity
-    cash_after = account.cash - approved_usd
-    cash_ok = cash_after >= cash_floor - EPS
-    checks.append(CheckOutcome(
-        "min_cash_reserve_pct", cash_ok,
-        f"cash after ${cash_after:,.2f} vs floor "
-        f"{limits.min_cash_reserve_pct:.0%} = ${cash_floor:,.2f}",
-        cap_usd=max(0.0, account.cash - cash_floor),
-    ))
-    if not cash_ok:
-        reasons.append(
-            f"would drop cash to ${cash_after:,.2f}, below the reserve floor "
-            f"${cash_floor:,.2f} ({limits.min_cash_reserve_pct:.0%} of equity)"
-        )
-        return reject()
-
-    # --- buying power: REJECT if it exceeds spendable buying power ----------
-    bp_ok = approved_usd <= account.buying_power + EPS
-    checks.append(CheckOutcome(
-        "buying_power", bp_ok,
-        f"order ${approved_usd:,.2f} vs buying power ${account.buying_power:,.2f}",
-        cap_usd=max(0.0, account.buying_power),
-    ))
-    if not bp_ok:
-        reasons.append(
-            f"order ${approved_usd:,.2f} exceeds buying power ${account.buying_power:,.2f}"
-        )
         return reject()
 
     return approve(approved_usd, approved_shares, resized)

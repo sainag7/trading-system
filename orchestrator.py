@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -62,6 +63,49 @@ from agents import explain_agent, llm
 
 def _now_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:6]
+
+
+def _floor_cents(usd: float) -> float:
+    """Round a budget DOWN to the cent, never up.
+
+    Budgets handed to the decision agent must never overstate the money that
+    exists. ``round()`` overstates half the time, and the agent is told to deploy
+    roughly all of what it is given: on 2026-09-10 a $3.507702 balance was
+    reported as $3.51, the agent proposed exactly $3.51, and the guardrails
+    rejected it for being $0.0023 short — the agent did exactly what it was told
+    and lost the trade for it. Flooring makes that failure impossible; the
+    sub-cent remainder is picked up by ``sweep_to_budget``, which works from the
+    exact figure.
+    """
+    return math.floor(float(usd) * 100.0) / 100.0
+
+
+# Guardrail checks whose failure the cycle's own exits can NEVER undo. A buy
+# rejected on any of these is not worth re-validating after the sells: the cash
+# changed, but none of these depend on cash, so the verdict would be identical
+# and the only result is a duplicate decision row in the log.
+_CASH_INDEPENDENT_CHECKS = frozenset({
+    "kill_switch",
+    "max_account_drawdown_halt_pct",
+    "daily_max_trades",     # stage 1's fills only push this further over
+    "no_trade_list",
+    "max_positions",
+    "price",
+    "buy_quantity",
+    "buy_notional",
+    "requested_usd",
+    "equity",
+})
+
+
+def _cash_could_fix(result) -> bool:
+    """Could the cash freed by this cycle's exits change this rejection?
+
+    True when every failed check is one that more buying power (or the room an
+    exit frees under a position/sector cap) could plausibly resolve.
+    """
+    failed = {c.name for c in result.checks if not c.passed}
+    return bool(failed) and not (failed & _CASH_INDEPENDENT_CHECKS)
 
 
 def _pending_exit_proceeds(exit_intents: list | None) -> float:
@@ -102,9 +146,12 @@ def _account_summary(acct: AccountState, limits=None,
         "equity": round(acct.equity, 2),
         "cash": round(acct.cash, 2),
         "buying_power": round(acct.buying_power, 2),
-        "deployable_cash": round(deployable, 2),
-        "expected_exit_proceeds": round(pending, 2),
-        "deployable_cash_after_exits": round(deployable + pending, 2),
+        # The three BUDGET figures floor; everything else here is display and
+        # rounds. See _floor_cents — an overstated budget gets the agent's order
+        # rejected for spending money that was never there.
+        "deployable_cash": _floor_cents(deployable),
+        "expected_exit_proceeds": _floor_cents(pending),
+        "deployable_cash_after_exits": _floor_cents(deployable + pending),
         "peak_equity": round(acct.peak_equity, 2),
         "drawdown_pct": round(acct.drawdown_pct() * 100, 2),
         "open_positions": acct.open_position_count(),
@@ -614,8 +661,22 @@ class Orchestrator:
         exits = [r for r in plan.approved if r.intent.side == Side.SELL]
         buys = [r for r in plan.approved if r.intent.side == Side.BUY]
 
+        # Buys the guardrails REJECTED at stage 1 for a reason the exits could
+        # plausibly resolve. Without this, a buy rejected for lack of cash never
+        # reaches stage 2 — so on 2026-09-10 `buys` was empty, the whole
+        # two-stage mechanism switched itself off, and the run took the
+        # single-stage path. The rejection disabled the machinery built to
+        # prevent it.
+        #
+        # This is safe because a carried-forward intent goes through the FULL
+        # validate_batch again against the freshly-read account: every check
+        # re-runs, nothing is bypassed, and the daily cap is re-counted below.
+        carried = [r for r in plan.results
+                   if r.intent.side == Side.BUY and not r.approved
+                   and _cash_could_fix(r)]
+
         # Nothing to sequence — one pass, exactly as before.
-        if not exits or not buys:
+        if not exits or not (buys or carried):
             await self._execute(plan.broker, plan.approved, plan.account)
             return
 
@@ -624,14 +685,17 @@ class Orchestrator:
         await self._execute(plan.broker, exits, plan.account)
 
         # ---- Stage 2: re-read, re-validate, then buy -----------------------
+        retry = buys + carried
         print(f"\n─── Stage 2 of 2: re-checking the account before "
-              f"{len(buys)} buy(s) ───")
+              f"{len(retry)} buy(s)"
+              + (f", {len(carried)} carried forward from a stage-1 rejection"
+                 if carried else "") + " ───")
         account = await self._read_account(plan.broker)
         if account is None:
             # The exits already succeeded; guessing at the balance would be the
             # only unsafe move here. Leave the cash for the next cycle.
             self.db.audit(self.run_id, "WARN", "post_exit_read_failed",
-                          {"skipped_buys": [r.intent.ticker for r in buys],
+                          {"skipped_buys": [r.intent.ticker for r in retry],
                            "note": "account unreadable after exits — buys skipped, "
                                    "cash left for the next cycle"})
             print("⚠️  Could not re-read the account after the exits — "
@@ -644,14 +708,14 @@ class Orchestrator:
         # Stage 1's fills consumed part of the daily budget; re-count so the
         # re-validation cannot overspend it.
         results = validate_batch(
-            [r.intent for r in buys], account, self.cfg.risk, self.db.trades_today(),
+            [r.intent for r in retry], account, self.cfg.risk, self.db.trades_today(),
             kill_switch=self.kill_switch_active(),
             audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
         )
         if getattr(self.cfg.risk, "sweep_cash_to_buys", False):
             results = sweep_to_budget(results, account, self.cfg.risk)
 
-        approved, before = [], {r.intent.ticker: r.approved_usd for r in buys}
+        approved, before = [], {r.intent.ticker: r.approved_usd for r in retry}
         print("\n🛡️  Guardrail re-check (against real post-exit cash):")
         for res in results:
             self.db.log_decision(self.run_id, res)
@@ -661,6 +725,7 @@ class Orchestrator:
         self.db.audit(self.run_id, "INFO", "buys_revalidated_post_exit", {
             "before": before,
             "after": {r.intent.ticker: round(r.approved_usd, 2) for r in approved},
+            "carried_forward": [r.intent.ticker for r in carried],
             "buying_power": round(account.buying_power, 2),
         })
 

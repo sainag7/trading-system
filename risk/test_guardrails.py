@@ -5,9 +5,11 @@ Run from the repo root:  pytest risk/test_guardrails.py -v
 These tests are the safety contract of the whole system. They cover every hard
 limit and its boundary values, plus the module's reject-favoring semantics:
 
-  * per_trade_max_usd is the ONLY cap that RESIZES (down).
-  * max_position_pct, max_sector_pct, min_cash_reserve_pct and buying power all
-    REJECT an offending buy rather than resizing it.
+  * per_trade_max_usd, max_position_pct, max_sector_pct, min_cash_reserve_pct
+    and buying power are all caps on SIZE: an oversized buy is TRIMMED to the
+    room left under them, and only a cap with no room left rejects. Each of
+    those has a paired "no room at all -> still rejected" case, so trimming can
+    never become a way to smuggle a zero-headroom order through.
   * The kill switch rejects EVERYTHING; the drawdown halt rejects buys but allows
     risk-reducing sells; the no-trade list blocks buys but allows exits.
   * Every decision is emitted to the optional audit sink.
@@ -160,13 +162,26 @@ def test_per_trade_pct_defaults_to_noop():
 
 
 # ===========================================================================
-# max_position_pct  (REJECT, not resize)
+# max_position_pct  (TRIM to the room left; reject only when there is none)
 # ===========================================================================
-def test_position_pct_over_cap_is_rejected():
-    # 15% of 10k = $1,500 cap. Request $2,000 (per-trade large) -> REJECT.
+def test_position_pct_over_cap_is_trimmed():
+    # 15% of 10k = $1,500 cap. Request $2,000 -> TRIM to $1,500, don't discard.
     res = validate_order(
         buy(usd=2000, price=100),
         account(equity=10_000, cash=10_000),
+        default_limits(per_trade_max_usd=10_000),
+    )
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(1_500.0)
+    assert any("position cap" in r for r in res.reasons)
+
+
+def test_position_pct_full_leaves_no_room_and_rejects():
+    # Already holding the whole $1,500 cap — nothing left to trim to.
+    res = validate_order(
+        buy(usd=500, price=100),
+        account(equity=10_000, cash=10_000,
+                positions=pos("AAPL", shares=15, market_value=1_500)),
         default_limits(per_trade_max_usd=10_000),
     )
     assert res.rejected
@@ -183,15 +198,16 @@ def test_position_pct_exactly_at_cap_is_approved():
     assert res.approved_usd == pytest.approx(1_500.0)
 
 
-def test_position_pct_existing_holding_pushes_over_cap_rejected():
-    # Hold $1,200 of AAPL; cap $1,500. A $500 add -> $1,700 > cap -> REJECT.
+def test_position_pct_existing_holding_trims_the_add():
+    # Hold $1,200 of AAPL; cap $1,500. A $500 add -> trimmed to the $300 of room.
     res = validate_order(
         buy(usd=500, price=100),
         account(equity=10_000, cash=10_000,
                 positions=pos("AAPL", shares=12, market_value=1_200)),
         default_limits(per_trade_max_usd=10_000),
     )
-    assert res.rejected
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(300.0)
     assert any("position cap" in r for r in res.reasons)
 
 
@@ -208,14 +224,27 @@ def test_position_pct_add_within_cap_approved():
 
 
 # ===========================================================================
-# max_sector_pct  (REJECT, not resize)
+# max_sector_pct  (TRIM to the room left; reject only when there is none)
 # ===========================================================================
-def test_sector_pct_over_cap_is_rejected():
-    # 40% of 10k = $4,000 sector cap. Already $3,800 Tech; +$500 -> $4,300 -> REJECT.
+def test_sector_pct_over_cap_is_trimmed():
+    # 40% of 10k = $4,000 sector cap. Already $3,800 Tech; a $500 buy trims to $200.
     res = validate_order(
         buy(ticker="AAPL", usd=500, price=100, sector="Technology"),
         account(equity=10_000, cash=10_000,
                 positions=pos("MSFT", shares=10, avg_cost=380, market_value=3_800)),
+        default_limits(per_trade_max_usd=10_000),
+    )
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(200.0)
+    assert any("sector cap" in r for r in res.reasons)
+
+
+def test_sector_pct_full_leaves_no_room_and_rejects():
+    # Tech already at the full $4,000 cap — nothing left to trim to.
+    res = validate_order(
+        buy(ticker="AAPL", usd=500, price=100, sector="Technology"),
+        account(equity=10_000, cash=10_000,
+                positions=pos("MSFT", shares=10, avg_cost=400, market_value=4_000)),
         default_limits(per_trade_max_usd=10_000),
     )
     assert res.rejected
@@ -247,24 +276,31 @@ def test_sector_cap_isolated_per_sector():
 
 
 # ===========================================================================
-# min_cash_reserve_pct  (REJECT — never spend below the floor)
+# min_cash_reserve_pct  (TRIM to the balance above the floor)
+#
+# The floor is measured against buying_power, not the settled `cash` field —
+# see the comment in validate_order. On limited margin Robinhood reports
+# cash: 0.00 against a healthy buying power, and measuring the reserve on
+# `cash` would reject every buy the account could actually afford.
 # ===========================================================================
-def test_cash_reserve_breach_is_rejected():
-    # equity 10k, 10% floor = $1,000. cash 1,200; a $500 buy -> $700 < floor -> REJECT.
+def test_cash_reserve_breach_is_trimmed_to_the_floor():
+    # equity 10k, 10% floor = $1,000, buying power 1,200 -> $200 deployable.
+    # A $500 buy is trimmed to $200 rather than discarded.
     res = validate_order(
         buy(usd=500, price=100),
-        account(equity=10_000, cash=1_200, buying_power=10_000),
+        account(equity=10_000, cash=1_200, buying_power=1_200),
         default_limits(per_trade_max_usd=10_000),
     )
-    assert res.rejected
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(200.0)
     assert any("reserve floor" in r for r in res.reasons)
 
 
 def test_cash_reserve_exactly_at_floor_approved():
-    # cash 1,500; $500 buy -> exactly $1,000 == floor -> APPROVE.
+    # buying power 1,500; $500 buy -> exactly $1,000 == floor -> APPROVE untouched.
     res = validate_order(
         buy(usd=500, price=100),
-        account(equity=10_000, cash=1_500, buying_power=10_000),
+        account(equity=10_000, cash=1_500, buying_power=1_500),
         default_limits(per_trade_max_usd=10_000),
     )
     assert res.approved and not res.resized
@@ -272,22 +308,55 @@ def test_cash_reserve_exactly_at_floor_approved():
 
 
 def test_cash_reserve_blocks_when_already_below_floor():
+    # Below the floor already: headroom is negative, so there is nothing to
+    # trim to and the order is still rejected outright.
     res = validate_order(
         buy(usd=100, price=100),
-        account(equity=10_000, cash=800, buying_power=10_000),
+        account(equity=10_000, cash=800, buying_power=800),
         default_limits(per_trade_max_usd=10_000),
     )
     assert res.rejected
+    assert any("reserve floor" in r for r in res.reasons)
+
+
+def test_cash_reserve_measured_against_buying_power_not_settled_cash():
+    """Limited margin: proceeds are spendable before they settle.
+
+    Robinhood reports settled `cash` as 0.00 while buying_power carries the
+    unsettled proceeds. Measuring the reserve against `cash` rejected every buy
+    the account could comfortably afford — the same stranding bug that was
+    already fixed in sweep_to_budget().
+    """
+    res = validate_order(
+        buy(usd=100, price=100),
+        account(equity=1_000, cash=0.0, buying_power=200.0),
+        default_limits(per_trade_max_usd=10_000, min_cash_reserve_pct=0.10),
+    )
+    assert res.approved and not res.resized      # floor $100, room $100
+    assert res.approved_usd == pytest.approx(100.0)
 
 
 # ===========================================================================
-# buying power  (REJECT)
+# buying power  (TRIM to what is spendable)
 # ===========================================================================
-def test_buying_power_insufficient_is_rejected():
+def test_buying_power_insufficient_is_trimmed():
     res = validate_order(
         buy(usd=500, price=100),
         account(equity=100_000, cash=100_000, buying_power=250),
-        default_limits(per_trade_max_usd=10_000),
+        default_limits(per_trade_max_usd=10_000, min_cash_reserve_pct=0.0,
+                       max_position_pct=1.0),
+    )
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(250.0)
+    assert any("buying power" in r for r in res.reasons)
+
+
+def test_no_buying_power_at_all_is_rejected():
+    res = validate_order(
+        buy(usd=500, price=100),
+        account(equity=100_000, cash=0.0, buying_power=0.0),
+        default_limits(per_trade_max_usd=10_000, min_cash_reserve_pct=0.0,
+                       max_position_pct=1.0),
     )
     assert res.rejected
     assert any("buying power" in r for r in res.reasons)
@@ -612,15 +681,16 @@ def test_buy_sized_by_shares_when_usd_absent():
 # ===========================================================================
 # precedence: which breach is reported first
 # ===========================================================================
-def test_per_trade_resize_then_position_reject():
-    # $2,000 request, per-trade $500 -> resized to $500; but position cap is $300
-    # of room -> the resized $500 still breaches the position cap -> REJECT.
+def test_per_trade_resize_then_position_trim():
+    # $2,000 request, per-trade $500 -> trimmed to $500; the position cap leaves
+    # only $300 of room -> trimmed again, to $300. Caps compose, tightest wins.
     res = validate_order(
         buy(ticker="AAPL", usd=2000, price=100, sector="Technology"),
         account(equity=2_000, cash=2_000),  # 15% of 2k = $300 position cap
         default_limits(per_trade_max_usd=500, min_cash_reserve_pct=0.0),
     )
-    assert res.rejected
+    assert res.approved and res.resized
+    assert res.approved_usd == pytest.approx(300.0)
     assert any("position cap" in r for r in res.reasons)
 
 
@@ -635,21 +705,26 @@ def test_batch_daily_limit_cuts_off_after_n_trades():
     assert sum(1 for r in results if r.approved) == 5  # 6th and 7th blocked
 
 
-def test_batch_cumulative_cash_reserve_rejects_later_buys():
-    # cash 2,000, equity 10k, floor $1,000 -> only ~$1,000 deployable.
+def test_batch_cumulative_cash_reserve_trims_then_stops():
+    # buying power 2,000, equity 10k, floor $1,000 -> $1,000 deployable across
+    # the batch. Two buys fit whole, the third is trimmed to the last $200, and
+    # the rest are rejected with nothing left. The batch never exceeds the floor.
     intents = [buy(ticker=f"T{i}", usd=400, price=100, sector=f"S{i}") for i in range(5)]
-    acct = account(equity=10_000, cash=2_000, buying_power=10_000)
+    acct = account(equity=10_000, cash=2_000, buying_power=2_000)
     results = validate_batch(intents, acct, default_limits(
         per_trade_max_usd=10_000, min_cash_reserve_pct=0.10,
         max_position_pct=1.0, max_sector_pct=1.0))
     approved = [r for r in results if r.approved]
     total = sum(r.approved_usd for r in approved)
-    assert len(approved) == 2 and total == pytest.approx(800.0)  # 3rd would breach floor
+    assert [round(r.approved_usd, 2) for r in approved] == [400.0, 400.0, 200.0]
+    assert total == pytest.approx(1_000.0)
     assert total <= 1_000.0 + 1e-6
+    assert results[3].rejected and results[4].rejected
 
 
-def test_batch_cumulative_sector_cap_rejects_second():
-    # Two tech buys that each fit but together breach the 40% sector cap.
+def test_batch_cumulative_sector_cap_trims_second():
+    # Two tech buys that each fit but together breach the 40% sector cap: the
+    # second is trimmed to the remaining $1,000 rather than dropped.
     intents = [
         buy(ticker="AAPL", usd=3000, price=100, sector="Technology"),
         buy(ticker="MSFT", usd=3000, price=100, sector="Technology"),
@@ -657,7 +732,9 @@ def test_batch_cumulative_sector_cap_rejects_second():
     acct = account(equity=10_000, cash=10_000)
     results = validate_batch(intents, acct, default_limits(
         per_trade_max_usd=10_000, max_position_pct=1.0, max_sector_pct=0.40))
-    assert results[0].approved and results[1].rejected
+    assert results[0].approved and not results[0].resized
+    assert results[1].approved and results[1].resized
+    assert results[1].approved_usd == pytest.approx(1_000.0)
     total_tech = sum(r.approved_usd for r in results if r.approved)
     assert total_tech <= 4_000.0 + 1e-6
 
@@ -681,9 +758,11 @@ def test_audit_logs_modified_on_resize():
 
 
 def test_audit_logs_rejected():
+    # No buying power at all: nothing to trim to, so this really is a rejection.
     events = []
-    validate_order(buy(usd=2000, price=100), account(equity=10_000, cash=10_000),
-                   default_limits(per_trade_max_usd=10_000),
+    validate_order(buy(usd=2000, price=100),
+                   account(equity=10_000, cash=0.0, buying_power=0.0),
+                   default_limits(per_trade_max_usd=10_000, min_cash_reserve_pct=0.0),
                    audit=lambda lvl, ev, det: events.append((lvl, ev)))
     assert ("WARN", "guardrail_rejected") in events
 
@@ -909,3 +988,75 @@ def test_floor_shares_never_rounds_a_sell_above_the_holding():
     from risk.guardrails import floor_shares
     for held in (0.125207, 0.999999, 1.0000004, 0.0000019):
         assert floor_shares(held) <= held
+
+
+# ===========================================================================
+# Regression: the 2026-09-10 SSL rejection
+# ===========================================================================
+def test_a_buy_two_tenths_of_a_cent_over_the_cash_is_trimmed_not_dropped():
+    """The exact numbers from the live run that prompted this change.
+
+    The Monitor sold $3.5077021200000003 of HPE. The budget was reported to the
+    decision agent as $3.51 (``round`` rounding UP), so it proposed a $3.51 SSL
+    buy — and the guardrails rejected it for being $0.0023 short, printing the
+    now-infamous "would drop cash to $-0.00, below the reserve floor $0.00".
+
+    A fifth of a cent must never cost a whole trade.
+    """
+    proceeds = 3.5077021200000003
+    res = validate_order(
+        buy(ticker="SSL", usd=3.51, price=14.02, sector="Materials"),
+        account(equity=264.20, cash=proceeds, buying_power=proceeds),
+        default_limits(per_trade_max_usd=500.0, per_trade_max_pct=1.0,
+                       max_position_pct=1.0, max_sector_pct=1.0,
+                       min_cash_reserve_pct=0.0, min_trade_usd=1.0,
+                       max_positions=None),
+    )
+    assert res.approved, res.reasons
+    assert res.resized
+    assert res.approved_usd <= proceeds + 1e-9      # never spends what isn't there
+    assert res.approved_usd == pytest.approx(proceeds, abs=0.02)
+
+
+def test_a_trim_never_lands_above_the_cap_that_caused_it():
+    """Property check: whatever binds, the approved size stays under it."""
+    for cash in (0.51, 3.5077021200000003, 12.34, 99.999999, 250.0):
+        res = validate_order(
+            buy(ticker="SSL", usd=1_000.0, price=14.02, sector="Materials"),
+            account(equity=1_000.0, cash=cash, buying_power=cash),
+            default_limits(per_trade_max_usd=10_000.0, per_trade_max_pct=1.0,
+                           max_position_pct=1.0, max_sector_pct=1.0,
+                           min_cash_reserve_pct=0.0, min_trade_usd=0.5,
+                           max_positions=None),
+        )
+        if res.approved:
+            assert res.approved_usd <= cash + 1e-9, (cash, res.approved_usd)
+
+
+def test_a_trimmed_size_still_respects_the_share_precision():
+    from risk.guardrails import MAX_SHARE_DECIMALS
+    from decimal import Decimal
+
+    res = validate_order(
+        buy(ticker="SSL", usd=3.51, price=14.02, sector="Materials"),
+        account(equity=264.20, cash=3.5077021200000003,
+                buying_power=3.5077021200000003),
+        default_limits(per_trade_max_usd=500.0, per_trade_max_pct=1.0,
+                       max_position_pct=1.0, max_sector_pct=1.0,
+                       min_cash_reserve_pct=0.0, min_trade_usd=1.0,
+                       max_positions=None),
+    )
+    exponent = Decimal(str(res.approved_shares)).as_tuple().exponent
+    assert max(0, -exponent) <= MAX_SHARE_DECIMALS
+
+
+def test_a_trim_below_the_minimum_trade_is_still_rejected():
+    """Trimming must not smuggle a dust order past min_trade_usd."""
+    res = validate_order(
+        buy(usd=500, price=100),
+        account(equity=10_000, cash=10.0, buying_power=10.0),
+        default_limits(per_trade_max_usd=10_000, min_cash_reserve_pct=0.0,
+                       max_position_pct=1.0, min_trade_usd=50.0),
+    )
+    assert res.rejected
+    assert any("minimum trade" in r for r in res.reasons)

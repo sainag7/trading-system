@@ -304,10 +304,12 @@ accounts:
       # Every percentage ceiling below is set to "no cap" so the agent's own
       # conviction sizing reaches the broker unmodified. A fixed fraction of
       # equity (formerly 0.30 -> $30 on a $100 book) silently resized the agent's
-      # judgement down; worse, a ceiling the agent exceeds does not trim the
-      # order, it REJECTS it outright (only the per-trade cap resizes — see the
-      # enforcement list in risk/guardrails.py), so a high-conviction idea was
-      # dropped entirely rather than placed smaller.
+      # judgement down to a number with nothing to do with its conviction.
+      #
+      # These were ALSO the workaround for a ceiling rejecting an oversized buy
+      # outright instead of trimming it. Every cap now trims to the room left and
+      # rejects only when there is none, so that second reason is gone — but the
+      # sizing argument above stands on its own, and these stay at "no cap".
       #
       # What still bounds this account: `per_trade_max_usd`, available buying
       # power, `max_equity_guard` above, and the kill switch. This is a
