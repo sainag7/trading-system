@@ -476,7 +476,7 @@ def _rejected(intent, failed_check: str) -> GuardrailResult:
     )
 
 
-def _ssl_buy(usd=3.51):
+def _ssl_buy(usd: float = 3.51):
     return OrderIntent(ticker="SSL", side=Side.BUY, action="buy",
                        usd_amount=usd, price=14.02, sector="Materials")
 
@@ -485,27 +485,48 @@ def test_stage_one_cash_rejection_gets_a_second_look_after_the_exits():
     """The 2026-09-10 failure mode: SSL was rejected at stage 1 for being $0.0023
     short, so it never entered plan.approved — `buys` was empty, and the whole
     two-stage mechanism switched itself off. The rejection disabled the very
-    machinery built to prevent it.
-
-    The original day's figure was $3.51; the same shape is reproduced at $13.51
-    because the agentic overlay's min_trade_usd is now $5 and a $3.51 buy would
-    be rejected on the floor rather than revived — a different rule, tested
-    elsewhere."""
+    machinery built to prevent it. (The exit here frees enough to clear the
+    minimum-position floor and the $5 minimum trade; the sub-floor case is the
+    next test.)"""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
         orch.cfg.apply_account("agentic")
         broke = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
                              peak_equity=264.20, positions={})
-        flush = AccountState(equity=264.20, cash=13.5077021200000003,
-                             buying_power=13.5077021200000003,
+        flush = AccountState(equity=264.20, cash=20.0077021200000003,
+                             buying_power=20.0077021200000003,
                              peak_equity=264.20, positions={})
-        exit_res = _approved(_exit_intent(), 13.5077021200000003, 0.281409)
+        exit_res = _approved(_exit_intent(), 20.0077021200000003, 0.35)
         plan = _plan(orch, [exit_res], broke)
-        plan.results = [exit_res, _rejected(_ssl_buy(13.51), "min_cash_reserve_pct")]
+        plan.results = [exit_res, _rejected(_ssl_buy(20.01), "min_cash_reserve_pct")]
         h = _StagedHarness(orch, flush)
         asyncio.run(orch._execute_staged(plan))
         assert h.calls[0] == ["HPE"], h.calls          # exits first
         assert h.calls[1] == ["SSL"], h.calls          # revived after the re-read
+
+
+def test_revived_buy_under_the_minimum_position_is_dropped_not_placed():
+    """The same 09-10 shape, but the exit only frees $3.51 — 1.3% of the book.
+    The carry-forward still gets its second look, and the floors then drop it:
+    a $3.51 SSL position can never matter, so the cash waits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        broke = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
+                             peak_equity=264.20, positions={})
+        flush = AccountState(equity=264.20, cash=3.5077021200000003,
+                             buying_power=3.5077021200000003,
+                             peak_equity=264.20, positions={})
+        exit_res = _approved(_exit_intent(), 3.5077021200000003, 0.062604)
+        plan = _plan(orch, [exit_res], broke)
+        plan.results = [exit_res, _rejected(_ssl_buy(), "min_cash_reserve_pct")]
+        h = _StagedHarness(orch, flush)
+        asyncio.run(orch._execute_staged(plan))
+        assert h.calls == [["HPE"]], h.calls           # exit placed, dust buy not
+        rows = orch.db.query(
+            "select approved, reasons from decisions where ticker='SSL' order by id desc limit 1")
+        assert rows and rows[0]["approved"] == 0
+        assert "minimum" in rows[0]["reasons"]
 
 
 def test_a_rejection_cash_cannot_fix_is_not_carried_forward():
@@ -536,29 +557,54 @@ def _seed_plan(orch, ticker="HPE", account="806", **kw):
                               peak_price=48.0, account=account, **kw)
 
 
+def _settle(orch, ticker, *, sold, pre_shares, action="exit_full", trigger="stop_loss",
+            shares=None):
+    """Drive _settle_plan_after_sell the way _execute does."""
+    from execution.executor import OrderResult
+    intent = OrderIntent(ticker=ticker, side=Side.SELL, action=action, shares=shares,
+                         price=50.0, trigger=trigger)
+    res = GuardrailResult(intent=intent, approved=True, approved_usd=sold * 50.0,
+                          approved_shares=sold, resized=False, reasons=["approved"],
+                          checks=[])
+    orch._settle_plan_after_sell(intent, res, pre_shares,
+                                 OrderResult(ok=True, status="filled", filled_qty=sold,
+                                             fill_price=50.0))
+
+
 def test_full_exit_deletes_the_plan():
     """Seven of twelve plan rows were stale on 2026-09-15 because nothing ever
     deleted one. A confirmed sell of the whole position must remove it."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
-        _seed_plan(orch)
-        orch._settle_plan_after_sell("HPE", sold=0.125207, pre_shares=0.125207)
-        assert "HPE" not in orch.db.get_trade_plans()
+        orch.cfg.apply_account("agentic")
+        acct = orch.cfg.account_number
+        _seed_plan(orch, account=acct)
+        _settle(orch, "HPE", sold=0.125207, pre_shares=0.125207)
+        assert "HPE" not in orch.db.get_trade_plans(account=acct)
         events = [r["event"] for r in orch.db.query(
             "SELECT event FROM audit_log WHERE run_id=?", (orch.run_id,))]
         assert "trade_plan_closed" in events
 
 
 def test_partial_exit_keeps_the_plan_and_marks_it_scaled_out():
-    """A half-trim leaves a live position: the plan stays, flagged so the next
-    stop hit closes the remainder instead of halving it again."""
+    """A half-trim on a trailing stop leaves a live position: the plan stays,
+    flagged so the next stop hit closes the remainder instead of halving it
+    again. A take-profit partial flags tp_taken instead."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
-        _seed_plan(orch)
-        orch._settle_plan_after_sell("HPE", sold=0.062604, pre_shares=0.125207)
-        plan = orch.db.get_trade_plans()["HPE"]
-        assert plan["scaled_out"] == 1
+        orch.cfg.apply_account("agentic")
+        acct = orch.cfg.account_number
+        _seed_plan(orch, account=acct)
+        _settle(orch, "HPE", sold=0.062604, pre_shares=0.125207, action="exit_partial",
+                trigger="stop_trail", shares=0.062604)
+        plan = orch.db.get_trade_plans(account=acct)["HPE"]
+        assert plan["scaled_out"] == 1 and plan["tp_taken"] == 0
         assert plan["stop_loss"] == 44.0          # levels untouched
+        _seed_plan(orch, "NTAP", account=acct)
+        _settle(orch, "NTAP", sold=0.1, pre_shares=0.2, action="exit_partial",
+                trigger="take_profit", shares=0.1)
+        plan = orch.db.get_trade_plans(account=acct)["NTAP"]
+        assert plan["tp_taken"] == 1 and plan["scaled_out"] == 0
 
 
 def test_full_exit_tolerates_broker_share_rounding():
@@ -566,9 +612,12 @@ def test_full_exit_tolerates_broker_share_rounding():
     still read as a full exit, not a partial that leaves a 1e-7 share stub."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
-        _seed_plan(orch)
-        orch._settle_plan_after_sell("HPE", sold=0.125207, pre_shares=0.1252071)
-        assert "HPE" not in orch.db.get_trade_plans()
+        orch.cfg.apply_account("agentic")
+        acct = orch.cfg.account_number
+        _seed_plan(orch, account=acct)
+        _settle(orch, "HPE", sold=0.125207, pre_shares=0.1252071, action="exit_partial",
+                trigger="stop_trail", shares=0.125207)
+        assert "HPE" not in orch.db.get_trade_plans(account=acct)
 
 
 def test_prune_only_touches_the_matching_account():
@@ -581,25 +630,27 @@ def test_prune_only_touches_the_matching_account():
         _seed_plan(orch, "LEGACY", account=None)
         # Pruning against the OTHER account: nothing of 806's is touched.
         assert orch.db.prune_trade_plans(held=["ORCL"], account="750") == []
-        assert set(orch.db.get_trade_plans()) == {"HPE", "SCCO", "LEGACY"}
+        assert set(orch.db.get_trade_plans(account="806")) == {"HPE", "SCCO"}
         # Pruning against 806 with only SCCO held: HPE goes, LEGACY (no
         # account) is never auto-pruned, SCCO stays.
         assert orch.db.prune_trade_plans(held=["SCCO"], account="806") == ["HPE"]
-        assert set(orch.db.get_trade_plans()) == {"SCCO", "LEGACY"}
+        assert set(orch.db.get_trade_plans(account="806")) == {"SCCO"}
+        assert set(orch.db.get_trade_plans(account=None)) == {"LEGACY"}
         # No account means no pruning at all.
         assert orch.db.prune_trade_plans(held=[], account=None) == []
 
 
 def test_get_trade_plans_is_account_scoped():
     """The individual account's Monitor must not read the agentic account's
-    stops for a ticker both happen to hold."""
+    stops for a ticker both happen to hold — and a legacy row (no account) is
+    not visible to either: it belongs to single-account mode only."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
         _seed_plan(orch, "NVDA", account="806")
         _seed_plan(orch, "OLD", account=None)
-        assert set(orch.db.get_trade_plans(account="806")) == {"NVDA", "OLD"}
-        assert set(orch.db.get_trade_plans(account="750")) == {"OLD"}
-        assert set(orch.db.get_trade_plans()) == {"NVDA", "OLD"}
+        assert set(orch.db.get_trade_plans(account="806")) == {"NVDA"}
+        assert set(orch.db.get_trade_plans(account="750")) == set()
+        assert set(orch.db.get_trade_plans()) == {"OLD"}
 
 
 def test_finalize_prunes_against_a_populated_read_only():
@@ -627,6 +678,6 @@ def test_finalize_prunes_against_a_populated_read_only():
         orch._read_account = _read                      # type: ignore[method-assign]
 
         asyncio.run(orch._finalize_run(broker=object()))   # empty read
-        assert set(orch.db.get_trade_plans()) == {"HPE", "SCCO"}
+        assert set(orch.db.get_trade_plans(account=acct_no)) == {"HPE", "SCCO"}
         asyncio.run(orch._finalize_run(broker=object()))   # SCCO only
-        assert set(orch.db.get_trade_plans()) == {"SCCO"}
+        assert set(orch.db.get_trade_plans(account=acct_no)) == {"SCCO"}

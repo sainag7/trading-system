@@ -276,6 +276,10 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 }
 .tbl td { padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 .tbl tr:last-child td { border-bottom: none; }
+/* A row followed by a full-width detail line (Learning tab): the pair reads as
+   one entry, so only the detail row carries the divider. */
+.tbl tr.has-detail td { border-bottom: none; padding-bottom: 4px; }
+.tbl tr.detail-row:hover { background: transparent; }
 .tbl tbody tr { transition: background 120ms; }
 .tbl tbody tr:hover { background: var(--surface-hover); }
 .tbl .num { text-align: right; font-variant-numeric: tabular-nums; }

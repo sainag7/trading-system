@@ -83,6 +83,15 @@ export const api = {
   diagnostics: () => get("/diagnostics"),
   runDiagnostic: (name: string) => post(`/diagnostics/${name}`),
 
+  // review agent (Learning tab)
+  review: (account?: string) =>
+    get("/review" + (account ? `?account=${encodeURIComponent(account)}` : "")),
+  reviewRun: (account?: string) => post("/review/run", { account }),
+  reviewApply: (id: number) => post(`/review/proposals/${id}/apply`),
+  reviewDismiss: (id: number) => post(`/review/proposals/${id}/dismiss`),
+  reviewRetire: (id: string, account?: string) =>
+    post(`/review/lessons/${encodeURIComponent(id)}/retire`, { account }),
+
   // jobs
   job: (id: string) => get(`/jobs/${id}`),
   jobStreamUrl: (id: string) => `${BASE}/jobs/${id}/stream`,

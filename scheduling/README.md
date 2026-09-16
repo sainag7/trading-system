@@ -1,12 +1,13 @@
 # Scheduling — run the agents once per trading day
 
 This is a **daily-cadence** system (free-tier daily bars, ~25 quotes/day). It is
-designed to run **once per trading day**, not continuously intraday. Two jobs:
+designed to run **once per trading day**, not continuously intraday. Three jobs:
 
-| Job | Time (local) | Command | What it does |
-|-----|--------------|---------|--------------|
+| Job | Time (ET) | Command | What it does |
+|-----|-----------|---------|--------------|
 | Individual advice | 10:00, weekdays | `--mode recommend --account individual` | Reads your ~$3k account **read-only** and produces advice. Never trades. |
-| Agentic autonomous | 10:05, weekdays | `--mode live --yes --profile momentum --account agentic` | Trades the **$100** agentic account hands-off, within guardrails. |
+| Agentic autonomous | 10:05, weekdays | `--mode live --yes --account agentic` | Trades the agentic account hands-off, within guardrails. |
+| Agentic review | 16:30, weekdays | `--mode review --account agentic` | **Post-close learning pass**: scores every closed trade and every call the agents made, writes lessons + a playbook into the next morning's prompts, applies bounded parameter proposals. Read-only. Installed with `--enable-live`. |
 
 Running ~30–60 min after the 9:30 ET open lets the opening auction settle. The
 orchestrator's **market-day gate** (`market.py`) makes any weekend/NYSE-holiday
@@ -52,8 +53,12 @@ Robinhood app, then enable the autonomous job with `install.sh --enable-live`.
 - **cron alternative** (if you prefer): the wrapper is cron-friendly —
   ```cron
   0  10 * * 1-5  /ABS/PATH/trading-system/scheduling/run.sh --mode recommend --account individual
-  5  10 * * 1-5  /ABS/PATH/trading-system/scheduling/run.sh --mode live --yes --profile momentum --account agentic
+  5  10 * * 1-5  /ABS/PATH/trading-system/scheduling/run.sh --mode live --yes --account agentic
+  30 16 * * 1-5  /ABS/PATH/trading-system/scheduling/run.sh --mode review --account agentic
   ```
+- **Review output:** `reports/YYYY-MM-DD-review.md` plus a "Trading review ready"
+  notification with the day summary; lessons, proposals and the scorecard are
+  in the dashboard's **Learning** tab.
 - **Holidays:** `market.py` carries the NYSE holiday list; extend `NYSE_HOLIDAYS`
   a year ahead periodically.
 - **Reliability:** the account read is model-mediated (~85% reliable). The

@@ -48,13 +48,16 @@ def test_agentic_overlay_applies_100dollar_risk():
         # and not $1 (which let a $1.76 buy through — pure spread).
         assert r.min_trade_usd == 5.0, r.min_trade_usd
         assert r.min_trade_usd < base_min_trade
-        # Sizing on this account is the decision agent's call: EVERY percentage
-        # ceiling is off. A ceiling the agent exceeds does not trim the order, it
-        # rejects it outright (only the per-trade cap resizes), so a cap here
-        # would drop high-conviction ideas rather than place them smaller.
+        # Sizing on this account is the decision agent's call within ONE ceiling:
+        # the per-trade percentage cap stays off, but the per-name cap is back at
+        # 35% — caps trim now instead of rejecting, and the 54%-of-book NVDA add
+        # was the account's entire realized loss.
         assert r.per_trade_max_pct == 1.0, r.per_trade_max_pct
-        assert r.max_position_pct == 1.0, r.max_position_pct
+        assert r.max_position_pct == 0.35, r.max_position_pct
         assert r.min_cash_reserve_pct == 0.0, r.min_cash_reserve_pct
+        # The smallest position worth holding: max($10, 5% of equity).
+        assert r.min_position_usd == 10.0, r.min_position_usd
+        assert r.min_position_pct == 0.05, r.min_position_pct
         # Discovered tickers often have no sector, so they all collapse into one
         # "Unknown" bucket; the sector cap is disabled here on purpose.
         assert r.max_sector_pct == 1.0, r.max_sector_pct

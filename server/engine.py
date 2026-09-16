@@ -28,7 +28,7 @@ def prepare_config(*, mode: str,
 
     role = account
     if role is None and cfg.accounts:
-        role = "agentic" if mode in ("preview", "live") else "individual"
+        role = "agentic" if mode in ("preview", "live", "review") else "individual"
     active = None
     if role:
         try:
@@ -50,6 +50,15 @@ async def run_scan(account: str | None = None) -> dict:
     orch = orch_mod.Orchestrator(cfg)
     await orch.run_cycle()
     return {"run_id": orch.run_id, "mode": "recommend", "account": role}
+
+
+async def run_review(account: str | None = None) -> dict:
+    """Post-close review (read-only — never trades). Defaults to the agentic
+    book, the one that has trades to learn from."""
+    cfg, role, _ = prepare_config(mode="review", account=account)
+    orch = orch_mod.Orchestrator(cfg)
+    result = await orch.run_review()
+    return {"run_id": orch.run_id, "mode": "review", "account": role, **result}
 
 
 async def run_research(ticker: str) -> dict:

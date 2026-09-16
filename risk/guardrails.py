@@ -29,6 +29,9 @@ Enforcement (thresholds read from ``config.yaml`` via :class:`config.RiskLimits`
   8. max_sector_pct     — TRIM a buy to the room left under the sector cap.
   9. min_cash_reserve   — TRIM a buy to the spendable balance above the floor.
      buying power       — TRIM a buy to the available buying power.
+ 10. min_position       — after the cash sweep, REJECT a buy whose resulting
+                          position would still be too small to matter
+                          (``validate_batch(sweep=...)`` / enforce_min_position).
 
 Design note — three distinct stops:
   * KILL SWITCH blocks *every* order so the operator can freeze instantly.
@@ -80,6 +83,14 @@ def floor_shares(qty: float) -> float:
     return math.floor(float(qty) * _SHARE_SCALE) / _SHARE_SCALE
 
 
+def min_position_floor(limits, equity: float) -> float:
+    """The smallest position worth holding: max of the dollar floor and the
+    equity fraction (see ``config.RiskLimits.min_position_usd``). 0 when off."""
+    usd = float(getattr(limits, "min_position_usd", 0.0) or 0.0)
+    pct = float(getattr(limits, "min_position_pct", 0.0) or 0.0)
+    return max(usd, pct * float(equity or 0.0))
+
+
 class Side(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
@@ -117,6 +128,11 @@ class OrderIntent:
     # the order is EXEMPT from the daily-trade cap so a protective sell can always
     # fire. The kill switch still blocks it; take-profit trims are NOT protective.
     protective_exit: bool = False
+    # Which Monitor rule produced a SELL (stop_loss | stop_trail | time_stop |
+    # thesis_break | take_profit), or None for decision-agent orders. Carried so
+    # execution can record e.g. "the take-profit was banked" without parsing the
+    # rationale string.
+    trigger: str | None = None
 
     def __post_init__(self) -> None:
         self.ticker = self.ticker.upper()
@@ -604,6 +620,7 @@ def validate_batch(
     *,
     kill_switch: bool = False,
     audit: Callable[[str, str, dict], None] | None = None,
+    sweep: bool = False,
 ) -> list[GuardrailResult]:
     """Validate a list of intents *sequentially*, accounting for cumulative use.
 
@@ -612,6 +629,12 @@ def validate_batch(
     second buy in a batch is validated against the state the first one would
     leave behind. This prevents a batch from collectively breaching a limit that
     each order individually respects.
+
+    ``sweep=True`` runs :func:`sweep_to_budget` over the approved buys afterwards.
+    The minimum-position floor is enforced strictly AFTER that sweep, so a small
+    proposal that the idle cash would have topped up is raised first and only a
+    buy the money genuinely cannot lift over the floor is dropped. Cash that a
+    dropped buy releases is swept once more into the survivors.
     """
     results: list[GuardrailResult] = []
     # Work on a shallow mutable copy of the account so we can simulate fills.
@@ -663,7 +686,64 @@ def validate_batch(
                 pos.market_value = max(0.0, pos.market_value - res.approved_usd)
                 if pos.shares <= EPS:
                     pos.shares = 0.0
+
+    if sweep:
+        results = sweep_to_budget(results, account, limits)
+    if enforce_min_position(results, account, limits, audit=audit) and sweep:
+        results = sweep_to_budget(results, account, limits)
     return results
+
+
+def enforce_min_position(
+    results: list[GuardrailResult],
+    account: AccountState,
+    limits,
+    *,
+    audit: Callable[[str, str, dict], None] | None = None,
+) -> int:
+    """Reject approved BUYs whose RESULTING position would sit under the
+    minimum-position floor. Returns how many were dropped.
+
+    Runs after the cash sweep on purpose (see :func:`validate_batch`). Sells and
+    trims are never touched here — shrinking a position is always allowed; the
+    orchestrator separately promotes a partial exit that would leave dust to a
+    full exit. Mutates the results in place so the audit trail keeps one row per
+    intent.
+
+    Why this exists: on 2026-09-14 the book bought $1.76 of GOOGL and on 09-15
+    proposed $0.45 of AAPL. Those orders are valid to the broker and to every
+    cap, but the positions can never matter to the book — they only cost spread,
+    a Monitor slot and a line in every brief.
+    """
+    floor = min_position_floor(limits, account.equity)
+    if floor <= EPS:
+        return 0
+    dropped = 0
+    for r in results:
+        if not (r.approved and r.intent.side == Side.BUY):
+            continue
+        resulting = account.position_value(r.intent.ticker) + r.approved_usd
+        if resulting + EPS >= floor:
+            r.checks.append(CheckOutcome(
+                "min_position", True,
+                f"resulting position ${resulting:,.2f} >= floor ${floor:,.2f}",
+                cap_usd=floor))
+            continue
+        r.checks.append(CheckOutcome(
+            "min_position", False,
+            f"resulting position ${resulting:,.2f} < floor ${floor:,.2f}",
+            cap_usd=floor))
+        r.reasons = [
+            f"resulting position ${resulting:,.2f} is below the minimum position "
+            f"${floor:,.2f} — too small to matter; holding the cash instead"]
+        r.approved = False
+        r.approved_usd = 0.0
+        r.approved_shares = 0.0
+        r.resized = False
+        dropped += 1
+        if audit is not None:
+            audit("WARN", "guardrail_rejected", _result_detail(r))
+    return dropped
 
 
 def sweep_to_budget(

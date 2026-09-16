@@ -442,13 +442,17 @@ class RobinhoodMCPBroker:
 class Executor:
     def __init__(self, broker, mode: str, db, run_id: str, exec_cfg: dict,
                  *, kill_switch_check: Callable[[], bool],
-                 confirm_callback: Callable[[dict], bool] | None = None):
+                 confirm_callback: Callable[[dict], bool] | None = None,
+                 account: str | None = None):
         self.broker = broker
         self.mode = mode
         self.db = db
         self.run_id = run_id
         self.cfg = exec_cfg
         self.kill_switch_check = kill_switch_check
+        # Brokerage account the ledger rows belong to (the broker itself is
+        # already scoped); lets the review agent read one book's trades.
+        self.account = account
         # Default preview confirmation: interactive y/N prompt.
         self.confirm = confirm_callback or self._default_confirm
 
@@ -522,8 +526,13 @@ class Executor:
 
     async def execute_order(self, *, ticker: str, side: Side, qty: float, ref_price: float,
                             notional: float, sector: str = "Unknown",
-                            pre_shares: float = 0.0) -> OrderResult:
-        """Run one approved order through the appropriate mode path."""
+                            pre_shares: float = 0.0, action: str | None = None,
+                            trigger: str | None = None) -> OrderResult:
+        """Run one approved order through the appropriate mode path.
+
+        ``action`` / ``trigger`` are informational tags (buy|add|trim|exit_full|
+        exit_partial and the Monitor rule that fired) recorded in the trade
+        ledger so the review agent can attribute each leg to the rule behind it."""
         # Belt-and-braces: refuse to send if the kill switch flipped mid-run.
         if self.kill_switch_check():
             self.db.audit(self.run_id, "HALT", "executor_refused_kill_switch", {"ticker": ticker})
@@ -558,6 +567,7 @@ class Executor:
         trade_id, is_new, prior_status = self.db.begin_trade(
             client_order_id=client_oid, run_id=self.run_id, mode=self.mode, ticker=ticker,
             side=side.value, qty=qty, price=limit_price, notional=notional,
+            account=self.account,
         )
         if not is_new and prior_status in ("submitting", "submitted", "filled", "simulated"):
             self.db.audit(self.run_id, "WARN", "duplicate_order_skipped",
@@ -590,9 +600,14 @@ class Executor:
         # row's reserved intent values in place (finish_trade COALESCEs) under a
         # status that says the order is not confirmed filled — rather than
         # overwriting them with numbers nothing actually traded at.
+        detail = dict(res.detail or {})
+        if action:
+            detail.setdefault("action", action)
+        if trigger:
+            detail.setdefault("trigger", trigger)
         self.db.finish_trade(trade_id, res.status, broker_order_id=res.broker_order_id,
                              price=res.fill_price or None, qty=res.filled_qty or None,
-                             simulated=False, detail=res.detail)
+                             simulated=False, detail=detail)
         # ----- IDEMPOTENCY/SAFETY: never blind-retry an unclear fill -------
         if res.status == "needs_review":
             await self._reconcile(ticker, side, qty, pre_shares)

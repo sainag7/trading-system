@@ -15,6 +15,9 @@ Run modes (``--mode`` overrides config.yaml; default ``recommend``):
                SQLite and viewable in the dashboard's Deep dive tab.
     preview    print planned orders, require explicit confirmation, then place live
     live       place real orders via the Robinhood Trading MCP (within guardrails)
+    review     post-close learning pass: score every closed trade and every call
+               the agents made, write lessons + a playbook back into the next
+               run's prompts, and apply bounded parameter proposals. Read-only.
 
 Hard safety properties enforced here:
 
@@ -50,7 +53,7 @@ from config import load_config
 from storage.db import Database
 from data.providers import build_provider
 from risk.guardrails import (
-    AccountState, OrderIntent, Side, floor_shares, validate_batch, sweep_to_budget,
+    AccountState, OrderIntent, Side, floor_shares, min_position_floor, validate_batch,
 )
 from execution.executor import Executor, RobinhoodMCPBroker
 from execution.notifier import Notifier
@@ -132,6 +135,21 @@ def _pending_exit_proceeds(exit_intents: list | None,
             shares = held.shares if held else 0.0
         total += float(shares) * float(i.price or 0.0)
     return total
+
+
+def _universe_with_held(universe: list[str], account: AccountState) -> tuple[list[str], list[str]]:
+    """Append every held name that discovery did not surface.
+
+    Returns ``(universe, added)``. Discovery is the only ticker source, so a name
+    dropped out of research the day after it was bought — the decision agent then
+    saw "not in candidate list — hold" and the Monitor's thesis-break check ran on
+    a default score that could never trip it. Held names are a few extra tickers
+    per run, scored cross-sectionally with the rest, so a holding and a candidate
+    are finally comparable."""
+    seen = {str(t).upper() for t in universe}
+    added = [t for t, p in account.positions.items()
+             if abs(p.shares) > 1e-9 and t.upper() not in seen]
+    return (list(universe) + added) if added else list(universe), added
 
 
 def _account_summary(acct: AccountState, limits=None,
@@ -419,7 +437,8 @@ class Orchestrator:
         cfg = self.cfg
         db = self.db
         db.start_run(self.run_id, self.mode,
-                     notes=f"backend={llm.backend_name()}")
+                     notes=f"backend={llm.backend_name()}",
+                     account=cfg.account_number)
         self._banner()
 
         # 0) KILL SWITCH gate (before anything trades). Recommend mode never
@@ -523,6 +542,10 @@ class Orchestrator:
         # =================================================================
         # MONITOR open positions FIRST (exits are risk-reducing & time-sensitive)
         # =================================================================
+        # The review agent's playbook for THIS account: what its own closed
+        # trades have taught it. Context for the model agents, never a limit.
+        lessons = self._lessons_payload()
+
         exit_intents: list[OrderIntent] = []
         monitor_out: dict = {}
         if account.positions:
@@ -530,7 +553,7 @@ class Orchestrator:
             with llm.usage_context(agent="monitor"):
                 monitor_out = await run_monitor(
                     mon_positions, strategy, cfg.models.get("monitor_agent", "claude-sonnet-4-6"),
-                    db=db, run_id=self.run_id,
+                    db=db, run_id=self.run_id, lessons=lessons,
                 )
             exit_intents = self._exits_to_intents(monitor_out.get("exits", []), account)
             if exit_intents:
@@ -565,6 +588,18 @@ class Orchestrator:
                 halted=True, halt_reason="no_universe_halt",
                 halt_message="Market scan produced no tradable candidates — "
                              "nothing researched, no orders placed.")
+
+        # ALWAYS research what the book already holds. Discovery is the only
+        # ticker source, so a name dropped out of it the day after it was bought:
+        # the decision agent then saw "not in candidate list — hold", and the
+        # Monitor's thesis-break check ran on a default score of 50 that could
+        # never trip it. SCCO sat at -11% unscored for a week. Held names are a
+        # few extra tickers per run and they get scored cross-sectionally with
+        # the rest, so a held name and a candidate are finally comparable.
+        universe, held_extra = _universe_with_held(universe, account)
+        if held_extra:
+            db.audit(self.run_id, "INFO", "held_added_to_universe",
+                     {"tickers": held_extra})
 
         # =================================================================
         # RESEARCH -> ANALYSIS -> DECISION
@@ -607,15 +642,32 @@ class Orchestrator:
                      {"excluded": sorted(exiting),
                       "reason": "the Monitor is closing these this cycle"})
 
+        # REBUY COOLDOWN. The same-cycle sell-and-rebuy was fixed above, but the
+        # next-day version wasn't: NVDA was sold 8/27 and bought 8/28, sold and
+        # bought 8/31, sold and bought 9/03 — a market-order round trip of spread
+        # each time for no net change in view. A name this account exited in the
+        # last N days is not a candidate today. A banked take-profit partial is
+        # not an exit of the idea, so it does not start a cooldown.
+        cooling = self._cooldown_tickers(account)
+        cooling -= exiting
+        if cooling:
+            decision_candidates = [a for a in decision_candidates
+                                   if a.get("ticker") not in cooling]
+            db.audit(self.run_id, "INFO", "candidates_excluded_cooldown",
+                     {"excluded": sorted(cooling),
+                      "days": int(strategy.get("rebuy_cooldown_days", 0) or 0),
+                      "reason": "sold recently — no rebuy inside the cooldown"})
+
         with llm.usage_context(agent="decision"):
             decision = await run_decision(
                 decision_candidates,
                 _account_summary(account, limits, exit_intents), limits_dict,
                 strategy, trades_remaining,
                 cfg.models.get("decision_agent", "claude-sonnet-4-6"), db=db, run_id=self.run_id,
+                lessons=lessons,
             )
         buy_intents = self._decision_to_intents(decision.get("orders", []), account,
-                                                exiting=exiting)
+                                                exiting=exiting | cooling)
         print(f"🧠 Decision: {decision.get('market_view','')!r} -> {len(buy_intents)} proposed order(s)")
 
         # =================================================================
@@ -628,18 +680,19 @@ class Orchestrator:
             # Recommend never trades, so it shows normal guardrail sizing rather
             # than a "kill switch -> all rejected" view.
             kill = False if self.mode == "recommend" else self.kill_switch_active()
+            # `sweep` tops the approved buys up to the deployable balance so a day
+            # with fewer qualifying names than the agent expected does not leave
+            # cash idle. It runs AFTER validation inside validate_batch, so it can
+            # only raise an already approved order toward its own caps — never
+            # revive a rejected one — and the minimum-position floor is then
+            # applied to the swept sizes.
             results = validate_batch(
                 all_intents, account, limits, trades_today,
                 kill_switch=kill,
                 # Guardrails write every approve/modify/reject to the audit_log table.
                 audit=lambda lvl, ev, det: db.audit(self.run_id, lvl, ev, det),
+                sweep=bool(getattr(limits, "sweep_cash_to_buys", False)),
             )
-            # Top the approved buys up to the deployable balance so a day with
-            # fewer qualifying names than the agent expected does not leave cash
-            # idle. Runs AFTER validation, so it can only raise an already
-            # approved order toward its own caps — never revive a rejected one.
-            if getattr(limits, "sweep_cash_to_buys", False):
-                results = sweep_to_budget(results, account, limits)
             print("\n🛡️  Guardrail review:")
             for res in results:
                 db.log_decision(self.run_id, res)
@@ -759,9 +812,8 @@ class Orchestrator:
             [r.intent for r in retry], account, self.cfg.risk, self.db.trades_today(),
             kill_switch=self.kill_switch_active(),
             audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
+            sweep=bool(getattr(self.cfg.risk, "sweep_cash_to_buys", False)),
         )
-        if getattr(self.cfg.risk, "sweep_cash_to_buys", False):
-            results = sweep_to_budget(results, account, self.cfg.risk)
 
         approved, before = [], {r.intent.ticker: r.approved_usd for r in retry}
         print("\n🛡️  Guardrail re-check (against real post-exit cash):")
@@ -816,7 +868,8 @@ class Orchestrator:
     async def run_explain(self, ticker: str) -> None:
         cfg, db = self.cfg, self.db
         db.start_run(self.run_id, "explain",
-                     notes=f"backend={llm.backend_name()} ticker={ticker}")
+                     notes=f"backend={llm.backend_name()} ticker={ticker}",
+                     account=cfg.account_number)
         self._banner()
         print(f"\n🔎 Deep research: {ticker} "
               "(read-only — nothing is traded, no orders are planned)")
@@ -858,12 +911,111 @@ class Orchestrator:
         print(f"\n✅ Report saved (run_id={self.run_id}). Re-read it any time in the "
               "dashboard's Deep dive tab.")
 
+    # =====================================================================
+    # REVIEW MODE — the post-close learning loop. READ-ONLY with respect to
+    # the broker: it reads the account (for open-lot marks), never trades.
+    # =====================================================================
+    async def run_review(self) -> dict:
+        from agents import review_agent
+        from reporting.review_brief import render_review, write_review
+
+        cfg, db = self.cfg, self.db
+        acct_no = cfg.account_number
+        rv = cfg.review
+        window = int(rv.get("window_days", 60) or 60)
+        horizons = tuple(int(h) for h in (rv.get("forward_horizons") or [1, 5, 10, 20]))
+        tunable = rv.get("tunable") or {}
+        day = market.now_et().date().isoformat()
+
+        db.start_run(self.run_id, "review",
+                     notes=f"backend={llm.backend_name()} window={window}d",
+                     account=acct_no)
+        self._banner()
+        print(f"\n🧾 Post-close review for {day} "
+              f"(account {(cfg.active_account or {}).get('role', 'default')}"
+              f"{' ' + acct_no if acct_no else ''}; read-only — nothing is traded)")
+
+        # A live read is nice-to-have for open-lot marks; the scorecard is
+        # ledger-based, so a failed read does not stop the review.
+        live_positions = None
+        if self._live_account_enabled():
+            acct = await self._robinhood_broker().get_account(
+                peak_equity=db.get_peak_equity(fallback=0.0, account=acct_no),
+                sectors=cfg.sectors)
+            if acct is not None:
+                live_positions = acct.positions
+                db.snapshot_positions(self.run_id, acct.positions, account=acct_no)
+                db.snapshot_pnl(self.run_id, equity=acct.equity, cash=acct.cash,
+                                buying_power=acct.buying_power, peak_equity=acct.peak_equity,
+                                drawdown_pct=acct.drawdown_pct() * 100, account=acct_no)
+            else:
+                db.audit(self.run_id, "WARN", "review_account_read_failed", {})
+                print("   (couldn't read the account — open-lot marks use the last close)")
+
+        # 1) the deterministic scorecard
+        from risk.guardrails import min_position_floor
+        latest = db.prior_pnl_for_account(acct_no, self.run_id) or {}
+        floor = min_position_floor(cfg.risk, float(latest.get("equity") or 0.0))
+        scorecard = review_agent.build_scorecard(
+            db, self.provider, acct_no, window_days=window, horizons=horizons,
+            min_position_usd=floor, live_positions=live_positions)
+        allst = scorecard["aggregates"]["all"]
+        print(f"\n📊 Scorecard: {scorecard['n_closed']} closed trade(s) in {window}d · "
+              f"win rate {allst.get('win_rate')}% · expectancy {allst.get('expectancy_pct')}% · "
+              f"P&L ${allst.get('total_pnl_usd')}")
+
+        # 2) the model's read of it
+        context = review_agent.day_context(db, acct_no, day)
+        current = db.active_lessons(acct_no, limit=20)
+        with llm.usage_context(agent="review"):
+            output, _raw = await review_agent.run_review_llm(
+                scorecard, context, current, db.latest_playbook(acct_no), tunable,
+                cfg.models.get("review_agent", "claude-sonnet-4-6"),
+                db=db, run_id=self.run_id)
+        print(f"\n🧠 {output.get('day_summary') or '(no summary)'}")
+
+        # 3) persist lessons; 4) bounded parameter proposals
+        counts = db.upsert_lessons(acct_no, output.get("lessons") or [],
+                                   source_run_id=self.run_id)
+        from server.config_io import apply_overrides
+        records = review_agent.apply_proposals(
+            output.get("parameter_proposals") or [], cfg_raw=cfg.raw, tunable=tunable,
+            n_closed=int(scorecard.get("n_closed", 0)),
+            min_closed=int(rv.get("min_closed_trades", 20) or 0),
+            auto_apply=bool(rv.get("auto_apply", False)), write=apply_overrides)
+        for rec in records:
+            db.save_proposal(run_id=self.run_id, account=acct_no, **rec)
+            if rec["status"] == "applied":
+                db.audit(self.run_id, "INFO", "review_param_applied", rec)
+        if output.get("lessons"):
+            print(f"📚 Lessons: {counts['new']} new · {counts['reinforced']} reinforced · "
+                  f"{counts['retired']} retired")
+        for rec in records:
+            print(f"🎚  {rec['key']}: {rec['current']} -> {rec['proposed']} "
+                  f"[{rec['status']}] {rec['reason'] or ''}")
+
+        # 5) persist + render
+        label = (cfg.active_account or {}).get("role") or ""
+        md = render_review(scorecard, output, records, account_label=label, day=day,
+                           lesson_counts=counts)
+        db.save_review(run_id=self.run_id, account=acct_no, review_date=day,
+                       window_days=window, model=cfg.models.get("review_agent"),
+                       scorecard=scorecard, output=output, markdown=md)
+        path = write_review(md, day)
+        db.finish_run(self.run_id)
+        print(f"\n✅ Review saved (run_id={self.run_id}) -> {path}")
+        return {"run_id": self.run_id, "path": str(path), "n_closed": scorecard["n_closed"],
+                "lessons": counts, "proposals": records,
+                "day_summary": output.get("day_summary")}
+
     async def _position_context(self, ticker: str) -> dict | None:
         """READ-ONLY position context: real holdings (if connected) + stored plan."""
         position: dict | None = None
         if self._live_account_enabled():
             acct = await self._robinhood_broker().get_account(
-                peak_equity=self.db.get_peak_equity(fallback=0.0), sectors=self.cfg.sectors)
+                peak_equity=self.db.get_peak_equity(
+                    fallback=0.0, account=self.cfg.account_number),
+                sectors=self.cfg.sectors)
             if acct is not None:
                 held = acct.positions.get(ticker)
                 if held and held.shares > 0:
@@ -1017,10 +1169,11 @@ class Orchestrator:
         if self.mode == "live" and not self.assume_yes:
             self._live_warning()
 
+        acct_no = self.cfg.account_number
         executor = Executor(
             broker=broker, mode=self.mode, db=self.db, run_id=self.run_id,
             exec_cfg=self.cfg.execution, kill_switch_check=self.kill_switch_active,
-            confirm_callback=confirm_callback,
+            confirm_callback=confirm_callback, account=acct_no,
         )
         verb = {"preview": "Previewing", "live": "PLACING LIVE"}[self.mode]
         print(f"\n💸 {verb} {len(approved)} order(s):")
@@ -1034,6 +1187,7 @@ class Orchestrator:
                 ticker=intent.ticker, side=intent.side, qty=res.approved_shares,
                 ref_price=ref_price, notional=res.approved_usd,
                 sector=intent.sector or "Unknown", pre_shares=pre_shares,
+                action=intent.action, trigger=intent.trigger,
             )
             # Record/refresh the exit plan for opened/increased positions so the
             # Monitor enforces the decision's stop / target / time-stop later.
@@ -1045,36 +1199,85 @@ class Orchestrator:
                     entry_price=fill, stop_loss=stop,
                     take_profit=take, max_hold_until=intent.max_hold_until,
                     thesis=intent.rationale, peak_price=fill,  # seed the chandelier trail
-                    account=self.cfg.account_number,
+                    account=acct_no,
                 )
             elif result.ok and intent.side == Side.SELL:
-                self._settle_plan_after_sell(intent.ticker, res.approved_shares, pre_shares)
+                self._settle_plan_after_sell(intent, res, pre_shares, result)
             tag = "✓" if result.ok else "✗"
             print(f"   {tag} {intent.side.value} {res.approved_shares:g} {intent.ticker} "
                   f"-> {result.status} @ ${result.fill_price:.2f}")
 
-    def _settle_plan_after_sell(self, ticker: str, sold: float, pre_shares: float) -> None:
-        """Keep ``trade_plans`` in step with a sell the broker accepted.
+    def _settle_plan_after_sell(self, intent: OrderIntent, res, pre_shares: float,
+                                result) -> None:
+        """Keep the stored exit plan in step with what a SELL just did.
 
-        A full exit deletes the plan. Left in place, the row outlived the
-        position: seven of twelve rows were stale on 2026-09-15, and a re-entry
-        into any of those names would have inherited the OLD entry date, thesis
-        and chandelier peak through the upsert's COALESCE — a time-stop and trail
-        anchored to a trade that no longer exists.
-
-        A partial exit flags ``scaled_out`` so the Monitor closes the remainder in
-        full on the next stop hit instead of halving it again.
+        * A sell that closes the position (exit_full, or a partial that empties
+          it) DELETES the plan. Plans were never deleted before, so a name
+          rebought later inherited the old entry date, entry price and peak
+          through the upsert's COALESCE — NVDA's plan still said "entered 08-26"
+          after three rebuys; seven of twelve rows were stale on 2026-09-15.
+        * A take-profit partial flags ``tp_taken`` so the Monitor never fires
+          the same target twice (HPE: four halvings on one target).
+        * A graded stop-trail partial flags ``scaled_out`` so the NEXT stop hit
+          closes the remainder in full instead of halving it again.
         """
-        full = pre_shares > 0 and sold >= pre_shares - 1e-6
-        if full:
-            self.db.delete_trade_plan(ticker)
+        acct_no = self.cfg.account_number
+        sold = float(result.filled_qty or res.approved_shares or 0.0)
+        remaining = max(0.0, float(pre_shares or 0.0) - sold)
+        closes = intent.action == "exit_full" or intent.shares is None \
+            or remaining <= 1e-6
+        if closes:
+            self.db.delete_trade_plan(intent.ticker, account=acct_no)
             self.db.audit(self.run_id, "INFO", "trade_plan_closed",
-                          {"ticker": ticker, "sold": sold, "held_before": pre_shares})
+                          {"ticker": intent.ticker, "action": intent.action,
+                           "trigger": intent.trigger, "sold": sold,
+                           "held_before": pre_shares, "remaining_shares": remaining})
+        elif (intent.trigger or "") == "take_profit":
+            self.db.mark_take_profit_taken(intent.ticker, account=acct_no)
+            self.db.audit(self.run_id, "INFO", "take_profit_banked",
+                          {"ticker": intent.ticker, "sold_shares": sold,
+                           "remaining_shares": remaining,
+                           "note": "remainder now rides the trailing stop only"})
         else:
-            self.db.mark_scaled_out(ticker)
+            self.db.mark_scaled_out(intent.ticker, account=acct_no)
             self.db.audit(self.run_id, "INFO", "trade_plan_scaled_out",
-                          {"ticker": ticker, "sold": sold, "held_before": pre_shares,
+                          {"ticker": intent.ticker, "trigger": intent.trigger,
+                           "sold": sold, "held_before": pre_shares,
                            "note": "next trailing-stop hit exits the remainder in full"})
+
+    def _cooldown_tickers(self, account: AccountState) -> set[str]:
+        """Names this account sold recently and must not rebuy yet
+        (``strategy.rebuy_cooldown_days``; 0 disables). A take-profit partial
+        does not count — that idea is still held."""
+        days = int(self.cfg.strategy.get("rebuy_cooldown_days", 0) or 0)
+        if days <= 0:
+            return set()
+        recent = self.db.recent_exits(self.cfg.account_number, days,
+                                      exclude_triggers=("take_profit",))
+        # A name still held (a partial exit) is not in cooldown — it is a position.
+        return {t for t in recent
+                if not (t in account.positions and abs(account.positions[t].shares) > 1e-9)}
+
+    def _lessons_payload(self) -> dict | None:
+        """The review agent's active lessons for this account, shaped for the
+        decision / monitor prompts. ``None`` when there are none (the key is then
+        absent from the payload rather than present and empty)."""
+        try:
+            items = self.db.active_lessons(self.cfg.account_number, limit=8)
+            playbook = self.db.latest_playbook(self.cfg.account_number)
+        except Exception:
+            return None
+        if not items and not playbook:
+            return None
+        return {
+            "playbook": playbook or "",
+            "items": [{"text": i["text"], "evidence": i.get("evidence"),
+                       "confidence": i.get("confidence"),
+                       "applies_to": i.get("applies_to")} for i in items],
+            "note": ("Distilled by the post-close review agent from this account's own "
+                     "closed trades. Evidence-backed context, not a rule; the risk "
+                     "layer is unchanged."),
+        }
 
     def _reanchor_levels(self, intent, ref_price: float,
                          fill_price: float) -> tuple[float | None, float | None]:
@@ -1262,20 +1465,40 @@ class Orchestrator:
 
     def _exits_to_intents(self, exits: list[dict], account: AccountState) -> list[OrderIntent]:
         intents = []
+        floor = min_position_floor(self.cfg.risk, account.equity)
         for e in exits:
             ticker = str(e.get("ticker", "")).upper()
             if ticker not in account.positions:
                 continue
             price = self._ref_price(ticker, e.get("current_price") or e.get("price"))
             trigger = str(e.get("trigger", "")).lower()
+            action = e.get("action", "exit_full")
+            shares = e.get("shares")
+            reason = e.get("reason", "")
+            # A partial exit is only a partial if what it leaves is a position
+            # worth holding. Below the minimum position the remainder is dust
+            # that pays a market-order spread on every later touch and can never
+            # be sized into anything (HPE: $6.57 -> $3.51 -> $1.76 -> a $0.97
+            # order the broker refused). Take the whole position instead.
+            held = account.positions[ticker].shares
+            if action == "exit_partial" and shares is not None and floor > 0 and price > 0:
+                remainder = max(0.0, held - float(shares)) * price
+                if remainder < floor:
+                    self.db.audit(self.run_id, "INFO", "partial_promoted_to_full", {
+                        "ticker": ticker, "trigger": trigger,
+                        "remainder_usd": round(remainder, 2), "floor_usd": round(floor, 2)})
+                    action, shares = "exit_full", None
+                    reason = (f"{reason} [remainder ${remainder:,.2f} would be under the "
+                              f"${floor:,.2f} minimum position — closing in full]")
             # exit_full -> shares None (guardrail sells all held); exit_partial carries shares.
             intents.append(OrderIntent(
-                ticker=ticker, side=Side.SELL, action=e.get("action", "exit_full"),
-                shares=e.get("shares"), price=price,
+                ticker=ticker, side=Side.SELL, action=action,
+                shares=shares, price=price,
                 sector=account.positions[ticker].sector,
                 confidence=float(e.get("confidence", 0) or 0),
-                rationale=f"{trigger or 'exit'}: {e.get('reason', '')}",
+                rationale=f"{trigger or 'exit'}: {reason}",
                 protective_exit=trigger in self.PROTECTIVE_TRIGGERS,
+                trigger=trigger or None,
             ))
         return intents
 
@@ -1287,11 +1510,17 @@ class Orchestrator:
         default_stop = strat.get("max_loss_pct", strat.get("default_stop_loss_pct", 0.10))
         default_tp = strat.get("default_take_profit_pct", 0.20)
         exit_below = strat.get("exit_below_score", 35)
-        min_position = float(strat.get("min_position_usd", 0) or 0)
+        # The smallest position worth holding, for the Monitor's dust rule: the
+        # per-account risk floor (max of $ and % of equity).
+        min_position = min_position_floor(self.cfg.risk, account.equity)
         use_trail = bool(strat.get("use_trailing_stop", True))
         trail_mult = float(strat.get("trail_atr_mult", 3.0))
         acct_no = self.cfg.account_number
-        plans = self.db.get_trade_plans(account=acct_no)  # this account's exit plans
+        # THIS account's plans only. Plans used to be shared across accounts, so
+        # the individual book's advice run ratcheted the agentic book's stops
+        # from its own (higher) cost basis — GOOGL ended up with a stop 0.65%
+        # below the agentic entry.
+        plans = self.db.get_trade_plans(account=acct_no)
         scores = self.db.get_latest_scores()        # previous cycle's composites
         research = self.db.get_latest_research()     # previous cycle's technicals/sentiment
         out = []
@@ -1319,8 +1548,12 @@ class Orchestrator:
             if use_trail and atr and peak:
                 trailed = round(peak - trail_mult * atr, 2)
                 stop_level = max(stop_level or trailed, trailed)
-                self.db.update_trail(t, stop_loss=stop_level, peak_price=peak,
-                                     account=acct_no)
+                # Persist only onto a plan this account owns; a position with no
+                # stored plan (legacy / advice-only book) is protected by the
+                # derived levels above without writing anything.
+                if plan:
+                    self.db.update_trail(t, stop_loss=stop_level, peak_price=peak,
+                                         account=acct_no)
 
             out.append({
                 "ticker": t, "shares": p.shares, "avg_cost": p.avg_cost,
@@ -1328,6 +1561,7 @@ class Orchestrator:
                 "unrealized_pnl_pct": round((price / p.avg_cost - 1) * 100, 2) if p.avg_cost else None,
                 "stop_loss": stop_level,
                 "take_profit": take_level,
+                "tp_taken": bool(plan.get("tp_taken")),
                 "max_hold_until": plan.get("max_hold_until"),
                 "entry_date": plan.get("entry_date"),
                 "thesis": plan.get("thesis"),
@@ -1367,8 +1601,9 @@ class Orchestrator:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Multi-agent swing-trading orchestrator")
-    ap.add_argument("--mode", choices=["recommend", "explain", "preview", "live"],
-                    help="run mode (overrides config.yaml; default recommend)")
+    ap.add_argument("--mode", choices=["recommend", "explain", "preview", "live", "review"],
+                    help="run mode (overrides config.yaml; default recommend). "
+                         "`review` is the post-close learning pass (read-only).")
     ap.add_argument("--ticker", default=None,
                     help="stock symbol for --mode explain (e.g. --ticker NVDA)")
     ap.add_argument("--account", default=None,
@@ -1404,9 +1639,10 @@ def main() -> None:
     # orders never touch the individual book. When no accounts: block is
     # configured the system stays single-account (MCP default). This is where
     # the per-account risk overlay is applied.
+    # `review` also defaults to agentic: it learns from the book that trades.
     role = args.account
     if role is None and config.accounts:
-        role = "agentic" if config.mode in ("preview", "live") else "individual"
+        role = "agentic" if config.mode in ("preview", "live", "review") else "individual"
     if role:
         try:
             active = config.apply_account(role)
@@ -1435,6 +1671,10 @@ def main() -> None:
             raise SystemExit(f"error: {args.ticker!r} does not look like a US equity "
                              "symbol (1-5 letters)")
         asyncio.run(orch.run_explain(ticker))
+        return
+
+    if config.mode == "review":
+        asyncio.run(orch.run_review())
         return
 
     asyncio.run(orch.run_cycle())

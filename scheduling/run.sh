@@ -45,7 +45,16 @@ notify() {  # notify <title> <message>
     >/dev/null 2>&1 || true
 }
 
-if [ "$STATUS" -eq 0 ]; then
+# A review run writes its own report (reports/<date>-review.md) and has no
+# positions brief to render; notify with its one-line summary instead.
+IS_REVIEW=0
+for arg in "$@"; do [ "$arg" = "review" ] && IS_REVIEW=1; done
+
+if [ "$STATUS" -eq 0 ] && [ "$IS_REVIEW" -eq 1 ]; then
+  SUMMARY="$("$PY" -m reporting.review_brief --summary 2>>"$LOG" || echo "review ready")"
+  echo "----- review: $SUMMARY" >> "$LOG"
+  notify "Trading review ready" "$SUMMARY"
+elif [ "$STATUS" -eq 0 ]; then
   # Render the brief for the run that just finished (it is now the latest).
   # A rendering failure is reported but does not fail the run itself — the
   # orchestrator's own output is already safely in the log and the database.
