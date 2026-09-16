@@ -312,6 +312,28 @@ def test_pending_exit_proceeds_sums_only_sells():
     assert _pending_exit_proceeds(None) == 0.0
 
 
+def test_pending_exit_proceeds_values_a_full_exit_at_the_held_size():
+    """The 2026-09-15 shape: an exit_full intent carries shares=None (sell all),
+    and it was being summed as $0 — a $150 NVDA stop read as $0.97 of proceeds."""
+    from orchestrator import _account_summary, _pending_exit_proceeds
+    from risk.guardrails import Position
+
+    acct = AccountState(equity=278.85, cash=0.18, buying_power=0.18, peak_equity=282.0,
+                        positions={"NVDA": Position("NVDA", 0.712752, 231.5, 150.36),
+                                   "HPE": Position("HPE", 0.031302, 48.24, 1.51)})
+    full = OrderIntent(ticker="NVDA", side=Side.SELL, action="exit_full",
+                       shares=None, price=210.96, protective_exit=True)
+    part = _exit_intent("HPE", 0.015651, 62.09)
+    assert _pending_exit_proceeds([full, part], acct) == pytest.approx(
+        0.712752 * 210.96 + 0.015651 * 62.09)
+    # Without an account to resolve against, a None-share exit is still $0 —
+    # never a guess.
+    assert _pending_exit_proceeds([full]) == 0.0
+    summary = _account_summary(acct, None, [full, part])
+    assert summary["expected_exit_proceeds"] == pytest.approx(151.33, abs=0.01)
+    assert summary["deployable_cash_after_exits"] == pytest.approx(151.51, abs=0.01)
+
+
 def test_account_summary_reports_what_the_exits_will_free():
     """A fully-invested book reads $0 deployable — the agent must still be told
     that this cycle's exits are about to fund it."""
@@ -454,27 +476,32 @@ def _rejected(intent, failed_check: str) -> GuardrailResult:
     )
 
 
-def _ssl_buy():
+def _ssl_buy(usd=3.51):
     return OrderIntent(ticker="SSL", side=Side.BUY, action="buy",
-                       usd_amount=3.51, price=14.02, sector="Materials")
+                       usd_amount=usd, price=14.02, sector="Materials")
 
 
 def test_stage_one_cash_rejection_gets_a_second_look_after_the_exits():
     """The 2026-09-10 failure mode: SSL was rejected at stage 1 for being $0.0023
     short, so it never entered plan.approved — `buys` was empty, and the whole
     two-stage mechanism switched itself off. The rejection disabled the very
-    machinery built to prevent it."""
+    machinery built to prevent it.
+
+    The original day's figure was $3.51; the same shape is reproduced at $13.51
+    because the agentic overlay's min_trade_usd is now $5 and a $3.51 buy would
+    be rejected on the floor rather than revived — a different rule, tested
+    elsewhere."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
         orch.cfg.apply_account("agentic")
         broke = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
                              peak_equity=264.20, positions={})
-        flush = AccountState(equity=264.20, cash=3.5077021200000003,
-                             buying_power=3.5077021200000003,
+        flush = AccountState(equity=264.20, cash=13.5077021200000003,
+                             buying_power=13.5077021200000003,
                              peak_equity=264.20, positions={})
-        exit_res = _approved(_exit_intent(), 3.5077021200000003, 0.062604)
+        exit_res = _approved(_exit_intent(), 13.5077021200000003, 0.281409)
         plan = _plan(orch, [exit_res], broke)
-        plan.results = [exit_res, _rejected(_ssl_buy(), "min_cash_reserve_pct")]
+        plan.results = [exit_res, _rejected(_ssl_buy(13.51), "min_cash_reserve_pct")]
         h = _StagedHarness(orch, flush)
         asyncio.run(orch._execute_staged(plan))
         assert h.calls[0] == ["HPE"], h.calls          # exits first
@@ -497,3 +524,109 @@ def test_a_rejection_cash_cannot_fix_is_not_carried_forward():
         h = _StagedHarness(orch, flush)
         asyncio.run(orch._execute_staged(plan))
         assert h.calls == [["HPE"]]                    # single pass, no revival
+
+
+# --------------------------------------------------------------------------- #
+# trade_plans lifecycle — a plan must not outlive its position
+# --------------------------------------------------------------------------- #
+def _seed_plan(orch, ticker="HPE", account="806", **kw):
+    orch.db.upsert_trade_plan(ticker=ticker, run_id="seed", entry_price=48.0,
+                              stop_loss=44.0, take_profit=58.0,
+                              max_hold_until="2026-12-31", thesis="t",
+                              peak_price=48.0, account=account, **kw)
+
+
+def test_full_exit_deletes_the_plan():
+    """Seven of twelve plan rows were stale on 2026-09-15 because nothing ever
+    deleted one. A confirmed sell of the whole position must remove it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        _seed_plan(orch)
+        orch._settle_plan_after_sell("HPE", sold=0.125207, pre_shares=0.125207)
+        assert "HPE" not in orch.db.get_trade_plans()
+        events = [r["event"] for r in orch.db.query(
+            "SELECT event FROM audit_log WHERE run_id=?", (orch.run_id,))]
+        assert "trade_plan_closed" in events
+
+
+def test_partial_exit_keeps_the_plan_and_marks_it_scaled_out():
+    """A half-trim leaves a live position: the plan stays, flagged so the next
+    stop hit closes the remainder instead of halving it again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        _seed_plan(orch)
+        orch._settle_plan_after_sell("HPE", sold=0.062604, pre_shares=0.125207)
+        plan = orch.db.get_trade_plans()["HPE"]
+        assert plan["scaled_out"] == 1
+        assert plan["stop_loss"] == 44.0          # levels untouched
+
+
+def test_full_exit_tolerates_broker_share_rounding():
+    """The broker reports holdings to 6dp; a sell sized from that figure must
+    still read as a full exit, not a partial that leaves a 1e-7 share stub."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        _seed_plan(orch)
+        orch._settle_plan_after_sell("HPE", sold=0.125207, pre_shares=0.1252071)
+        assert "HPE" not in orch.db.get_trade_plans()
+
+
+def test_prune_only_touches_the_matching_account():
+    """A run on the individual book must never discard the agentic book's plans
+    just because the individual account does not hold those names."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        _seed_plan(orch, "HPE", account="806")
+        _seed_plan(orch, "SCCO", account="806")
+        _seed_plan(orch, "LEGACY", account=None)
+        # Pruning against the OTHER account: nothing of 806's is touched.
+        assert orch.db.prune_trade_plans(held=["ORCL"], account="750") == []
+        assert set(orch.db.get_trade_plans()) == {"HPE", "SCCO", "LEGACY"}
+        # Pruning against 806 with only SCCO held: HPE goes, LEGACY (no
+        # account) is never auto-pruned, SCCO stays.
+        assert orch.db.prune_trade_plans(held=["SCCO"], account="806") == ["HPE"]
+        assert set(orch.db.get_trade_plans()) == {"SCCO", "LEGACY"}
+        # No account means no pruning at all.
+        assert orch.db.prune_trade_plans(held=[], account=None) == []
+
+
+def test_get_trade_plans_is_account_scoped():
+    """The individual account's Monitor must not read the agentic account's
+    stops for a ticker both happen to hold."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        _seed_plan(orch, "NVDA", account="806")
+        _seed_plan(orch, "OLD", account=None)
+        assert set(orch.db.get_trade_plans(account="806")) == {"NVDA", "OLD"}
+        assert set(orch.db.get_trade_plans(account="750")) == {"OLD"}
+        assert set(orch.db.get_trade_plans()) == {"NVDA", "OLD"}
+
+
+def test_finalize_prunes_against_a_populated_read_only():
+    """An empty account read is the model UNDER-reporting (the read-sanity gate
+    exists for exactly this), so finalize must not treat it as 'sold out'."""
+    from risk.guardrails import Position
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        acct_no = orch.cfg.account_number
+        _seed_plan(orch, "HPE", account=acct_no)
+        _seed_plan(orch, "SCCO", account=acct_no)
+        orch.notifier.send_digest = lambda *a, **k: None   # type: ignore[method-assign]
+
+        reads = [
+            AccountState(equity=1.0, cash=1.0, buying_power=1.0, peak_equity=1.0,
+                         positions={}),
+            AccountState(equity=60.0, cash=0.0, buying_power=0.0, peak_equity=60.0,
+                         positions={"SCCO": Position("SCCO", 0.3, 200.0, 60.0)}),
+        ]
+
+        async def _read(broker):
+            return reads.pop(0)
+        orch._read_account = _read                      # type: ignore[method-assign]
+
+        asyncio.run(orch._finalize_run(broker=object()))   # empty read
+        assert set(orch.db.get_trade_plans()) == {"HPE", "SCCO"}
+        asyncio.run(orch._finalize_run(broker=object()))   # SCCO only
+        assert set(orch.db.get_trade_plans()) == {"SCCO"}

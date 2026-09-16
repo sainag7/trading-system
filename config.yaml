@@ -75,6 +75,14 @@ strategy:
   default_stop_loss_pct: 0.12        # legacy/fallback stop (used only when ATR is unavailable)
   default_take_profit_pct: 0.20      # legacy/fallback target (monitor fallback only)
   max_holding_days: 60               # time-based exit if thesis hasn't played out
+  # The smallest position worth HOLDING. A graded (half) exit whose remainder
+  # would fall under this closes the whole position instead, and any exit on a
+  # position already this small is taken in full. Without it the Monitor halved
+  # HPE on three separate days down to a $1.76 stub, then sold that stub to buy
+  # $1.76 of GOOGL — a market-order round trip for nothing. Distinct from the
+  # per-account `min_trade_usd` (the smallest ORDER): this is about what is left
+  # behind, not what is sent.
+  min_position_usd: 10
 
   # -- Methodology: momentum + quality factor model with volatility-based risk --
   # Master switch. "momentum_quality" (default) uses the factor scoring + ATR
@@ -236,7 +244,11 @@ data:
   use_alphavantage_series: false
   alphavantage:
     daily_request_budget: 25         # free-tier hard cap; provider self-throttles
-    min_seconds_between_calls: 13    # ~5 calls/min on free tier
+    # Alpha Vantage's stated free-tier pace is 1 request per second; 13s dated
+    # from the old 5-calls/minute tier. Calls are serialised across the research
+    # threads at this spacing, so 20 tickers cost ~40s on the first run of the
+    # day (the second run reads the 24h cache).
+    min_seconds_between_calls: 2
   use_yfinance_fallback: true        # yfinance serves quotes/series when needed (free)
   use_fred: true                     # macro context (rates, etc.) when configured
 
@@ -299,7 +311,11 @@ accounts:
     # (the base $50 min-trade would otherwise reject every order) while keeping
     # every percentage ceiling explicit.
     risk:
-      min_trade_usd: 1          # allow small/fractional orders (a floor, not a risk ceiling)
+      # Allow small/fractional orders (a floor, not a risk ceiling). $5 rather
+      # than $1: on 2026-09-14 the entire deployable balance was $1.76 and the
+      # agent dutifully bought $1.76 of GOOGL with it. Below a few dollars the
+      # market-order spread is the whole trade; let that cash wait a day.
+      min_trade_usd: 5
       # SIZING IS THE DECISION AGENT'S CALL ON THIS ACCOUNT, ON PURPOSE.
       # Every percentage ceiling below is set to "no cap" so the agent's own
       # conviction sizing reaches the broker unmodified. A fixed fraction of

@@ -361,7 +361,9 @@ top of an absolute score so a broken name is never bought just for being the
   and losers are cut early. Persisted in `trade_plans.peak_price`.
 - **Graded exits:** a broken downtrend (below the 200-SMA / large loss) is a full
   exit; a quality name merely *pulling back* to its trailing stop scales out to
-  half.
+  half — **once**. The next stop hit closes the remainder, and a half-trim that
+  would leave less than `min_position_usd` ($10) is taken in full instead, so
+  the book never accumulates $2 stubs that pay spread on every touch.
 - **Sizing** shrinks high-ATR names (`vol_target_sizing`) so dollar risk is
   roughly constant across the book.
 
@@ -429,7 +431,7 @@ account's runs only**. The two accounts in this repo are deliberately opposite:
 | `max_position_pct` | 0.15 | **1.0** (no cap) |
 | `max_sector_pct` | 0.40 | **1.0** (no cap) |
 | `min_cash_reserve_pct` | 0.10 | **0.0** |
-| `min_trade_usd` | 50 | **1** |
+| `min_trade_usd` | 50 | **5** |
 | `sweep_cash_to_buys` | false | **true** |
 
 The agentic book runs with the percentage ceilings off **on purpose**. Because a
@@ -470,7 +472,11 @@ Sizing is done in **dollars**, which on a small book almost always produces a
 ## Trade plans and exits
 
 When a buy fills, a row is written to `trade_plans` — entry, stop, target,
-time-stop, thesis. The **Monitor agent** enforces it on later runs.
+time-stop, thesis, and the account that holds it. The **Monitor agent** enforces
+it on later runs. A confirmed full exit **deletes** the row (a partial flags it
+`scaled_out`), and each run's final account read prunes plans for names the
+account no longer holds — so a re-entry always starts a fresh plan rather than
+inheriting the previous trade's entry date and trail.
 
 - **The time-stop is validated.** `max_hold_until` from the model is only
   accepted if it parses and falls inside `(today, today + max_holding_days]`;
@@ -585,8 +591,10 @@ in the dashboard's **Deep dive** tab.
 
 Run it **once per trading day** (e.g. ~30–60 min after the open, so the opening
 auction settles). Runs are **single-shot and idempotent** — there is no daemon. A
-**market-day gate** ([market.py](market.py)) makes any weekend/NYSE-holiday firing a
-clean no-op for trading modes.
+**market gate** ([market.py](market.py)) makes any firing on a weekend, NYSE
+holiday, or outside the 09:30–16:00 ET session a clean no-op for trading modes —
+it halts before the (paid) account read, so a manual `--mode live` at 8pm costs
+nothing and sends nothing.
 
 ### macOS launchd (recommended)
 
@@ -664,7 +672,9 @@ Each source does what it's best at:
 The Alpha Vantage free tier is **25 requests/day**. [data/providers.py](data/providers.py)
 defends the quota three ways: an **on-disk cache** (24h TTL), a **persistent daily
 request budget** (after which it falls back to yfinance), and **self-throttling**
-between live calls. Keep your `universe` focused.
+between live calls — serialised under a lock, so the concurrent research threads
+queue for the interval instead of bursting past it and burning the budget on
+"1 request per second" rejections.
 
 ---
 

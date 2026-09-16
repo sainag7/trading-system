@@ -108,18 +108,28 @@ def _cash_could_fix(result) -> bool:
     return bool(failed) and not (failed & _CASH_INDEPENDENT_CHECKS)
 
 
-def _pending_exit_proceeds(exit_intents: list | None) -> float:
+def _pending_exit_proceeds(exit_intents: list | None,
+                           account: AccountState | None = None) -> float:
     """Cash the Monitor's exits would free THIS cycle, if they all fill.
 
     Exits execute before buys, so this money is genuinely available within the
     same run — but only once those sells actually fill, which is why the buys are
     re-validated against a fresh account read afterwards rather than trusting
-    this figure."""
+    this figure.
+
+    An ``exit_full`` intent carries ``shares=None`` ("everything held" — the
+    guardrail resolves it against the account), so the held quantity is what it
+    frees. Reading None as zero is how, on 2026-09-15, a $150 NVDA stop-loss was
+    reported to the decision agent as $0.97 of proceeds: it sized two buys at
+    $0.70 and $0.45, both were rejected, and $152 sat idle for the day."""
     total = 0.0
     for i in exit_intents or []:
         if i.side != Side.SELL:
             continue
-        shares = i.shares if i.shares is not None else 0.0
+        shares = i.shares
+        if shares is None:
+            held = account.positions.get(i.ticker) if account else None
+            shares = held.shares if held else 0.0
         total += float(shares) * float(i.price or 0.0)
     return total
 
@@ -141,7 +151,7 @@ def _account_summary(acct: AccountState, limits=None,
     # concludes it cannot buy — even though the Monitor is about to sell and free
     # capital in this very cycle. Telling it what the exits will release is what
     # lets the proceeds be redeployed today instead of sitting idle until tomorrow.
-    pending = _pending_exit_proceeds(exit_intents)
+    pending = _pending_exit_proceeds(exit_intents, acct)
     return {
         "equity": round(acct.equity, 2),
         "cash": round(acct.cash, 2),
@@ -246,7 +256,42 @@ class Orchestrator:
 
     async def _read_account(self, broker) -> AccountState | None:
         peak = self.db.get_peak_equity(fallback=0.0, account=self.cfg.account_number)
-        return await broker.get_account(peak_equity=peak, sectors=self.cfg.sectors)
+        account = await broker.get_account(peak_equity=peak, sectors=self.cfg.sectors)
+        if account is not None:
+            await self._fill_sectors(account)
+        return account
+
+    async def _fill_sectors(self, account: AccountState) -> None:
+        """Resolve each position's sector through the data provider.
+
+        The broker only knows the dozen names in ``config.sectors``; everything
+        else came back as "Unknown", which put SCCO, NTAP and HPE in one
+        "Unknown" bucket for the sector cap and the dashboard alike. The provider
+        already has a cheap, cached lookup (``sector_for``), so use it — off the
+        event loop, a few at a time, and never fatally: a data hiccup on one
+        ticker must not turn a successful account read into a failed one.
+        """
+        unknown = [t for t, p in account.positions.items()
+                   if not p.sector or p.sector == "Unknown"]
+        if not unknown:
+            return
+        sem = asyncio.Semaphore(5)
+
+        async def _one(ticker: str) -> tuple[str, str | None]:
+            async with sem:
+                try:
+                    return ticker, await asyncio.to_thread(self.provider.sector_for, ticker)
+                except Exception:
+                    return ticker, None
+
+        resolved = 0
+        for ticker, sector in await asyncio.gather(*(_one(t) for t in unknown)):
+            if sector and sector != "Unknown":
+                account.positions[ticker].sector = sector
+                resolved += 1
+        if resolved:
+            self.db.audit(self.run_id, "INFO", "position_sectors_resolved",
+                          {"resolved": resolved, "of": len(unknown)})
 
     async def check_broker(self) -> None:
         """Preflight the Robinhood MCP connection: read the selected account and
@@ -302,10 +347,7 @@ class Orchestrator:
         into the P&L/positions tables (keeps the dashboard real)."""
         self._account_is_real = False
         if self._live_account_enabled():
-            acct = await self._robinhood_broker().get_account(
-                peak_equity=self.db.get_peak_equity(
-                    fallback=0.0, account=self.cfg.account_number),
-                sectors=self.cfg.sectors)
+            acct = await self._read_account(self._robinhood_broker())
             if acct is not None:
                 print("   (using your live Robinhood holdings, read-only)")
                 self._account_is_real = True
@@ -390,19 +432,25 @@ class Orchestrator:
                 halted=True, halt_reason="kill_switch_active",
                 halt_message="Kill switch is active — halting all trading. No orders placed.")
 
-        # 0b) MARKET-DAY gate (trading modes only). The daily schedule fires on
-        # weekdays; skip weekends and NYSE holidays so a firing on a closed market
-        # cleanly no-ops instead of attempting to trade. Advice modes may run any
-        # day, so they are exempt.
-        if self.mode in ("preview", "live") and not market.is_trading_day():
+        # 0b) MARKET gate (trading modes only). The daily schedule fires on
+        # weekdays at 10:05 ET; skip weekends, NYSE holidays AND the hours outside
+        # the regular session, so a firing on a closed market — or a manual run at
+        # 8pm — cleanly no-ops instead of attempting to trade. Every fractional
+        # order goes out as a market order, and Robinhood only fills those in
+        # regular hours, so an off-hours run could only send orders that reject
+        # or sit unprotected until the open. Advice modes may run any time.
+        if self.mode in ("preview", "live") and not market.is_market_open():
+            now = market.now_et()
+            why = ("outside the regular session (09:30-16:00 ET)"
+                   if market.is_trading_day(now) else "weekend/holiday")
             db.audit(self.run_id, "INFO", "market_closed_skip",
-                     {"mode": self.mode, "date": market.now_et().date().isoformat()})
-            print("\n📆 Market closed today (weekend/holiday) — no trading. "
-                  "No orders placed.")
+                     {"mode": self.mode, "date": now.date().isoformat(),
+                      "time_et": now.strftime("%H:%M"), "reason": why})
+            print(f"\n📆 Market closed — {why}. No trading, no orders placed.")
             db.finish_run(self.run_id)
             return PipelineOutcome(
                 halted=True, halt_reason="market_closed_skip",
-                halt_message="Market is closed today (weekend/holiday) — no trading.")
+                halt_message=f"Market is closed ({why}) — no trading.")
 
         # Recommend mode reads no broker it could trade through; it uses the real
         # account read-only when connected, else a hypothetical book.
@@ -829,7 +877,7 @@ class Orchestrator:
                     }
                 else:
                     position = {"held": False}
-        plan = self.db.get_trade_plans().get(ticker)
+        plan = self.db.get_trade_plans(account=self.cfg.account_number).get(ticker)
         if plan:
             position = {**(position or {"held": None}), "trade_plan": {
                 k: plan.get(k) for k in
@@ -997,10 +1045,36 @@ class Orchestrator:
                     entry_price=fill, stop_loss=stop,
                     take_profit=take, max_hold_until=intent.max_hold_until,
                     thesis=intent.rationale, peak_price=fill,  # seed the chandelier trail
+                    account=self.cfg.account_number,
                 )
+            elif result.ok and intent.side == Side.SELL:
+                self._settle_plan_after_sell(intent.ticker, res.approved_shares, pre_shares)
             tag = "✓" if result.ok else "✗"
             print(f"   {tag} {intent.side.value} {res.approved_shares:g} {intent.ticker} "
                   f"-> {result.status} @ ${result.fill_price:.2f}")
+
+    def _settle_plan_after_sell(self, ticker: str, sold: float, pre_shares: float) -> None:
+        """Keep ``trade_plans`` in step with a sell the broker accepted.
+
+        A full exit deletes the plan. Left in place, the row outlived the
+        position: seven of twelve rows were stale on 2026-09-15, and a re-entry
+        into any of those names would have inherited the OLD entry date, thesis
+        and chandelier peak through the upsert's COALESCE — a time-stop and trail
+        anchored to a trade that no longer exists.
+
+        A partial exit flags ``scaled_out`` so the Monitor closes the remainder in
+        full on the next stop hit instead of halving it again.
+        """
+        full = pre_shares > 0 and sold >= pre_shares - 1e-6
+        if full:
+            self.db.delete_trade_plan(ticker)
+            self.db.audit(self.run_id, "INFO", "trade_plan_closed",
+                          {"ticker": ticker, "sold": sold, "held_before": pre_shares})
+        else:
+            self.db.mark_scaled_out(ticker)
+            self.db.audit(self.run_id, "INFO", "trade_plan_scaled_out",
+                          {"ticker": ticker, "sold": sold, "held_before": pre_shares,
+                           "note": "next trailing-stop hit exits the remainder in full"})
 
     def _reanchor_levels(self, intent, ref_price: float,
                          fill_price: float) -> tuple[float | None, float | None]:
@@ -1043,6 +1117,17 @@ class Orchestrator:
                 buying_power=account.buying_power, peak_equity=account.peak_equity,
                 drawdown_pct=account.drawdown_pct() * 100, account=acct_no,
             )
+            # Drop plans for names this account no longer holds (a sell made
+            # outside the system, or an exit whose fill landed after the poll
+            # window). Only against a read that returned holdings: the one known
+            # failure mode of the model-mediated read is UNDER-reporting, and an
+            # empty read must never be taken as "everything was sold".
+            if account.positions:
+                held = [t for t, p in account.positions.items() if p.shares > 1e-6]
+                pruned = self.db.prune_trade_plans(held, acct_no)
+                if pruned:
+                    self.db.audit(self.run_id, "INFO", "trade_plans_pruned",
+                                  {"account": acct_no, "tickers": pruned})
         summary = self.db.get_run_summary(self.run_id)
         print("\n📋 Run summary: "
               f"executed {summary['trades_executed']} "
@@ -1202,9 +1287,11 @@ class Orchestrator:
         default_stop = strat.get("max_loss_pct", strat.get("default_stop_loss_pct", 0.10))
         default_tp = strat.get("default_take_profit_pct", 0.20)
         exit_below = strat.get("exit_below_score", 35)
+        min_position = float(strat.get("min_position_usd", 0) or 0)
         use_trail = bool(strat.get("use_trailing_stop", True))
         trail_mult = float(strat.get("trail_atr_mult", 3.0))
-        plans = self.db.get_trade_plans()           # decision agent's exit plans
+        acct_no = self.cfg.account_number
+        plans = self.db.get_trade_plans(account=acct_no)  # this account's exit plans
         scores = self.db.get_latest_scores()        # previous cycle's composites
         research = self.db.get_latest_research()     # previous cycle's technicals/sentiment
         out = []
@@ -1232,7 +1319,8 @@ class Orchestrator:
             if use_trail and atr and peak:
                 trailed = round(peak - trail_mult * atr, 2)
                 stop_level = max(stop_level or trailed, trailed)
-                self.db.update_trail(t, stop_loss=stop_level, peak_price=peak)
+                self.db.update_trail(t, stop_loss=stop_level, peak_price=peak,
+                                     account=acct_no)
 
             out.append({
                 "ticker": t, "shares": p.shares, "avg_cost": p.avg_cost,
@@ -1245,6 +1333,8 @@ class Orchestrator:
                 "thesis": plan.get("thesis"),
                 "score": scores.get(t, 50),
                 "exit_below_score": exit_below,
+                "min_position_usd": min_position,
+                "scaled_out": bool(plan.get("scaled_out")),
                 "atr20": atr,
                 "sma50": tech.get("sma50"),
                 "above_sma200": tech.get("above_sma200"),

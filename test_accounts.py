@@ -43,8 +43,11 @@ def test_agentic_overlay_applies_100dollar_risk():
         base_min_trade = cfg.risk.min_trade_usd            # base = 50
         active = cfg.apply_account("agentic")
         r = cfg.risk
-        # The $100 overlay must take effect for the agentic account.
-        assert r.min_trade_usd == 1.0, r.min_trade_usd
+        # The $100 overlay must take effect for the agentic account: a few
+        # dollars, not the base $50 (which would reject every order on this book)
+        # and not $1 (which let a $1.76 buy through — pure spread).
+        assert r.min_trade_usd == 5.0, r.min_trade_usd
+        assert r.min_trade_usd < base_min_trade
         # Sizing on this account is the decision agent's call: EVERY percentage
         # ceiling is off. A ceiling the agent exceeds does not trim the order, it
         # rejects it outright (only the per-trade cap resizes), so a cap here
@@ -191,3 +194,137 @@ def test_peak_equity_is_scoped_per_account():
         assert db.get_peak_equity(fallback=0.0, account="750268922") == 3000.0
         # Global (legacy) view still sees the max across all accounts.
         assert db.get_peak_equity(fallback=0.0) == 3000.0
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator._fill_sectors — the broker only knows config.sectors
+# --------------------------------------------------------------------------- #
+import asyncio  # noqa: E402
+
+
+class _SectorProvider(StubProvider):
+    """sector_for that answers for some names, says Unknown for others, and
+    blows up for one — the three shapes a real lookup produces."""
+
+    KNOWN = {"SCCO": "Materials", "NTAP": "Technology"}
+
+    def __init__(self):
+        self.asked = []
+
+    def sector_for(self, ticker):
+        self.asked.append(ticker)
+        if ticker == "BOOM":
+            raise RuntimeError("yfinance hiccup")
+        return self.KNOWN.get(ticker, "Unknown")
+
+
+def _fill(orch, positions):
+    acct = AccountState(equity=1.0, cash=0.0, buying_power=0.0, peak_equity=1.0,
+                        positions=positions)
+    asyncio.run(orch._fill_sectors(acct))
+    return {t: p.sector for t, p in acct.positions.items()}
+
+
+def test_fill_sectors_resolves_unknowns_through_the_provider():
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = Orchestrator(_cfg(tmp), provider=_SectorProvider())
+        out = _fill(orch, {
+            "NVDA": Position("NVDA", 0.7, 231.0, 150.0, sector="Technology"),
+            "SCCO": Position("SCCO", 0.3, 211.0, 57.0),        # Unknown
+            "NTAP": Position("NTAP", 0.2, 194.0, 44.0, sector=""),
+        })
+        assert out == {"NVDA": "Technology", "SCCO": "Materials", "NTAP": "Technology"}
+        # Names the broker already placed are not re-looked-up.
+        assert "NVDA" not in orch.provider.asked
+
+
+def test_fill_sectors_survives_a_failing_lookup():
+    """One bad ticker must not turn a successful account read into a failure,
+    and must not stop the others from resolving."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = Orchestrator(_cfg(tmp), provider=_SectorProvider())
+        out = _fill(orch, {
+            "BOOM": Position("BOOM", 1.0, 1.0, 1.0),
+            "SCCO": Position("SCCO", 0.3, 211.0, 57.0),
+            "ZZZZ": Position("ZZZZ", 1.0, 1.0, 1.0),
+        })
+        assert out == {"BOOM": "Unknown", "SCCO": "Materials", "ZZZZ": "Unknown"}
+
+
+def test_read_account_fills_sectors_on_a_successful_read():
+    """The fill is wired into the one place every trading-mode read goes
+    through, so the guardrail sector bucket and the positions snapshot see it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = Orchestrator(_cfg(tmp), provider=_SectorProvider())
+
+        class _Broker:
+            async def get_account(self, peak_equity=0.0, sectors=None):
+                return AccountState(equity=57.0, cash=0.0, buying_power=0.0,
+                                    peak_equity=57.0,
+                                    positions={"SCCO": Position("SCCO", 0.3, 211.0, 57.0)})
+
+        acct = asyncio.run(orch._read_account(_Broker()))
+        assert acct.positions["SCCO"].sector == "Materials"
+
+
+def test_read_account_passes_a_failed_read_through_untouched():
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = Orchestrator(_cfg(tmp), provider=_SectorProvider())
+
+        class _Broker:
+            async def get_account(self, peak_equity=0.0, sectors=None):
+                return None
+
+        assert asyncio.run(orch._read_account(_Broker())) is None
+        assert orch.provider.asked == []
+
+
+# --------------------------------------------------------------------------- #
+# build_plan — the market gate blocks trading modes outside the session
+# --------------------------------------------------------------------------- #
+from datetime import datetime  # noqa: E402
+
+import market  # noqa: E402
+
+
+def test_is_market_open_by_the_clock():
+    et = market.ET
+    assert market.is_market_open(datetime(2026, 9, 15, 10, 5, tzinfo=et))    # Tue, mid-morning
+    assert not market.is_market_open(datetime(2026, 9, 15, 9, 0, tzinfo=et))  # pre-open
+    assert not market.is_market_open(datetime(2026, 9, 15, 16, 30, tzinfo=et))  # after close
+    assert not market.is_market_open(datetime(2026, 9, 12, 10, 5, tzinfo=et))  # Saturday
+    assert not market.is_market_open(datetime(2026, 9, 7, 10, 5, tzinfo=et))   # Labor Day
+
+
+def test_trading_mode_halts_outside_market_hours_before_touching_the_broker(monkeypatch):
+    """A manual `--mode live` at 8pm used to run the whole pipeline and send
+    market orders the broker could not fill. Now it stops at the gate, before
+    the (paid, model-mediated) account read."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _cfg(tmp, mode="live")
+        cfg.apply_account("agentic")
+        orch = _orch(cfg)
+        monkeypatch.setattr(market, "is_market_open", lambda dt=None: False)
+        monkeypatch.setattr(market, "is_trading_day", lambda d=None: True)
+
+        def _no_broker():
+            raise AssertionError("broker must not be built when the market is closed")
+        orch._build_broker = _no_broker                     # type: ignore[method-assign]
+
+        outcome = asyncio.run(orch.build_plan())
+        assert outcome.halted and outcome.halt_reason == "market_closed_skip"
+        assert "regular session" in outcome.halt_message
+        events = [r["event"] for r in orch.db.query(
+            "SELECT event FROM audit_log WHERE run_id=?", (orch.run_id,))]
+        assert "market_closed_skip" in events
+
+
+def test_recommend_mode_is_exempt_from_the_market_gate(monkeypatch):
+    """Advice is safe to produce at any hour; only trading modes are gated."""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(_cfg(tmp, mode="recommend"))
+        monkeypatch.setattr(market, "is_market_open", lambda dt=None: False)
+        outcome = asyncio.run(orch.build_plan())
+        # Discovery is off in the test config, so the run halts for lack of a
+        # universe — NOT for the market gate. That is the assertion.
+        assert outcome.halt_reason == "no_universe_halt"

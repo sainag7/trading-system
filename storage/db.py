@@ -157,6 +157,8 @@ CREATE TABLE IF NOT EXISTS trade_plans (
     max_hold_until TEXT,                -- ISO date swing time-stop
     thesis         TEXT,                -- original entry thesis (for the Monitor)
     peak_price     REAL,                -- highest price seen since entry (chandelier trail)
+    account        TEXT,                -- brokerage account that holds the position
+    scaled_out     INTEGER,            -- 1 once a partial (graded) exit has fired
     run_id         TEXT,
     updated_ts     TEXT
 );
@@ -220,6 +222,8 @@ class Database:
         """Add columns introduced after the initial schema (no-op if present)."""
         for table, col, decl in [("trade_plans", "thesis", "TEXT"),
                                   ("trade_plans", "peak_price", "REAL"),
+                                  ("trade_plans", "account", "TEXT"),
+                                  ("trade_plans", "scaled_out", "INTEGER"),
                                   ("positions", "account", "TEXT"),
                                   ("pnl", "account", "TEXT")]:
             try:
@@ -441,12 +445,13 @@ class Database:
         self, *, ticker: str, run_id: str, entry_price: float | None = None,
         stop_loss: float | None = None, take_profit: float | None = None,
         max_hold_until: str | None = None, thesis: str | None = None,
-        peak_price: float | None = None,
+        peak_price: float | None = None, account: str | None = None,
     ) -> None:
-        """Record/refresh a position's exit plan. ``entry_date``, ``thesis`` and
-        ``peak_price`` are set once, on first open, so the Monitor's time-stop
-        measures from the real entry, the original thesis is preserved, and the
-        chandelier trail starts from the entry price."""
+        """Record/refresh a position's exit plan. ``entry_date``, ``thesis``,
+        ``peak_price`` and ``account`` are set once, on first open, so the
+        Monitor's time-stop measures from the real entry, the original thesis is
+        preserved, the chandelier trail starts from the entry price, and the plan
+        stays tied to the account that actually holds the shares."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with self._cursor() as c:
             exists = c.execute(
@@ -461,39 +466,80 @@ class Database:
                        entry_price=COALESCE(entry_price, ?),
                        thesis=COALESCE(thesis, ?),
                        peak_price=COALESCE(peak_price, ?),
+                       account=COALESCE(account, ?),
                        run_id=?, updated_ts=? WHERE ticker=?""",
                     (stop_loss, take_profit, max_hold_until, entry_price, thesis,
-                     peak_price, run_id, _now(), ticker),
+                     peak_price, account, run_id, _now(), ticker),
                 )
             else:
                 c.execute(
                     """INSERT INTO trade_plans(ticker, entry_date, entry_price,
                        stop_loss, take_profit, max_hold_until, thesis, peak_price,
-                       run_id, updated_ts)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       account, run_id, updated_ts)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (ticker, today, entry_price, stop_loss, take_profit,
-                     max_hold_until, thesis, peak_price, run_id, _now()),
+                     max_hold_until, thesis, peak_price, account, run_id, _now()),
                 )
 
+    def mark_scaled_out(self, ticker: str) -> None:
+        """Flag that a graded (partial) exit has fired on this position. The
+        Monitor reads it so the NEXT trailing-stop hit closes the remainder in
+        full instead of halving it again — a position halved on every hit never
+        actually exits, it just pays spread on ever-smaller stubs."""
+        with self._cursor() as c:
+            c.execute("UPDATE trade_plans SET scaled_out=1, updated_ts=? WHERE ticker=?",
+                      (_now(), ticker))
+
+    def prune_trade_plans(self, held: Iterable[str], account: str | None) -> list[str]:
+        """Delete this account's plans for tickers no longer held; return them.
+
+        Scoped to ``account`` on purpose: a plan is only ever pruned against a
+        read of the account that owns it, so a run on the individual book can
+        never discard the agentic book's plans. Rows with no account (legacy)
+        are left alone. With ``account`` None nothing is pruned."""
+        if account is None:
+            return []
+        keep = {str(t).upper() for t in held}
+        with self._cursor() as c:
+            rows = c.execute(
+                "SELECT ticker FROM trade_plans WHERE account=?", (account,)
+            ).fetchall()
+            stale = sorted(r["ticker"] for r in rows if r["ticker"] not in keep)
+            for t in stale:
+                c.execute("DELETE FROM trade_plans WHERE ticker=? AND account=?",
+                          (t, account))
+        return stale
+
     def update_trail(self, ticker: str, *, stop_loss: float | None = None,
-                     peak_price: float | None = None) -> None:
+                     peak_price: float | None = None,
+                     account: str | None = None) -> None:
         """Ratchet a position's chandelier trail: raise ``stop_loss`` and
         ``peak_price`` but NEVER lower them (a trailing stop only moves up). Called
         each monitor cycle. ``MAX(existing, new)`` keeps the higher; when either
-        side is NULL the COALESCE chain falls back so nothing is clobbered."""
+        side is NULL the COALESCE chain falls back so nothing is clobbered.
+        With ``account`` given, only that account's plan (or a legacy row with
+        no account) is touched."""
         with self._cursor() as c:
             c.execute(
                 """UPDATE trade_plans SET
                    stop_loss  = COALESCE(MAX(stop_loss, ?), ?, stop_loss),
                    peak_price = COALESCE(MAX(peak_price, ?), ?, peak_price),
-                   updated_ts = ? WHERE ticker=?""",
-                (stop_loss, stop_loss, peak_price, peak_price, _now(), ticker),
+                   updated_ts = ? WHERE ticker=?
+                   AND (? IS NULL OR account IS NULL OR account=?)""",
+                (stop_loss, stop_loss, peak_price, peak_price, _now(), ticker,
+                 account, account),
             )
 
-    def get_trade_plans(self) -> dict[str, dict]:
-        """All stored exit plans, keyed by ticker."""
+    def get_trade_plans(self, account: str | None = None) -> dict[str, dict]:
+        """Stored exit plans, keyed by ticker. With ``account`` given, only that
+        account's plans (plus legacy rows with no account) are returned, so one
+        book's run never reads the other book's stops."""
         with self._cursor() as c:
-            c.execute("SELECT * FROM trade_plans")
+            if account is None:
+                c.execute("SELECT * FROM trade_plans")
+            else:
+                c.execute("SELECT * FROM trade_plans WHERE account IS NULL OR account=?",
+                          (account,))
             return {row["ticker"]: dict(row) for row in c.fetchall()}
 
     def delete_trade_plan(self, ticker: str) -> None:

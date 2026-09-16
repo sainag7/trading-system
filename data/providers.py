@@ -9,8 +9,9 @@ exhaust it, so this module is built around three defences:
   2. **A persistent daily request budget** stored in the cache dir. Once the
      budget is spent, Alpha Vantage calls are refused for the rest of the day
      and we transparently fall back to yfinance.
-  3. **Self-throttling** — a minimum delay between live Alpha Vantage calls so a
-     burst can't trip the per-minute limit.
+  3. **Self-throttling** — a minimum delay between live Alpha Vantage calls,
+     enforced under a lock so the concurrent research threads queue for it
+     instead of bursting past it together.
 
 Public surface (all return plain dicts/values, never raise on network failure —
 they return ``None``/empty and the caller decides what to do):
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -148,6 +150,15 @@ class DataProvider:
         self.budget = DailyBudget(cfg.cache_dir, cfg.av_daily_budget)
         self.sector_overrides = {k.upper(): v for k, v in (cfg.sector_overrides or {}).items()}
         self._last_av_call = 0.0
+        # Alpha Vantage traffic is serialised. The research agent fans out across
+        # worker threads (`research.concurrency`), and with an unlocked throttle
+        # all of them read the same stale `_last_av_call`, fire at once, and get
+        # AV's "1 request per second" rejection — while each rejected call still
+        # spends a unit of the 25/day budget. 107 of the 115 AV errors in the
+        # fortnight to 2026-09-15 were that message, and the budget they burned
+        # is why nearly every ticker then fell back to yfinance for news.
+        self._av_lock = threading.Lock()
+        self._av_exhausted_logged = False
         # Optional callback (run_id, level, event, detail) for the audit log.
         self._audit = audit
 
@@ -175,29 +186,53 @@ class DataProvider:
         if cached is not None:
             return cached
 
-        if not self.budget.can_spend():
-            self._log("WARN", "alphavantage_budget_exhausted",
-                      {"used": self.budget.used(), "budget": self.cfg.av_daily_budget})
-            return None
+        with self._av_lock:
+            # Re-check under the lock: a sibling thread may have just fetched it.
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        self._throttle_av()
-        params = {**params, "apikey": self.cfg.av_api_key}
-        try:
-            resp = requests.get(self.AV_URL, params=params, timeout=20)
-            self._last_av_call = time.time()
-            self.budget.spend(1)
-            data = resp.json()
-        except Exception as e:  # network / parse error — never raise to caller
-            self._log("ERROR", "alphavantage_request_failed", {"error": str(e)})
-            return None
+            if not self.budget.can_spend():
+                self._warn_budget_exhausted()
+                return None
 
-        # Alpha Vantage signals throttling/limits inside a 200 response body.
-        if any(k in data for k in ("Note", "Information", "Error Message")):
-            self._log("WARN", "alphavantage_limit_or_error", data)
-            return None
+            self._throttle_av()
+            params = {**params, "apikey": self.cfg.av_api_key}
+            try:
+                resp = requests.get(self.AV_URL, params=params, timeout=20)
+                self._last_av_call = time.time()
+                self.budget.spend(1)
+                data = resp.json()
+            except Exception as e:  # network / parse error — never raise to caller
+                self._log("ERROR", "alphavantage_request_failed", {"error": str(e)})
+                return None
+
+            # Alpha Vantage signals throttling/limits inside a 200 response body.
+            if any(k in data for k in ("Note", "Information", "Error Message")):
+                self._log("WARN", "alphavantage_limit_or_error", data)
+                # AV's own daily counter can run ahead of ours (another process
+                # on the same key, a different day boundary). Once it says the
+                # day is spent, spend ours too, so the remaining tickers go
+                # straight to the yfinance fallback instead of each sleeping
+                # through the throttle to collect the same rejection.
+                if "per day" in " ".join(str(v) for v in data.values()).lower():
+                    self.budget.spend(self.budget.remaining())
+                return None
 
         self.cache.set(cache_key, data)
         return data
+
+    def _warn_budget_exhausted(self) -> None:
+        """Audit the exhausted budget ONCE per provider instance. Every ticker
+        after the 25th used to add an identical row (172 in a fortnight); one
+        row that says the rest are suppressed carries the same information."""
+        if self._av_exhausted_logged:
+            return
+        self._av_exhausted_logged = True
+        self._log("WARN", "alphavantage_budget_exhausted",
+                  {"used": self.budget.used(), "budget": self.cfg.av_daily_budget,
+                   "note": "further Alpha Vantage calls this run fall back to "
+                           "yfinance; this warning is logged once per run"})
 
     # -- yfinance fallback -------------------------------------------------
     def _yf_quote(self, ticker: str) -> dict | None:
