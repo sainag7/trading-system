@@ -147,6 +147,29 @@ def _exits_by_ticker(payload) -> dict[str, dict]:
     return out
 
 
+def _promote_dust_exits(conn: sqlite3.Connection, run_id: str,
+                        exits: dict[str, dict]) -> dict[str, dict]:
+    """A partial exit whose remainder would be dust is sent as a FULL exit (see
+    ``Orchestrator._exits_to_intents``). The monitor payload still says
+    ``exit_partial``; the guardrail's ``decisions`` row carries what was actually
+    proposed, so the brief reads that and says SELL rather than TRIM."""
+    if not exits:
+        return exits
+    try:
+        rows = conn.execute(
+            "select ticker, action from decisions where run_id = ? and side = 'SELL' "
+            "and action = 'exit_full'", (run_id,)).fetchall()
+    except sqlite3.Error:
+        return exits
+    for r in rows:
+        t = str(r["ticker"]).upper()
+        if t in exits and exits[t].get("action") != "exit_full":
+            exits[t] = {**exits[t], "action": "exit_full",
+                        "reason": f"{exits[t].get('reason', '')} [closing in full — the "
+                                  f"remainder would be under the minimum position]"}
+    return exits
+
+
 def _previous_run_id(conn: sqlite3.Connection, run: sqlite3.Row) -> str | None:
     row = conn.execute(
         "select run_id from runs where started_ts < ? and mode = ? "
@@ -156,8 +179,18 @@ def _previous_run_id(conn: sqlite3.Connection, run: sqlite3.Row) -> str | None:
 
 
 def _holdings(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    """The run's holdings — ONE row per ticker.
+
+    A trading run snapshots positions twice (before deciding and again after
+    executing), so a plain ``where run_id = ?`` listed every name twice, once
+    with the pre-trade broker read (whose market_value equals cost basis, hence
+    the "$0.00 / +0.0%" twin). The LAST snapshot per ticker is the one that
+    reflects what the run actually did and what the position is worth."""
     return conn.execute(
-        "select * from positions where run_id = ? and shares > 0 order by ticker",
+        """select p.* from positions p
+           join (select ticker, max(id) as mid from positions
+                 where run_id = ? and shares > 0 group by ticker) m on m.mid = p.id
+           order by p.ticker""",
         (run_id,)).fetchall()
 
 
@@ -171,6 +204,38 @@ def _fpct(frac: float | None, *, signed: bool = False) -> str:
     if frac is None:
         return DASH
     return fmt_pct(frac * 100.0, signed=signed)
+
+
+def _drawdown_frac(stored: float | None) -> float | None:
+    """``pnl.drawdown_pct`` is stored in percent units; return it as a fraction."""
+    if stored is None:
+        return None
+    return float(stored) / 100.0
+
+
+def _halt_threshold() -> float:
+    """The configured drawdown-halt limit as a fraction (0.15 by default)."""
+    try:
+        from config import load_config
+        return float(load_config().risk.max_account_drawdown_halt_pct)
+    except Exception:
+        return 0.15
+
+
+def _active_lessons(conn: sqlite3.Connection, run: sqlite3.Row) -> list[dict]:
+    """Active review-agent lessons for the run's account (empty when the table
+    or the account attribution predates this feature)."""
+    try:
+        keys = run.keys()
+        account = run["account"] if "account" in keys else None
+        rows = conn.execute(
+            """select text, confidence from lessons
+               where account = ? and status = 'active'
+               order by confidence desc, times_reinforced desc limit 8""",
+            (str(account) if account else "",)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(r) for r in rows]
 
 
 def _delta(cur: float | None, prev: float | None) -> str:
@@ -276,7 +341,8 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
     analysis = _analysis_by_ticker(_agent_payload(conn, run_id, "analysis"))
     decision = _agent_payload(conn, run_id, "decision")
     verdicts = _verdicts_by_ticker(decision)
-    exits = _exits_by_ticker(_agent_payload(conn, run_id, "monitor"))
+    exits = _promote_dust_exits(
+        conn, run_id, _exits_by_ticker(_agent_payload(conn, run_id, "monitor")))
 
     prev_id = _previous_run_id(conn, run)
     prev_analysis = _analysis_by_ticker(
@@ -304,7 +370,10 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
     pnl = conn.execute(
         "select * from pnl where run_id = ? order by id desc limit 1", (run_id,)).fetchone()
     if pnl:
-        dd = pnl["drawdown_pct"]
+        # pnl.drawdown_pct is stored in PERCENT (the orchestrator snapshots
+        # ``drawdown_pct() * 100``); _fpct expects a fraction. Feeding it the
+        # percent printed "839.7% from peak" for an 8.4% drawdown.
+        dd = _drawdown_frac(pnl["drawdown_pct"])
         L.append(f"**Account** · equity {fmt_money(pnl['equity'])} · "
                  f"cash {fmt_money(pnl['cash'])} · "
                  f"drawdown {_fpct(dd)} from peak")
@@ -423,10 +492,29 @@ def _render(conn: sqlite3.Connection, run: sqlite3.Row) -> str:
         attention.append("**Kill switch is ENGAGED** — no orders will be placed in any mode "
                          "until the `KILL_SWITCH` file is removed.")
 
-    if pnl and pnl["drawdown_pct"] is not None and pnl["drawdown_pct"] >= 0.15:
+    # The halt threshold is the configured limit (a fraction), compared against
+    # the drawdown as a fraction. The old ``>= 0.15`` was compared against the
+    # PERCENT figure, so the banner fired at a 0.15% dip — every brief for two
+    # weeks said "New buys are blocked" while buys were going through.
+    dd_frac = _drawdown_frac(pnl["drawdown_pct"]) if pnl else None
+    halt_at = _halt_threshold()
+    if dd_frac is not None and dd_frac >= halt_at - 1e-9:
         attention.append(
-            f"**Drawdown halt territory** — {_fpct(pnl['drawdown_pct'])} off the peak. "
-            "New buys are blocked; risk-reducing sells still allowed.")
+            f"**Drawdown halt territory** — {_fpct(dd_frac)} off the peak (limit "
+            f"{_fpct(halt_at)}). New buys are blocked; risk-reducing sells still allowed.")
+
+    lessons = _active_lessons(conn, run)
+    if lessons:
+        L.append("## Lessons in force")
+        L.append("")
+        L.append("_From the post-close review agent — evidence from this account's own "
+                 "closed trades, handed to the decision and monitor agents this run._")
+        L.append("")
+        for l in lessons:
+            conf = l.get("confidence")
+            conf_s = f" _(confidence {int(conf)})_" if conf is not None else ""
+            L.append(f"- {l['text']}{conf_s}")
+        L.append("")
 
     L.append("## Needs your attention")
     L.append("")
@@ -484,7 +572,8 @@ def summary_line(db_path: str | Path = _DEFAULT_DB, run_id: str | None = None,
         analysis = _analysis_by_ticker(_agent_payload(conn, rid, "analysis"))
         decision = _agent_payload(conn, rid, "decision")
         verdicts = _verdicts_by_ticker(decision)
-        exits = _exits_by_ticker(_agent_payload(conn, rid, "monitor"))
+        exits = _promote_dust_exits(
+            conn, rid, _exits_by_ticker(_agent_payload(conn, rid, "monitor")))
         holdings = _build_holdings(conn, rid, analysis, verdicts, {}, exits)
         held = {h.ticker for h in holdings}
 

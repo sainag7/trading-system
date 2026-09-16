@@ -47,7 +47,7 @@ you money, potentially all of it. Nothing here is financial advice.**
 - [How an order reaches the broker](#how-an-order-actually-reaches-the-broker)
 - [Trade plans and exits](#trade-plans-and-exits)
 - [Dashboard](#dashboard-web-app) · [Deep research](#deep-research-on-one-stock---mode-explain)
-- [Scheduling](#scheduling-a-daily-run) · [Data & rate limits](#data--rate-limits)
+- [Scheduling](#scheduling-a-daily-run) · [The review agent](#the-review-agent--learning-from-the-ledger---mode-review) · [Data & rate limits](#data--rate-limits)
 - [Discovery](#dynamic-discovery-trending-stocks) · [Performance](#performance--speed)
 - [Testing](#testing) · [Troubleshooting](#troubleshooting)
 
@@ -246,8 +246,9 @@ it is the one component you can fully unit-test and trust.
 | Path | What it does |
 |------|--------------|
 | [config.yaml](config.yaml) | Strategy params, **hard risk limits**, watchlist, models, accounts |
-| [orchestrator.py](orchestrator.py) | Main loop; `--mode recommend\|explain\|preview\|live`; kill switch |
-| [agents/](agents/) | research / analysis / decision / monitor (+ shared `llm.py`) |
+| [orchestrator.py](orchestrator.py) | Main loop; `--mode recommend\|explain\|preview\|live\|review`; kill switch |
+| [agents/](agents/) | research / analysis / decision / monitor / **review** (+ shared `llm.py`) |
+| [agents/review_agent.py](agents/review_agent.py) | Post-close learning loop: deterministic scorecard, lessons, bounded parameter proposals |
 | [prompts/](prompts/) | One system prompt per agent |
 | [risk/guardrails.py](risk/guardrails.py) | **Deterministic** order validation + cash sweep (no LLM) |
 | [risk/test_guardrails.py](risk/test_guardrails.py) | Thorough unit tests for every limit |
@@ -255,8 +256,9 @@ it is the one component you can fully unit-test and trust.
 | [data/providers.py](data/providers.py) | Alpha Vantage / yfinance / FRED with caching + rate limits |
 | [data/robinhood_provider.py](data/robinhood_provider.py) | Quota-free quotes + fundamentals via the Robinhood MCP |
 | [market.py](market.py) | NYSE trading-day / market-hours gate |
-| [storage/db.py](storage/db.py) | SQLite: trades, fills, agent_outputs, positions, pnl, trade_plans, audit_log |
+| [storage/db.py](storage/db.py) | SQLite: trades, fills, agent_outputs, positions, pnl, trade_plans (per account), reviews, lessons, proposals, audit_log |
 | [reporting/brief.py](reporting/brief.py) | Renders the daily markdown brief |
+| [reporting/review_brief.py](reporting/review_brief.py) | Renders the post-close review (`reports/<date>-review.md`) |
 | [scheduling/](scheduling/) | launchd installer + the wrapper the scheduler runs |
 | [server/](server/) | FastAPI backend for the web dashboard |
 | [web/](web/) | React dashboard frontend (built to `web/dist`, served by the server) |
@@ -278,6 +280,7 @@ agents). Move to `preview`/`live` only once you trust it.
 | `explain` | Deep research on **one** ticker. Read-only. | **No** |
 | `preview` | Reads your real account, runs the full pipeline, prints each planned order and **asks for explicit confirmation** before sending it live. | Only after you confirm |
 | `live` | Reads your real account and **places real orders** via the Robinhood Trading MCP, within the guardrails. Requires typing `I UNDERSTAND`. | **Yes** |
+| `review` | **Post-close learning pass.** Scores every closed trade and every call the agents made, writes lessons + a playbook into the next run's prompts, applies bounded `strategy:` proposals. Defaults to the agentic account. Read-only. | **No** |
 
 ```bash
 # Advice only — see what the agents would do (nothing is traded)
@@ -426,20 +429,29 @@ account's runs only**. The two accounts in this repo are deliberately opposite:
 | | `individual` (advice only) | `agentic` (autonomous) |
 |---|:---:|:---:|
 | `max_positions` | 15 | **`null`** (agent decides) |
-| `max_position_pct` | 0.15 | **1.0** (no cap) |
+| `max_position_pct` | 0.15 | **0.35** (one name ≤ ~⅓ of the book) |
 | `max_sector_pct` | 0.40 | **1.0** (no cap) |
 | `min_cash_reserve_pct` | 0.10 | **0.0** |
 | `min_trade_usd` | 50 | **1** |
+| `min_position_usd` / `min_position_pct` | off | **$10 / 5%** of equity |
 | `sweep_cash_to_buys` | false | **true** |
 
-The agentic book runs with the percentage ceilings off **on purpose**. Because a
-ceiling *rejects* rather than trims (see above), a per-trade cap on a ~$100 book
-was dropping the agent's highest-conviction ideas rather than placing them
-smaller. What still bounds it: `per_trade_max_usd`, `daily_max_trades`, available
-buying power, `max_equity_guard`, and the kill switch.
+Sizing on the agentic book is the decision agent's call **within one ceiling**.
+The per-trade percentage cap stays off, and because every cap now *trims* an
+order to the room left rather than rejecting it, a ceiling no longer throws a
+good idea away. The per-name cap is back on purpose: on 2026-09-04 the agent put
+54% of the book into one name and that single leg lost more than the account's
+entire realized P&L across 13 closed trades.
 
-**This is a deliberately unconstrained sandbox for a small book.** Do not copy
-these settings onto an account you care about.
+**Minimum position** is distinct from minimum *trade*: it is the smallest
+position worth *holding*, enforced **after** the cash sweep. A $5 proposal with
+$100 idle is swept up, not dropped; a $1.76 open that no amount of idle cash can
+make meaningful is dropped and the cash waits a day. A partial exit whose
+remainder would fall under the floor is taken in full instead — the Monitor no
+longer halves a winner down to a stub the broker refuses.
+
+**This is still a small sandbox book.** Do not copy these settings onto an
+account you care about.
 
 ---
 
@@ -507,7 +519,7 @@ off-host. `start.command` builds the frontend on first run (needs Node 18+).
 
 ![Ideas view — ranked candidates with score bars](docs/img/ideas.png)
 
-Eight sections, everything runnable from the UI:
+Ten sections, everything runnable from the UI:
 
 - **Overview** — market/mode/backend/last-scan cards, quick actions (run a scan,
   plan trades, deep dive), your accounts and their roles, and the top ideas.
@@ -525,6 +537,10 @@ Eight sections, everything runnable from the UI:
 - **Trade** — pick an account, then **plan → approve each order → place**, or
   **one-click live** after typing `I UNDERSTAND`. Every order still passes the
   guardrails and re-checks the kill switch; it defaults to the `agentic` account.
+- **Learning** — the review agent's scorecard (expectancy, win rate, profit
+  factor, by score and size bucket), what every call did next, the closed-trade
+  table with R-multiples, **lessons in force** (retire any), **parameter
+  proposals** (Apply / Dismiss), the playbook, and **Run review now**.
 - **Automation** — install/remove the daily launchd schedule and run diagnostics.
 - **Activity** — tabbed **decisions / orders / fills / audit**, newest first, with
   each guardrail verdict and the reason (including cash-sweep resizes).
@@ -596,7 +612,8 @@ timezone changes.
 
 ```bash
 ./scheduling/install.sh                 # individual advice job (read-only), 10:00 ET weekdays
-./scheduling/install.sh --enable-live   # ALSO schedule autonomous trading — commission first!
+./scheduling/install.sh --enable-live   # ALSO schedule autonomous trading (10:05 ET) and the
+                                        # post-close review (16:30 ET) — commission first!
 ./scheduling/uninstall.sh               # stop all scheduled runs
 ```
 
@@ -635,6 +652,65 @@ python -m reporting.brief --run-id <RUN>   # a specific run
 ```
 
 `reports/` and `logs/` are gitignored — they contain real holdings and equity.
+
+---
+
+## The review agent — learning from the ledger (`--mode review`)
+
+Every other agent looks forward. The **review agent** runs once after the
+close, reads what the agents decided and what the ledger says happened, and
+writes what the evidence says back into the next morning's run. It never places
+an order and never touches a `risk:` limit.
+
+```bash
+python orchestrator.py --mode review --account agentic     # read-only; installed at 16:30 ET with --enable-live
+```
+
+**Models narrate, Python scores.** The split is the same as everywhere else:
+
+1. **A deterministic scorecard** ([agents/review_agent.py](agents/review_agent.py))
+   rebuilt from the trade ledger, no LLM involved:
+   - **FIFO round trips** — every closed leg with P&L, **R-multiple** (against the
+     stop the decision agent set at entry), hold days, size as a % of equity,
+     entry score / setup / confidence, exit trigger, MFE/MAE while held, and what
+     the name did in the 10 days *after* the exit (so a whipsawed stop is a number).
+   - **Forward returns on every call** — for each buy / add / hold / trim the
+     decision agent made *and every candidate it passed on*, the close-to-close
+     return at +1/5/10/20 trading days. "Did the buys beat the passes" is in the
+     table, not the vibes.
+   - **Behaviour** — concentration, idle cash, dust orders, broker rejections,
+     same-name rebuys within 5 days, take-profit re-fires, guardrail rejections
+     by check, decision-agent fallbacks, holdings that received no score.
+   - **Hit rates by bucket** — score, setup, exit trigger, size, hold time, ticker.
+2. **One model call** ([prompts/review_agent.md](prompts/review_agent.md)) turns
+   that into a `day_summary`, `what_worked` / `what_didnt`, **lessons** (each with
+   the legs or aggregates it rests on and a confidence bounded by sample size),
+   a **playbook**, and **parameter proposals**.
+
+**How it feeds back:**
+
+- **Lessons → prompts.** Active lessons for the account (most confident first,
+  bounded) and the playbook are handed to the decision and monitor agents as a
+  `lessons` field on every run, labelled as evidence-backed context — not a rule
+  that can override a limit. The morning brief lists them under "Lessons in force".
+  A lesson is *reinforced* when later reviews cite the same `id`, and *retired*
+  when the data stops supporting it (or from the dashboard).
+- **Proposals → `config.local.yaml`, inside bounds.** `config.yaml → review.tunable`
+  whitelists the `strategy:` keys the agent may move, each with a hard `min`/`max`
+  and the largest `step` per review. A proposal is clamped to those, and applied
+  automatically only once `review.min_closed_trades` (20) closed round trips exist
+  — a dozen trades cannot tell signal from noise. Under the gate it is recorded and
+  shown in the dashboard with an **Apply** button. `risk:` keys are never writable
+  from here, whatever the model proposes.
+- **Report.** `reports/YYYY-MM-DD-review.md` plus a "Trading review ready"
+  notification; the **Learning** tab shows the scorecard, calls table, lessons,
+  proposals and playbook, with **Run review now**.
+
+A real first review of this book (15 closed trades) found what the plan for this
+feature was written from: the `50%+` size bucket held one trade and 99% of the
+loss; the `<10%` bucket had the best expectancy; `pullback-in-uptrend` was the
+only setup with positive expectancy; `time_stop` was the worst exit trigger. Its
+one parameter proposal (`stop_atr_mult` 2.5 → 3.0) was gated at 15 < 20 trades.
 
 ---
 
@@ -725,6 +801,8 @@ The risk layer is the safety contract, so it is covered thoroughly:
 python -m pytest -q                        # everything
 python -m pytest risk/test_guardrails.py -v   # every hard limit + the cash sweep
 python -m pytest test_trade_plan.py -v        # time-stop validation + fill confirmation
+python -m pytest test_exit_discipline.py -v   # take-profit once, dust guard, per-account plans, cooldown
+python -m pytest test_review.py -v            # FIFO round trips, scorecard, bounded proposals, lessons
 python recommend_check.py                     # offline end-to-end pipeline (no keys)
 ```
 

@@ -3,7 +3,8 @@
 set -euo pipefail
 
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-for label in com.trading-system.individual-advice com.trading-system.agentic-live; do
+for label in com.trading-system.individual-advice com.trading-system.agentic-live \
+             com.trading-system.agentic-review; do
   plist="$AGENTS_DIR/$label.plist"
   if [ -f "$plist" ]; then
     launchctl unload "$plist" 2>/dev/null || true

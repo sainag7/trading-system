@@ -454,16 +454,38 @@ def _rejected(intent, failed_check: str) -> GuardrailResult:
     )
 
 
-def _ssl_buy():
+def _ssl_buy(usd: float = 3.51):
     return OrderIntent(ticker="SSL", side=Side.BUY, action="buy",
-                       usd_amount=3.51, price=14.02, sector="Materials")
+                       usd_amount=usd, price=14.02, sector="Materials")
 
 
 def test_stage_one_cash_rejection_gets_a_second_look_after_the_exits():
     """The 2026-09-10 failure mode: SSL was rejected at stage 1 for being $0.0023
     short, so it never entered plan.approved — `buys` was empty, and the whole
     two-stage mechanism switched itself off. The rejection disabled the very
-    machinery built to prevent it."""
+    machinery built to prevent it. (The exit here frees enough to clear the
+    minimum-position floor; the sub-floor case is the next test.)"""
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _orch(tmp)
+        orch.cfg.apply_account("agentic")
+        broke = AccountState(equity=264.20, cash=0.0, buying_power=0.0,
+                             peak_equity=264.20, positions={})
+        flush = AccountState(equity=264.20, cash=20.0077021200000003,
+                             buying_power=20.0077021200000003,
+                             peak_equity=264.20, positions={})
+        exit_res = _approved(_exit_intent(), 20.0077021200000003, 0.35)
+        plan = _plan(orch, [exit_res], broke)
+        plan.results = [exit_res, _rejected(_ssl_buy(20.01), "min_cash_reserve_pct")]
+        h = _StagedHarness(orch, flush)
+        asyncio.run(orch._execute_staged(plan))
+        assert h.calls[0] == ["HPE"], h.calls          # exits first
+        assert h.calls[1] == ["SSL"], h.calls          # revived after the re-read
+
+
+def test_revived_buy_under_the_minimum_position_is_dropped_not_placed():
+    """The same 09-10 shape, but the exit only frees $3.51 — 1.3% of the book.
+    The carry-forward still gets its second look, and the minimum-position floor
+    then drops it: a $3.51 SSL position can never matter, so the cash waits."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _orch(tmp)
         orch.cfg.apply_account("agentic")
@@ -477,8 +499,11 @@ def test_stage_one_cash_rejection_gets_a_second_look_after_the_exits():
         plan.results = [exit_res, _rejected(_ssl_buy(), "min_cash_reserve_pct")]
         h = _StagedHarness(orch, flush)
         asyncio.run(orch._execute_staged(plan))
-        assert h.calls[0] == ["HPE"], h.calls          # exits first
-        assert h.calls[1] == ["SSL"], h.calls          # revived after the re-read
+        assert h.calls == [["HPE"]], h.calls           # exit placed, dust buy not
+        rows = orch.db.query(
+            "select approved, reasons from decisions where ticker='SSL' order by id desc limit 1")
+        assert rows and rows[0]["approved"] == 0
+        assert "minimum position" in rows[0]["reasons"]
 
 
 def test_a_rejection_cash_cannot_fix_is_not_carried_forward():

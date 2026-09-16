@@ -78,6 +78,52 @@ def api_usage(days: int = 30) -> dict:
     return data.usage(max(1, min(days, 365)))
 
 
+# ==========================================================================
+# Review agent — the Learning tab
+# ==========================================================================
+@app.get("/api/review")
+def api_review(account: str | None = None) -> dict:
+    return data.review(account)
+
+
+@app.post("/api/review/run")
+async def api_review_run(body: dict = Body(default={})) -> dict:
+    account = body.get("account")
+
+    async def factory(job):
+        return await engine.run_review(account)
+
+    try:
+        job = manager.start_engine("review", f"{account or 'agentic'} post-close review", factory)
+    except EngineBusy as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return job.status_dict()
+
+
+@app.post("/api/review/proposals/{proposal_id}/apply")
+def api_review_apply(proposal_id: int) -> dict:
+    res = data.apply_proposal(proposal_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "could not apply")
+    return res
+
+
+@app.post("/api/review/proposals/{proposal_id}/dismiss")
+def api_review_dismiss(proposal_id: int) -> dict:
+    res = data.dismiss_proposal(proposal_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error") or "not found")
+    return res
+
+
+@app.post("/api/review/lessons/{lesson_id}/retire")
+def api_review_retire(lesson_id: str, body: dict = Body(default={})) -> dict:
+    res = data.retire_lesson(lesson_id, body.get("account"))
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error") or "not found")
+    return res
+
+
 @app.get("/api/config")
 def api_config_get() -> dict:
     return config_io.config_view()

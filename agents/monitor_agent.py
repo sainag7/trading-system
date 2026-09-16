@@ -121,24 +121,43 @@ def _deterministic_exits(positions: list[dict], strategy: dict) -> list[dict]:
                                f"broke below 50-day SMA (${sma50:.2f}) on elevated volume ({vol:.1f}x avg)", 0.75))
             continue
 
-        # 4) TAKE-PROFIT — lock gains, trail the remainder.
-        if take and price >= take - 1e-9:
+        # 4) TAKE-PROFIT — lock gains ONCE, then trail the remainder. The flag is
+        # what makes "trail the remainder" true: without it this rule re-fired on
+        # every later run the price stayed above target and halved HPE four
+        # times (0.25 sh -> 0.0157 sh) before the broker refused the dust.
+        if take and price >= take - 1e-9 and not p.get("tp_taken"):
             exits.append(_exit(p, "exit_partial", half, "take_profit",
                                f"price ${price:.2f} >= target ${take:.2f} — lock gains, trail the remainder", 0.6))
             continue
     return exits
 
 
+def _drop_repeat_take_profit(exits: list[dict], positions: list[dict]) -> list[dict]:
+    """Remove model-emitted take-profit exits on positions whose take-profit
+    has already been banked. The deterministic rule already skips them; this
+    keeps the union from letting the model re-fire what the rule retired."""
+    taken = {p["ticker"] for p in positions if p.get("tp_taken")}
+    return [e for e in exits
+            if not (e.get("ticker") in taken
+                    and str(e.get("trigger", "")).lower() == "take_profit")]
+
+
 async def run_monitor(
     positions: list[dict], strategy: dict, model: str,
-    *, db=None, run_id: str | None = None,
+    *, db=None, run_id: str | None = None, lessons: dict | None = None,
 ) -> dict:
-    """Return exit/hold decisions for open positions."""
+    """Return exit/hold decisions for open positions.
+
+    ``lessons`` (optional) is the review agent's playbook for this account —
+    evidence-backed notes from its own track record — passed through to the
+    model as context, never as a rule that can override the hard exits."""
     if not positions:
         return {"exits": [], "holds": [], "notes": "no open positions"}
 
     deterministic = _deterministic_exits(positions, strategy)
     payload = {"positions": positions, "strategy": strategy}
+    if lessons:
+        payload["lessons"] = lessons
     parsed, raw = await generate_json(SYSTEM_PROMPT, payload, model)
 
     if not isinstance(parsed, dict) or "exits" not in parsed:
@@ -148,7 +167,7 @@ async def run_monitor(
         # Safety net: union the deterministic hard exits with the LLM's, so the
         # model can NEVER suppress a triggered stop/time/thesis exit. The LLM may
         # still add an exit the rules missed (e.g. a bad-earnings thesis break).
-        exits = list(parsed.get("exits") or [])
+        exits = _drop_repeat_take_profit(list(parsed.get("exits") or []), positions)
         seen = {e.get("ticker") for e in exits}
         for d in deterministic:
             if d["ticker"] not in seen:
