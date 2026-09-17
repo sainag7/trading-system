@@ -3,11 +3,12 @@
 One broker:
 
   * :class:`RobinhoodMCPBroker` — talks to the official **Robinhood Trading
-    MCP** (https://agent.robinhood.com/mcp/trading) through the Claude Agent
-    SDK. OAuth is handled by the MCP server; no API key/secret lives in this
-    repo. Used to read the account (when configured) and to place real orders
-    in ``live`` mode. Every MCP request and response is written to the audit
-    log.
+    MCP** (https://agent.robinhood.com/mcp/trading) DIRECTLY through
+    :class:`data.robinhood_mcp.RobinhoodMCP` — no model in the loop. OAuth is
+    the client's own session in ``.cache/`` (or a bearer token); no API
+    key/secret lives in this repo. Used to read the account (when configured)
+    and to place real orders in ``live`` mode. Every MCP request and response
+    is written to the audit log.
 
 The :class:`Executor` ties a broker + run mode + the audit DB together and is the
 ONLY component that ever sends an order. Safety properties:
@@ -85,57 +86,27 @@ class OrderResult:
 # Robinhood Trading MCP broker (real)
 # ---------------------------------------------------------------------------
 class RobinhoodMCPBroker:
-    """Broker backed by the Robinhood Trading MCP via the Claude Agent SDK.
+    """Broker backed by the Robinhood Trading MCP, called directly.
 
-    The MCP is configured as a remote HTTP MCP server. OAuth is handled by the
-    MCP/Claude Code; we never store credentials. Tool discovery is automatic;
-    set ``allowed_tools`` to the exact Robinhood tool names exposed by the MCP
-    (confirm them once against your connected server — they look like
-    ``mcp__robinhood__get_positions`` etc.).
-
-    Every MCP request/response is written to the audit log. Order placement goes
-    through a narrow, imperative prompt ("place exactly this order") and results
-    are parsed as strict JSON. Anything ambiguous is returned as ``needs_review``
-    rather than retried.
+    Every tool call and its payload is written to the audit log. Order
+    placement sends exactly one ``place_equity_order`` and parses the broker's
+    own order object; anything ambiguous is returned as ``needs_review`` rather
+    than retried. The deterministic risk layer upstream is the real control —
+    this class never sizes, prices or re-tries a fill on its own.
     """
 
-    # The MCP server name as registered with Claude Code (`claude mcp add
-    # robinhood-trading ...`). Its tools are namespaced ``mcp__<server>__<tool>``.
-    SERVER = "robinhood-trading"
-
-    def __init__(self, mcp_url: str, model: str, *, token: str | None = None,
-                 account_number: str | None = None,
-                 read_tools: list[str] | None = None, place_tools: list[str] | None = None,
+    def __init__(self, client, *, account_number: str | None = None,
                  audit: Callable | None = None):
-        self.mcp_url = mcp_url
-        self.model = model
-        self.token = token          # optional bearer-token fallback (headless/CI)
+        self._rh = client
         # Which Robinhood account to read/trade. Robinhood exposes several
         # accounts under one login and every per-account MCP tool (get_portfolio,
         # get_equity_positions, place_equity_order, …) REQUIRES this number, so
-        # reads and orders are always scoped to exactly one account. When None the
-        # broker runs single-account (whatever the MCP treats as default) — the
-        # legacy behaviour, kept for backward compatibility.
+        # reads and orders are always scoped to exactly one account.
         self.account_number = str(account_number).strip() if account_number else None
         self._audit = audit
         # Set when the most recent get_account() failed, so callers can print an
         # actionable message (connection/auth lapse vs an unparseable read).
         self.last_read_failure: dict | None = None
-        # The Agent SDK grants MCP permission at SERVER granularity, so the
-        # allow-list uses the server prefix (individual tool names are silently
-        # denied → empty responses). The narrow per-call instruction + the
-        # deterministic risk layer are the real controls, not this list.
-        # Read tools (get_accounts / get_equity_positions / get_equity_quotes) and
-        # place tools (place_equity_order) both live under this one server.
-        server = f"mcp__{self.SERVER}"
-        self.read_tools = read_tools or [server]
-        self.place_tools = place_tools or [server]
-
-    def _server_config(self) -> dict:
-        cfg: dict[str, Any] = {self.SERVER: {"type": "http", "url": self.mcp_url}}
-        if self.token:
-            cfg[self.SERVER]["headers"] = {"Authorization": f"Bearer {self.token}"}
-        return cfg
 
     def _log(self, level: str, event: str, detail: Any) -> None:
         if self._audit:
@@ -144,34 +115,11 @@ class RobinhoodMCPBroker:
             except Exception:
                 pass
 
-    async def _ask(self, instruction: str, tools: list[str], max_turns: int) -> tuple[Any, str | None]:
-        from agents.llm import generate_json, usage_context
-        # Auditable MCP request log (never logs the bearer token).
-        self._log("INFO", "mcp_request",
-                  {"server": self.SERVER, "account": self.account_number,
-                   "tools": tools, "instruction": instruction[:500]})
-        system = (
-            "You are an execution bridge to the Robinhood Trading MCP. "
-            "Use ONLY the provided Robinhood MCP tools to fulfil the request. "
-            "Do not invent data. After you have called the necessary tools, your "
-            "FINAL message MUST be the requested STRICT JSON object and nothing "
-            "else — no prose, no markdown, and not a tool call."
-        )
-        # Prefer the OAuth'd server that Claude Code holds (inherit its config via
-        # setting_sources=["local"]); fall back to an explicit bearer-token server
-        # only when a token was supplied (headless/CI without an interactive login).
-        with usage_context(agent="execution"):
-            if self.token:
-                parsed, raw = await generate_json(
-                    system, instruction, self.model,
-                    mcp_servers=self._server_config(), allowed_tools=tools, max_turns=max_turns)
-            else:
-                parsed, raw = await generate_json(
-                    system, instruction, self.model,
-                    allowed_tools=tools, max_turns=max_turns, setting_sources=["local"])
-        self._log("INFO", "mcp_response",
-                  {"raw": (raw or "")[:1000], "parsed_ok": isinstance(parsed, (dict, list))})
-        return parsed, raw
+    async def _call(self, tool: str, args: dict) -> Any:
+        """One direct tool call. Raises ``RobinhoodMCPError`` — callers decide
+        whether that is a retryable read or a needs-review order outcome."""
+        from data.robinhood_mcp import RobinhoodMCPError  # noqa: F401 (re-raised)
+        return await self._rh.call(tool, args)
 
     def _account_from_json(self, parsed: dict, peak_equity: float, sectors: dict) -> AccountState:
         positions = {}
@@ -196,144 +144,83 @@ class RobinhoodMCPBroker:
 
     async def get_account(self, peak_equity: float = 0.0,
                           sectors: dict[str, str] | None = None) -> AccountState | None:
+        """Read cash + holdings for this account. ``None`` on failure (with
+        ``last_read_failure`` set); reads are idempotent so the caller may retry."""
+        from data.robinhood_mcp import RobinhoodMCPError
         acct = self.account_number
-        if acct:
-            # Account-scoped read: get_portfolio + get_equity_positions both take
-            # the account number, so cash/holdings are for THIS account only.
-            instruction = (
-                f'Read Robinhood account number "{acct}", READ-ONLY. You MUST call '
-                f'BOTH tools with account_number="{acct}", every time, before '
-                "answering:\n"
-                f'  1. get_portfolio(account_number="{acct}") → this account\'s cash '
-                "and buying power.\n"
-                f'  2. get_equity_positions(account_number="{acct}") → EVERY open '
-                "equity holding IN THIS ACCOUNT (ticker, quantity, average buy "
-                "price, current market value). Do not skip this or summarise — list "
-                "every position it returns.\n"
-                f'Use ONLY account "{acct}". Call NO buy/sell/place/cancel tools. If '
-                "get_equity_positions returns holdings, `positions` MUST be "
-                "non-empty. Return STRICT JSON only:\n"
-                '{"cash": <float>, "buying_power": <float>, '
-                '"positions": [{"ticker": "AAPL", "shares": <float>, "avg_cost": '
-                '<float>, "market_value": <float>}]}'
-            )
-            cash_instruction = (
-                f'READ-ONLY. Call get_portfolio(account_number="{acct}") ONLY and '
-                "report this account's settled cash and buying power. Call no other "
-                'tool. Return STRICT JSON only: {"cash": <float>, "buying_power": '
-                "<float>}"
-            )
-        else:
-            instruction = (
-                "Read my Robinhood account, READ-ONLY. You MUST call BOTH tools, "
-                "every time, before answering:\n"
-                "  1. get_accounts  → cash and buying power.\n"
-                "  2. get_equity_positions → EVERY open equity holding (ticker, "
-                "quantity, average buy price, current market value). Do not skip "
-                "this or summarise — list every position it returns.\n"
-                "Call NO buy/sell/place/cancel tools. If get_equity_positions "
-                "returns holdings, `positions` MUST be non-empty. Return STRICT "
-                'JSON only:\n{"cash": <float>, "buying_power": <float>, '
-                '"positions": [{"ticker": "AAPL", "shares": <float>, "avg_cost": '
-                '<float>, "market_value": <float>}]}'
-            )
-            cash_instruction = (
-                "READ-ONLY. Call get_accounts ONLY and report the account's "
-                "settled cash and buying power. Call no other tool. Return STRICT "
-                'JSON only: {"cash": <float>, "buying_power": <float>}'
-            )
-        # The model-mediated read's ONLY failure mode is under-reporting — it
-        # sometimes answers from get_accounts alone and skips positions (never the
-        # reverse; it can't invent holdings). So take the RICHEST of a few reads
-        # and stop as soon as one returns holdings. Reads are idempotent, so
-        # retrying is always safe (unlike a fill).
-        from agents.llm import last_error
-        sec = {k.upper(): v for k, v in (sectors or {}).items()}
-        best: AccountState | None = None
-        any_text = False            # did any attempt return non-empty model output?
-        for attempt in range(3):
-            try:
-                parsed, raw = await self._ask(instruction, self.read_tools, max_turns=8)
-            except Exception as e:
-                self._log("WARN", "robinhood_read_retry", {"attempt": attempt + 1, "error": str(e)})
-                continue
-            if raw:
-                any_text = True
-            if not isinstance(parsed, dict):
-                continue
-            cand = self._account_from_json(parsed, peak_equity, sec)
-            if best is None or len(cand.positions) > len(best.positions) \
-                    or (len(cand.positions) == len(best.positions) and cand.equity > best.equity):
-                best = cand
-            if best.positions:  # got holdings -> trust it, stop early
-                break
-        if best is None:
-            err = last_error()
-            if not any_text:
-                # No model output at all on any attempt — the MCP call returned
-                # nothing. This is (almost always) a dropped/expired Robinhood MCP
-                # connection: the OAuth'd `robinhood-trading` session the subprocess
-                # inherits via setting_sources=["local"] has lapsed. NOT a stochastic
-                # parse miss — retrying won't help until it's reconnected.
-                self.last_read_failure = {
-                    "kind": "no_response", "attempts": 3,
-                    "account": self.account_number, "error": err,
-                    "hint": "reconnect robinhood-trading via /mcp in an interactive "
-                            "claude session started from this repo, then re-run",
-                }
-                self._log("ERROR", "robinhood_mcp_no_response", self.last_read_failure)
-            else:
-                # Got model text but never valid account JSON — the rarer, genuinely
-                # stochastic case; a re-run usually succeeds.
-                self.last_read_failure = {
-                    "kind": "unparseable", "attempts": 3,
-                    "account": self.account_number, "error": err,
-                }
-                self._log("ERROR", "robinhood_read_unparseable", self.last_read_failure)
+        if not acct:
+            self.last_read_failure = {"kind": "no_account", "error": "account_number not configured"}
+            self._log("ERROR", "robinhood_read_failed", self.last_read_failure)
+            return None
+        try:
+            portfolio = await self._call("get_portfolio", {"account_number": acct})
+            positions = await self._read_positions(acct)
+            symbols = sorted({p["symbol"] for p in positions if p.get("symbol")})
+            quotes = await self._read_quotes(symbols) if symbols else {}
+        except RobinhoodMCPError as e:
+            self.last_read_failure = {
+                "kind": "no_response", "account": acct, "error": str(e)[:300],
+                "hint": "Robinhood MCP unreachable or OAuth session lapsed — run "
+                        "`python -m data.robinhood_mcp login` from this repo, then re-run",
+            }
+            self._log("ERROR", "robinhood_mcp_no_response", self.last_read_failure)
+            return None
+        parsed = account_json(portfolio, positions, quotes)
+        if parsed is None:
+            self.last_read_failure = {"kind": "unparseable", "account": acct,
+                                      "error": "portfolio payload missing cash"}
+            self._log("ERROR", "robinhood_read_unparseable", self.last_read_failure)
             return None
         self.last_read_failure = None
-
-        # The positions-rich read usually reports cash as 0 (the model called the
-        # positions tool but not the cash/portfolio one). Top up cash with a
-        # focused read so equity/buying-power are complete.
-        if best.positions and best.cash <= 0:
-            for _ in range(2):
-                try:
-                    c, _raw = await self._ask(cash_instruction, self.read_tools, max_turns=6)
-                except Exception:
-                    c = None
-                if isinstance(c, dict) and float(c.get("cash", 0) or 0) > 0:
-                    best.cash = float(c["cash"])
-                    best.buying_power = float(c.get("buying_power", best.cash) or best.cash)
-                    best.equity = best.cash + sum(p.market_value for p in best.positions.values())
-                    best.peak_equity = max(best.peak_equity, best.equity)
-                    break
-
+        sec = {k.upper(): v for k, v in (sectors or {}).items()}
+        best = self._account_from_json(parsed, peak_equity, sec)
         self._log("INFO", "robinhood_account_read",
-                  {"account": self.account_number, "cash": round(best.cash, 2),
+                  {"account": acct, "cash": round(best.cash, 2),
                    "positions": len(best.positions), "equity": round(best.equity, 2)})
         return best
+
+    async def _read_positions(self, acct: str) -> list[dict]:
+        """All open equity positions, following pagination."""
+        out: list[dict] = []
+        cursor = None
+        for _ in range(20):                       # hard stop; a book is never 20 pages
+            args = {"account_number": acct}
+            if cursor:
+                args["cursor"] = cursor
+            data = await self._call("get_equity_positions", args)
+            rows = (data or {}).get("positions") if isinstance(data, dict) else None
+            out.extend(r for r in (rows or []) if isinstance(r, dict))
+            cursor = _next_cursor(data)
+            if not cursor:
+                break
+        return out
+
+    async def _read_quotes(self, symbols: list[str]) -> dict[str, float]:
+        from data.robinhood_provider import quote_from_result
+        prices: dict[str, float] = {}
+        for i in range(0, len(symbols), 20):
+            data = await self._call("get_equity_quotes", {"symbols": symbols[i:i + 20]})
+            for row in ((data or {}).get("results") or []) if isinstance(data, dict) else []:
+                q = quote_from_result(row)
+                if q:
+                    prices[q["ticker"]] = q["price"]
+        return prices
 
     async def place_order(self, *, ticker: str, side: Side, qty: float, limit_price: float,
                           order_type: str = "limit", ref_id: str | None = None,
                           dollar_amount: float | None = None) -> OrderResult:
-        acct = self.account_number
-        acct_clause = (
-            f'in Robinhood account number "{acct}" (pass account_number="{acct}") '
-            if acct else ""
-        )
-        ref_clause = f'Pass ref_id="{ref_id}" for idempotency. ' if ref_id else ""
-        # A market order takes no limit_price — passing one is an invalid
-        # combination at the broker. The reference price is passed along only so
-        # the response can be sanity-checked against it, never as an order field.
-        if order_type == "market":
-            price_clause = (
-                'as a MARKET order with market_hours="regular_hours". '
-                "Do NOT pass limit_price. The current reference price is "
-                f"~${limit_price:.2f}"
-            )
-        else:
-            price_clause = f"at limit price {limit_price:.2f}"
+        from data.robinhood_mcp import RobinhoodMCPError
+        if not self.account_number:
+            return OrderResult(ok=False, status="error",
+                               detail={"error": "account_number not configured"})
+        args: dict[str, Any] = {
+            "account_number": self.account_number,
+            "symbol": ticker.upper(),
+            "side": str(side.value).lower(),
+            "type": order_type,
+            "market_hours": "regular_hours",
+            "time_in_force": "gfd",
+        }
         # A fractional quantity can only go out as a market order, which has no
         # price protection: between sizing and fill the price can move and a
         # share-based order spends whatever it costs. Sending the approved
@@ -341,99 +228,159 @@ class RobinhoodMCPBroker:
         # count itself. Buys only: a sell needs to move an exact share count
         # (closing a position), and its risk is smaller proceeds, not overspend.
         if dollar_amount is not None:
-            size_clause = (f'for dollar_amount="{dollar_amount:.2f}" of {ticker} '
-                           f"(pass dollar_amount, NOT quantity; this caps the spend "
-                           f"at ${dollar_amount:.2f})")
+            args["dollar_amount"] = f"{dollar_amount:.2f}"
         else:
-            size_clause = f"for {_fmt_qty(qty)} shares of {ticker}"
-        instruction = (
-            f"Using place_equity_order, place EXACTLY ONE {order_type} {side.value} "
-            f"order {acct_clause}{size_clause} "
-            f"{price_clause}. {ref_clause}Do not place any other order and do not "
-            "use any other account. If the order is accepted, return STRICT JSON: "
-            '{"status": "submitted"|"filled", "order_id": "<id>", '
-            '"filled_qty": <float>, "fill_price": <float>}. '
-            "Report filled_qty and fill_price ONLY as the broker actually reports "
-            "them; OMIT either field if the broker did not report it. Do NOT infer, "
-            "estimate or echo back the reference price. "
-            "If it is rejected or anything is unclear, return "
-            '{"status": "rejected"|"unclear", "detail": "<why>"} and do NOT retry.'
-        )
+            args["quantity"] = _fmt_qty(qty)
+        # A market order takes no limit_price — passing one is an invalid
+        # combination at the broker. The reference price is kept only for the
+        # audit trail, never sent as an order field.
+        if order_type != "market":
+            args["limit_price"] = f"{limit_price:.2f}"
+        if ref_id:
+            args["ref_id"] = ref_id
+        self._log("INFO", "order_request", {**args, "reference_price": round(limit_price, 4)})
         try:
-            parsed, raw = await self._ask(instruction, self.place_tools, max_turns=6)
-        except Exception as e:
-            return OrderResult(ok=False, status="error", detail={"error": str(e)})
-        if not isinstance(parsed, dict):
-            # Unknown outcome -> never assume; flag for a human. NEVER blind-retry a fill.
+            data = await self._call("place_equity_order", args)
+        except RobinhoodMCPError as e:
+            # The transport failed; the order MAY have been accepted upstream.
+            # Never blind-retry a fill: flag it and let reconciliation decide.
             return OrderResult(ok=False, status="needs_review",
-                               detail={"raw": raw, "note": "unparseable broker response"})
-        status = str(parsed.get("status", "unclear")).lower()
-        if status in ("submitted", "filled"):
-            reported_qty = _f_or_none(parsed.get("filled_qty"))
-            reported_price = _f_or_none(parsed.get("fill_price"))
-            # NEVER substitute the reference price for a fill the broker did not
-            # report — that writes an invented cost basis into the ledger and
-            # produces P&L computed against a price nothing traded at. Unknown
-            # stays 0.0 and is flagged, so the fills row is skipped and the
-            # trades row keeps its "intended" price under a non-filled status.
-            detail = dict(parsed)
-            if reported_price is None:
-                detail["fill_price_reported"] = False
-            # A share count may be assumed only for a share-based order the
-            # broker says is FILLED. A "submitted" order has no fill yet, and a
-            # dollar-based order's share count is the broker's to determine.
-            if reported_qty is None and status == "filled" and dollar_amount is None:
-                reported_qty = qty
-            elif reported_qty is None:
-                detail["filled_qty_reported"] = False
-            return OrderResult(
-                ok=True, status=status,
-                filled_qty=reported_qty or 0.0,
-                fill_price=reported_price or 0.0,
-                broker_order_id=str(parsed.get("order_id", "")) or None, detail=detail,
-            )
-        if status == "rejected":
-            return OrderResult(ok=False, status="rejected", detail=parsed)
-        return OrderResult(ok=False, status="needs_review", detail=parsed)
+                               detail={"error": str(e)[:500], "note": "broker call failed; state unknown"})
+        order = order_from_payload(data)
+        if order is None:
+            return OrderResult(ok=False, status="needs_review",
+                               detail={"raw": _clip(data), "note": "unparseable broker response"})
+        state = order["state"]
+        if state in _REJECTED_STATES:
+            return OrderResult(ok=False, status="rejected", detail=order)
+        if state not in _ACCEPTED_STATES:
+            return OrderResult(ok=False, status="needs_review", detail=order)
+        status = "filled" if state == "filled" else "submitted"
+        reported_qty = order.get("filled_qty")
+        reported_price = order.get("fill_price")
+        # NEVER substitute the reference price for a fill the broker did not
+        # report — that writes an invented cost basis into the ledger and
+        # produces P&L computed against a price nothing traded at. Unknown
+        # stays 0.0 and is flagged, so the fills row is skipped and the
+        # trades row keeps its "intended" price under a non-filled status.
+        detail = dict(order)
+        if reported_price is None:
+            detail["fill_price_reported"] = False
+        # A share count may be assumed only for a share-based order the
+        # broker says is FILLED. A "submitted" order has no fill yet, and a
+        # dollar-based order's share count is the broker's to determine.
+        if reported_qty is None and status == "filled" and dollar_amount is None:
+            reported_qty = qty
+        elif reported_qty is None:
+            detail["filled_qty_reported"] = False
+        return OrderResult(
+            ok=True, status=status,
+            filled_qty=reported_qty or 0.0,
+            fill_price=reported_price or 0.0,
+            broker_order_id=order.get("order_id"), detail=detail,
+        )
 
     async def get_order_fill(self, order_id: str) -> dict:
         """Read one order's CURRENT state back from the broker (read-only).
 
         ``place_equity_order`` returns as soon as the order is accepted, so its
-        response usually says ``submitted`` with no price — the fill lands
-        milliseconds later. Without this read-back the system never learns what
-        it actually paid and falls back to the pre-trade reference price, which
-        is both a wrong cost basis and a wrongly-anchored stop.
+        response usually says ``confirmed``/``queued`` with no price — the fill
+        lands milliseconds later. Without this read-back the system never
+        learns what it actually paid and falls back to the pre-trade reference
+        price, which is both a wrong cost basis and a wrongly-anchored stop.
 
         Returns ``{}`` when the state cannot be read; the caller must treat that
         as "unknown", never as "not filled".
         """
-        acct = self.account_number
-        acct_clause = f', account_number="{acct}"' if acct else ""
-        instruction = (
-            f'READ-ONLY. Call get_equity_orders(order_id="{order_id}"{acct_clause}) '
-            "and report that order's CURRENT state. Call no other tool and place "
-            "no orders. Report ONLY what the broker returns — do not infer or "
-            "estimate a price. Map cumulative_quantity -> filled_qty and "
-            "average_price -> fill_price; OMIT a field the broker leaves null. "
-            'Return STRICT JSON only: {"state": "<state>", "filled_qty": <float>, '
-            '"fill_price": <float>}'
-        )
+        from data.robinhood_mcp import RobinhoodMCPError
         try:
-            parsed, raw = await self._ask(instruction, self.read_tools, max_turns=4)
-        except Exception as e:
-            self._log("WARN", "order_readback_failed",
-                      {"order_id": order_id, "error": str(e)})
+            data = await self._call("get_equity_orders",
+                                    {"account_number": self.account_number, "order_id": order_id})
+        except RobinhoodMCPError as e:
+            self._log("WARN", "order_readback_failed", {"order_id": order_id, "error": str(e)[:300]})
             return {}
-        if not isinstance(parsed, dict):
-            self._log("WARN", "order_readback_unparseable",
-                      {"order_id": order_id, "raw": (raw or "")[:500]})
+        orders = (data or {}).get("orders") if isinstance(data, dict) else None
+        order = order_from_payload(orders[0]) if orders else None
+        if order is None:
+            self._log("WARN", "order_readback_unparseable", {"order_id": order_id, "raw": _clip(data)})
             return {}
-        return {
-            "state": str(parsed.get("state", "")).lower(),
-            "filled_qty": _f_or_none(parsed.get("filled_qty")),
-            "fill_price": _f_or_none(parsed.get("fill_price")),
-        }
+        return {"state": order["state"], "filled_qty": order.get("filled_qty"),
+                "fill_price": order.get("fill_price")}
+
+
+# Broker order states. Anything else (unconfirmed, partially_filled after the
+# poll window, unknown strings) is surfaced as needs_review, never guessed.
+_ACCEPTED_STATES = {"new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"}
+_REJECTED_STATES = {"rejected", "failed", "cancelled", "voided"}
+
+
+def _clip(v: Any, n: int = 800) -> str:
+    import json
+    s = v if isinstance(v, str) else json.dumps(v, default=str)
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _next_cursor(data: Any) -> str | None:
+    """Pagination cursor from a list payload, if any (``cursor`` or a ``next``
+    URL carrying ``?cursor=``)."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("cursor"):
+        return str(data["cursor"])
+    nxt = data.get("next")
+    if isinstance(nxt, str) and "cursor=" in nxt:
+        from urllib.parse import parse_qs, urlparse
+        return (parse_qs(urlparse(nxt).query).get("cursor") or [None])[0]
+    return None
+
+
+def account_json(portfolio: Any, positions: list[dict], prices: dict[str, float]) -> dict | None:
+    """Assemble the ``{cash, buying_power, positions[]}`` shape
+    :meth:`RobinhoodMCPBroker._account_from_json` consumes from the raw
+    ``get_portfolio`` / ``get_equity_positions`` / quotes payloads."""
+    if not isinstance(portfolio, dict) or portfolio.get("cash") is None:
+        return None
+    cash = float(portfolio.get("cash") or 0)
+    bp = portfolio.get("buying_power")
+    if isinstance(bp, dict):
+        bp = bp.get("buying_power")
+    out_positions = []
+    for p in positions:
+        sym = str(p.get("symbol") or "").upper()
+        shares = _f_or_none(p.get("quantity"))
+        if not sym or not shares:
+            continue
+        avg = _f_or_none(p.get("average_buy_price")) or 0.0
+        px = prices.get(sym)
+        out_positions.append({
+            "ticker": sym, "shares": shares, "avg_cost": avg,
+            # Market value at the live quote; if a quote is missing fall back
+            # to cost so the position is at least counted, never dropped.
+            "market_value": shares * (px if px else avg),
+        })
+    return {"cash": cash, "buying_power": float(bp) if bp is not None else cash,
+            "positions": out_positions}
+
+
+def order_from_payload(data: Any) -> dict | None:
+    """Normalise a broker order object (from ``place_equity_order`` or one
+    ``get_equity_orders`` entry) to ``{order_id, state, filled_qty, fill_price}``.
+    Tolerates an ``{"order": {...}}`` wrapper. ``None`` when it is not an order."""
+    if not isinstance(data, dict):
+        return None
+    o = data.get("order") if isinstance(data.get("order"), dict) else data
+    order_id = o.get("id") or o.get("order_id")
+    state = o.get("state")
+    if not order_id or not state:
+        return None
+    return {
+        "order_id": str(order_id),
+        "state": str(state).lower(),
+        "filled_qty": _f_or_none(o.get("cumulative_quantity")),
+        "fill_price": _f_or_none(o.get("average_price")),
+        "symbol": o.get("symbol"), "side": o.get("side"), "type": o.get("type"),
+        "quantity": o.get("quantity"), "dollar_based_amount": o.get("dollar_based_amount"),
+    }
 
 
 # ---------------------------------------------------------------------------

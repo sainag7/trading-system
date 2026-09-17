@@ -1,7 +1,7 @@
 """Offline tests for the Robinhood market-data provider — NO network, NO MCP.
 
-Feeds a fake MCP bridge the real JSON shapes captured from the live tools and
-asserts the field contract the rest of the system relies on, the deterministic
+Feeds a fake direct MCP client the real JSON shapes captured from the live
+tools and asserts the field contract the rest of the system relies on, the deterministic
 financials computation, the sector mapping, and graceful fallback to the wrapped
 provider on any missing symbol.
 
@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import asyncio
 
-from data.robinhood_provider import RobinhoodDataProvider, _map_rh_sector
+from data.robinhood_mcp import RobinhoodMCPError
+from data.robinhood_provider import (
+    RobinhoodDataProvider, _map_rh_sector, profile_from_result, quote_from_result,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -53,18 +56,23 @@ class FakeInner:
         return {"fed_funds": 4.5, "ten_year": 4.2, "cpi": 3.1, "unemployment": 4.0}
 
 
-# Real captured shapes (trimmed) from the live Robinhood tools.
-_QUOTES = {"NVDA": {"price": 206.96, "prev_close": 208.76}}
+# Real captured shapes (trimmed) from the live Robinhood tools, as the direct
+# client returns them (the `data` half of the {"data", "guide"} envelope).
+_QUOTES = {"NVDA": {"quote": {"symbol": "NVDA", "last_trade_price": "206.960000",
+                              "last_non_reg_trade_price": None,
+                              "previous_close": "208.760000"},
+                    "close": {"symbol": "NVDA", "price": "208.76"}}}
 _SERIES = {"NVDA": [
     {"date": "2026-06-15", "open": 208.92, "high": 212.71, "low": 208.34,
      "close": 212.45, "volume": 149936688},
     {"date": "2026-06-16", "open": 211.18, "high": 211.49, "low": 207.29,
      "close": 207.41, "volume": 125694100},
 ]}
-_PROFILE = {"NVDA": {"sector": "Electronic Technology", "industry": "Semiconductors",
-                     "description": "NVIDIA Corp. designs GPUs.", "market_cap": 5.09e12,
-                     "pe_ratio": 31.76, "shares_outstanding": 24.6e9,
-                     "week52_high": 236.54, "week52_low": 164.07}}
+_PROFILE = {"NVDA": {"symbol": "NVDA", "sector": "Electronic Technology",
+                     "industry": "Semiconductors",
+                     "description": "NVIDIA Corp. designs GPUs.", "market_cap": "5.09e12",
+                     "pe_ratio": "31.76", "shares_outstanding": "24.6e9",
+                     "high_52_weeks": "236.54", "low_52_weeks": "164.07"}}
 # 5 quarters so YoY growth is computable (index 0 vs index 4).
 _FIN = {"NVDA": [
     {"revenue": 81.6e9, "gross_profit": 61.1e9, "net_income": 58.3e9, "net_margin": 71.46},
@@ -75,32 +83,39 @@ _FIN = {"NVDA": [
 ]}
 
 
-def _fake_ask_factory(calls):
-    async def _ask(instruction, max_turns=8):
-        instr = instruction
-        calls.append(instr)               # record every MCP instruction issued
-        # Only answer for symbols mentioned in the instruction (so a fallback
-        # symbol not in the canned data is simply never returned).
-        def scope(table):
-            return {s: v for s, v in table.items() if f'"{s}"' in instr or s in instr}
-        if "get_equity_quotes" in instr:
-            return scope(_QUOTES)
-        if "get_equity_historicals" in instr:
-            return scope(_SERIES)
-        if "get_equity_fundamentals" in instr:
-            return scope(_PROFILE)
-        if "get_financials" in instr:
-            return scope(_FIN)
-        return {}
-    return _ask
+class FakeRH:
+    """Stands in for data.robinhood_mcp.RobinhoodMCP: answers each tool with the
+    raw payload shape, scoped to the requested symbols."""
+
+    def __init__(self, quotes=None, profiles=None, fins=None):
+        self.calls: list[tuple[str, dict]] = []     # every (tool, args) issued
+        self.quotes = _QUOTES if quotes is None else quotes
+        self.profiles = _PROFILE if profiles is None else profiles
+        self.fins = _FIN if fins is None else fins
+
+    async def call(self, tool, args):
+        self.calls.append((tool, args))
+        syms = args.get("symbols") or []
+        if tool == "get_equity_quotes":
+            return {"results": [self.quotes[s] for s in syms if s in self.quotes]}
+        if tool == "get_equity_fundamentals":
+            return {"results": [self.profiles[s] for s in syms if s in self.profiles]}
+        if tool == "get_financials":
+            return {"results": [{"symbol": s, "period": "quarterly", "financials": self.fins[s]}
+                                if s in self.fins else None for s in syms]}
+        raise RobinhoodMCPError(f"unexpected tool {tool}")
 
 
-def _provider():
+def _provider(rh: FakeRH | None = None):
     inner = FakeInner()
-    p = RobinhoodDataProvider(inner, model="test")
-    p.ask_calls = []                      # instructions the provider issued to the MCP
-    p._ask = _fake_ask_factory(p.ask_calls)   # bypass the real MCP/LLM bridge
+    rh = rh or FakeRH()
+    p = RobinhoodDataProvider(inner, rh)
+    p.rh = rh
     return p, inner
+
+
+def _tools(p) -> list[str]:
+    return [t for t, _ in p.rh.calls]
 
 
 # --------------------------------------------------------------------------- #
@@ -115,14 +130,14 @@ def test_prefetch_populates_quotes_from_robinhood():
 
 
 def test_prefetch_never_requests_historicals():
-    # Series is deliberately NOT sourced from Robinhood (the LLM bridge can't
-    # re-emit hundreds of bars). Prefetch must issue quotes + fundamentals +
+    # Series is deliberately NOT sourced from Robinhood (yfinance serves the
+    # full lookback free). Prefetch must issue quotes + fundamentals +
     # financials calls, but NEVER get_equity_historicals.
     p, _ = _provider()
     asyncio.run(p.prefetch(["NVDA"]))
-    assert p.ask_calls, "prefetch should issue some MCP calls"
-    assert not any("get_equity_historicals" in c for c in p.ask_calls)
-    assert any("get_equity_quotes" in c for c in p.ask_calls)
+    assert p.rh.calls, "prefetch should issue some MCP calls"
+    assert "get_equity_historicals" not in _tools(p)
+    assert "get_equity_quotes" in _tools(p)
 
 
 def test_series_always_delegates_to_yfinance():
@@ -223,58 +238,63 @@ def test_dataprovider_series_skips_alphavantage():
 
 
 # --------------------------------------------------------------------------- #
-# Unquotable symbols: blacklist only on real evidence, and never re-ask
+# Unquotable symbols and payload mapping
 # --------------------------------------------------------------------------- #
-def _provider_with(responses):
-    """Provider whose quotes call returns each queued response in turn."""
-    inner = FakeInner()
-    p = RobinhoodDataProvider(inner, model="test")
-    p.ask_calls = []
-    queue = list(responses)
-
-    async def _ask(instruction, max_turns=8):
-        p.ask_calls.append(instruction)
-        return queue.pop(0) if queue else {}
-
-    p._ask = _ask
-    return p
-
-
 def test_symbol_absent_from_a_real_payload_is_blacklisted_once():
-    """A successful quotes payload that omits a symbol is proof the broker has no
-    instrument for it (delisted/acquired). Record it and stop asking — re-asking
-    cannot change the answer and burns an LLM round-trip each time."""
-    p = _provider_with([{"AAPL": {"price": 100.0, "prev_close": 99.0}}])
-    asyncio.run(p.prefetch(["AAPL", "WBS"]))
+    """A well-formed quotes payload that omits a symbol is proof the broker has
+    no instrument for it (delisted/acquired). Record it and stop asking."""
+    p, _ = _provider()
+    asyncio.run(p.prefetch(["NVDA", "WBS"]))
     assert "WBS" in p._unavailable
-    assert "AAPL" not in p._unavailable
-    quote_calls = [c for c in p.ask_calls if "get_equity_quotes" in c]
-    assert len(quote_calls) == 1          # no pointless retry
+    assert "NVDA" not in p._unavailable
+    assert _tools(p).count("get_equity_quotes") == 1          # no pointless retry
 
     # A later prefetch must not ask about the known-unavailable symbol again.
-    p.ask_calls.clear()
+    p.rh.calls.clear()
     p._prefetched.clear()
     asyncio.run(p.prefetch(["WBS"]))
-    assert [c for c in p.ask_calls if "get_equity_quotes" in c] == []
+    assert "get_equity_quotes" not in _tools(p)
 
 
-def test_error_shaped_response_does_not_blacklist_the_batch():
-    """Being a dict is not proof of a quotes payload. An error body or wrapped
-    envelope resolves nothing — that must trigger a retry, not permanently
-    blacklist every symbol in the batch."""
-    p = _provider_with([
-        {"error": "rate limited"},                              # garbage, retry
-        {"AAPL": {"price": 100.0}, "MSFT": {"price": 200.0}},   # real payload
-    ])
-    asyncio.run(p.prefetch(["AAPL", "MSFT"]))
-    assert p._unavailable == set()        # nothing wrongly blacklisted
-    assert p._quotes["AAPL"]["price"] == 100.0
-    assert p._quotes["MSFT"]["price"] == 200.0
-    assert len([c for c in p.ask_calls if "get_equity_quotes" in c]) == 2   # retried
+def test_failed_quotes_call_falls_back_without_blacklisting():
+    """A transport/tool error resolves nothing: nothing is blacklisted and the
+    wrapped provider serves the quote."""
+    class Broken(FakeRH):
+        async def call(self, tool, args):
+            self.calls.append((tool, args))
+            raise RobinhoodMCPError("boom")
 
-
-def test_all_garbage_responses_leave_symbols_retryable():
-    """Two unusable responses must not poison the symbols permanently."""
-    p = _provider_with([{"error": "boom"}, {"error": "boom"}])
-    asyncio.run(p.prefetch(["AAPL"]))
+    p, inner = _provider(Broken())
+    asyncio.run(p.prefetch(["NVDA"]))
     assert p._unavailable == set()
+    assert p.get_quote("NVDA")["source"] == "yfinance"
+    assert inner.quote_calls == ["NVDA"]
+
+
+def test_quote_from_result_prefers_regular_session_then_extended():
+    row = {"quote": {"symbol": "aapl", "last_trade_price": None,
+                     "last_non_reg_trade_price": "101.5", "previous_close": "100"},
+           "close": {"symbol": "AAPL", "price": "99.5"}}
+    q = quote_from_result(row)
+    assert q == {"ticker": "AAPL", "price": 101.5, "prev_close": 99.5}
+    # No price at all -> no quote (never a zero).
+    assert quote_from_result({"quote": {"symbol": "X", "last_trade_price": None}}) is None
+    assert quote_from_result("garbage") is None
+
+
+def test_profile_from_result_maps_52_week_fields():
+    prof = profile_from_result(_PROFILE["NVDA"])
+    assert prof["week52_high"] == "236.54" and prof["week52_low"] == "164.07"
+    assert "description" not in prof
+
+
+def test_quotes_are_batched_at_twenty():
+    """Above 20 symbols get_equity_quotes omits the official closes, so the
+    provider must split the request."""
+    syms = [f"S{i:02d}" for i in range(45)]
+    quotes = {s: {"quote": {"symbol": s, "last_trade_price": "1.0"}} for s in syms}
+    p, _ = _provider(FakeRH(quotes=quotes, profiles={}, fins={}))
+    asyncio.run(p._prefetch_quotes(syms))
+    sizes = [len(a["symbols"]) for t, a in p.rh.calls if t == "get_equity_quotes"]
+    assert sizes == [20, 20, 5]
+    assert len(p._quotes) == 45

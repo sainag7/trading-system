@@ -1,13 +1,14 @@
-"""Shared LLM access for the agents, built on the **Claude Agent SDK**.
+"""Shared LLM access for the agents.
 
 This is the single place that talks to a model. Every agent calls
-:func:`generate_text` / :func:`generate_json`. Backends are tried in order:
+:func:`generate_text` / :func:`generate_json`. Backends:
 
-  1. **Claude Agent SDK** (`claude_agent_sdk.query`) — the primary path. This is
-     what also lets the decision/execution flow reach the Robinhood Trading MCP
-     via ``mcp_servers``.
-  2. **Anthropic Messages API** (`anthropic` SDK) — a lightweight fallback for
-     the pure text-in/JSON-out agents when the Agent SDK runtime isn't present.
+  1. **Anthropic Messages API** (`anthropic` SDK) — the primary path for the
+     pure text-in/JSON-out agents (monitor, analysis, decision, explain, review).
+  2. **Claude Agent SDK** (`claude_agent_sdk.query`) — only when a caller asks
+     for MCP tools (``mcp_servers`` / ``setting_sources``). Nothing in the daily
+     cycle does any more: the Robinhood MCP is called directly, with no model,
+     by :mod:`data.robinhood_mcp`. Kept as a fallback when no API key is set.
   3. **Offline** — if no backend/API key is available, returns ``None`` so the
      caller can fall back to a deterministic heuristic. This keeps **recommend
      mode fully runnable without any API keys**, which is how you should develop.

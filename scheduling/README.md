@@ -61,7 +61,8 @@ Robinhood app, then enable the autonomous job with `install.sh --enable-live`.
   in the dashboard's **Learning** tab.
 - **Holidays:** `market.py` carries the NYSE holiday list; extend `NYSE_HOLIDAYS`
   a year ahead periodically.
-- **Reliability:** the account read is model-mediated (~85% reliable). The
-  read-sanity gate skips a live cycle if the read looks like it under-reported
-  holdings, so a bad read never trades on stale position data — it just waits for
-  the next day (re-run manually to retry sooner).
+- **Reliability:** the account read is a direct MCP call (no model). If the
+  stored Robinhood OAuth session lapses the run fails fast with a hint to run
+  `python -m data.robinhood_mcp login`; the read-sanity gate still skips a live
+  cycle if a read looks like it under-reported holdings, so a bad read never
+  trades on stale position data.

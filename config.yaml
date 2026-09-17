@@ -198,15 +198,14 @@ discovery:
   use_reddit: true               # r/wallstreetbets + r/stocks hot.json mentions
 
 # ----------------------------------------------------------------------------
-# LLM model selection for each agent (Claude Agent SDK).
+# LLM model selection for each agent.
 # Cheaper/faster models for high-volume gathering, stronger model for the
 # final capital-allocation decision.
 # ----------------------------------------------------------------------------
 # Fast preset: Haiku for the high-volume / supporting agents, Sonnet for the
-# final capital-allocation decision. NOTE: decision_agent is ALSO the model the
-# Robinhood MCP broker uses for every account read (a best-of-3 loop) and order
-# placement — so it runs several times per cycle, not once. Keep it on Sonnet;
-# Opus (claude-opus-5 / claude-opus-4-8) is far more expensive here for little
+# final capital-allocation decision (one call per cycle; the Robinhood MCP is
+# called directly with no model — see data/robinhood_mcp.py). Opus
+# (claude-opus-5 / claude-opus-4-8) is far more expensive here for little
 # gain, since the decision is bounded by the deterministic guardrails.
 models:
   research_agent: "claude-haiku-4-5-20251001"
@@ -236,15 +235,15 @@ research:
 data:
   cache_dir: ".cache"
   cache_ttl_minutes: 1440            # reuse cached data for 24h (daily cadence)
-  # Use your connected Robinhood Trading MCP for market data (real-time quotes +
+  # Use the Robinhood Trading MCP for market data (real-time quotes +
   # fundamentals) instead of Alpha Vantage — quota-free, so the 25/day AV cap
-  # stops biting. Daily SERIES comes from yfinance (see use_alphavantage_series
-  # below), and Alpha Vantage is then used ONLY for news sentiment (Robinhood has
-  # no news tool); FRED still supplies macro. Falls back to yfinance on any
-  # Robinhood miss. Requires the robinhood-trading MCP connected in Claude Code
-  # (OAuth). Turn off to use the pure Alpha-Vantage/yfinance path.
+  # stops biting. Called DIRECTLY (no model): run `python -m data.robinhood_mcp
+  # login` once to store the OAuth session in .cache/. Daily SERIES comes from
+  # yfinance (see use_alphavantage_series below), and Alpha Vantage is then used
+  # ONLY for news sentiment (Robinhood has no news tool); FRED still supplies
+  # macro. Falls back to yfinance on any Robinhood miss. Turn off to use the
+  # pure Alpha-Vantage/yfinance path.
   use_robinhood_data: true
-  robinhood_data_model: "claude-haiku-4-5-20251001"   # cheap model for the batched data reads
   # Alpha Vantage no longer serves daily series on the free tier
   # (TIME_SERIES_DAILY outputsize=full is premium; compact is only 100 bars <
   # the 200-day SMA lookback). Keep OFF: series is served free by yfinance and AV
@@ -261,8 +260,8 @@ data:
   use_fred: true                     # macro context (rates, etc.) when configured
 
 # ----------------------------------------------------------------------------
-# Execution (Robinhood Trading MCP). OAuth is handled by the MCP server itself;
-# no API key/secret is ever stored in this repo.
+# Execution (Robinhood Trading MCP, called directly). OAuth session lives in
+# .cache/robinhood_oauth.json (gitignored); no API key/secret in this repo.
 # ----------------------------------------------------------------------------
 execution:
   mcp_url: "https://agent.robinhood.com/mcp/trading"
@@ -278,8 +277,8 @@ execution:
   fill_poll_interval_seconds: 2
   # Read your REAL Robinhood holdings (READ-ONLY) in recommend/explain modes, so
   # advice + verdicts are position-aware (hold/trim/sell/add for names you own).
-  # Requires the robinhood-trading MCP connected in Claude Code (OAuth). Adds one
-  # slower MCP call per run; turn off to always use the hypothetical book.
+  # Requires the stored Robinhood OAuth session (see data: above). Turn off to
+  # always use the hypothetical book.
   # Trading still only happens in preview/live — this flag never places an order.
   read_live_account: true
 

@@ -644,7 +644,7 @@ def _pct(v: Any) -> float | None:
     return round(f * 100, 2) if f is not None else None
 
 
-def build_provider(config, audit=None) -> DataProvider:
+def build_provider(config, audit=None, robinhood_client=None) -> DataProvider:
     """Construct a :class:`DataProvider` from the global :class:`config.Config`."""
     data_cfg = config.data
     av = data_cfg.get("alphavantage", {})
@@ -668,8 +668,9 @@ def build_provider(config, audit=None) -> DataProvider:
     # real-time, quota-free market data for quotes/series/fundamentals. Alpha
     # Vantage is left only for news sentiment (Robinhood has no news tool); FRED
     # still supplies macro. Falls back to `inner` on any Robinhood miss.
-    if data_cfg.get("use_robinhood_data", False):
+    # `robinhood_client` is a zero-arg factory (the orchestrator's shared
+    # direct MCP client) so the network is only touched on first use.
+    if data_cfg.get("use_robinhood_data", False) and robinhood_client is not None:
         from data.robinhood_provider import RobinhoodDataProvider
-        model = data_cfg.get("robinhood_data_model", "claude-haiku-4-5-20251001")
-        return RobinhoodDataProvider(inner, model=model, audit=audit)
+        return RobinhoodDataProvider(inner, robinhood_client(), audit=audit)
     return inner

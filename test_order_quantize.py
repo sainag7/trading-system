@@ -38,49 +38,56 @@ def test_quantize_various():
         assert _decimals(_quantize_shares(v)) <= MAX_SHARE_DECIMALS, v
 
 
-def _instruction_for(qty: float) -> str:
-    """Capture the exact instruction place_order() hands to the MCP, without
-    touching the network: _ask is the only outbound seam."""
-    broker = RobinhoodMCPBroker(
-        mcp_url="http://test.invalid/mcp", model="test-model",
-        account_number="123456789",
-    )
-    captured: dict[str, str] = {}
+class _FakeRH:
+    """Stands in for the direct MCP client: records the args place_order
+    sends and answers with a broker-shaped order object."""
 
-    async def fake_ask(instruction, tools, max_turns=6):
-        captured["instruction"] = instruction
-        return {"status": "submitted", "order_id": "x", "filled_qty": qty,
-                "fill_price": 1.0}, instruction
+    def __init__(self, response=None):
+        self.calls: list[tuple[str, dict]] = []
+        self.response = response
 
-    broker._ask = fake_ask
+    async def call(self, tool, args):
+        self.calls.append((tool, args))
+        if self.response is not None:
+            return self.response
+        return {"id": "x", "state": "confirmed", "symbol": args.get("symbol"),
+                "side": args.get("side"), "type": args.get("type"),
+                "quantity": args.get("quantity"), "cumulative_quantity": None,
+                "average_price": None}
+
+
+def _order_args_for(qty: float) -> dict:
+    """Capture the exact place_equity_order arguments place_order() sends,
+    without touching the network: the client's .call is the only outbound seam."""
+    rh = _FakeRH()
+    broker = RobinhoodMCPBroker(rh, account_number="123456789")
     asyncio.run(broker.place_order(
         ticker="AAPL", side=Side.BUY, qty=qty, limit_price=337.93,
     ))
-    return captured["instruction"]
+    (tool, args), = rh.calls
+    assert tool == "place_equity_order"
+    return args
 
 
 def test_instruction_text_never_exceeds_the_share_precision():
     """Regression for the live HTTP 400: Robinhood rejected an order because the
-    QUANTITY IN THE INSTRUCTION had 17 decimals. Quantizing the float is not
-    enough on its own — what reaches the broker is this rendered string, so the
-    guarantee has to be asserted here, not only on _quantize_shares' return."""
+    QUANTITY it received had 17 decimals. Quantizing the float is not enough on
+    its own — what reaches the broker is this rendered string, so the guarantee
+    has to be asserted here, not only on _quantize_shares' return."""
     # The exact quantity Robinhood rejected on 2026-07-27.
-    text = _instruction_for(0.07434944237918216)
-    m = re.search(r"for ([0-9.]+) shares of", text)
-    assert m, f"quantity not found in instruction: {text!r}"
-    rendered = m.group(1)
-    assert _decimals(float(rendered)) <= MAX_SHARE_DECIMALS, rendered
-    assert rendered == "0.074349"
-    # The raw un-quantized float must not appear anywhere in the instruction.
-    assert "0.07434944237918216" not in text
+    args = _order_args_for(0.07434944237918216)
+    qty = args["quantity"]
+    m = re.fullmatch(r"[0-9.]+", qty)
+    assert m, f"quantity not a plain decimal: {qty!r}"
+    assert _decimals(float(qty)) <= MAX_SHARE_DECIMALS, qty
+    assert qty == "0.074349"
 
 
 def test_instruction_quantity_is_never_scientific_notation():
     # A tiny fractional order must still render as a plain decimal — "1.9e-08"
     # would be rejected by the broker's quantity parser.
-    text = _instruction_for(0.000000019)
-    m = re.search(r"for ([0-9.eE+-]+) shares of", text)
-    assert m and "e" not in m.group(1).lower(), text
+    qty = _order_args_for(0.000000019)["quantity"]
+    assert "e" not in qty.lower(), qty
 
 
 class _FakeDB:
@@ -203,13 +210,8 @@ def test_unreported_fill_price_is_never_replaced_by_reference_price():
     """A 'submitted' response carrying no fill price must not have the stale
     prefetch price recorded as the fill — that invents a cost basis and produces
     P&L against a price nothing traded at."""
-    broker = RobinhoodMCPBroker(mcp_url="http://test.invalid/mcp", model="test-model",
+    broker = RobinhoodMCPBroker(_FakeRH({"id": "x", "state": "confirmed"}),
                                 account_number="123456789")
-
-    async def fake_ask(instruction, tools, max_turns=6):
-        return {"status": "submitted", "order_id": "x"}, instruction
-
-    broker._ask = fake_ask
     res = asyncio.run(broker.place_order(ticker="AAPL", side=Side.BUY, qty=2.0,
                                          limit_price=337.93, order_type="market"))
     assert res.fill_price == 0.0                      # NOT 337.93

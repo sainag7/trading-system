@@ -1,11 +1,11 @@
 # Multi-Agent Swing-Trading System
 
-A daily-cadence, multi-agent swing-trading system for US equities, built on the
-**Claude Agent SDK**. LLM agents research a universe of stocks, score and rank
+A daily-cadence, multi-agent swing-trading system for US equities. LLM agents
+(Claude via the Messages API) research a universe of stocks, score and rank
 them, and propose orders — then a **deterministic, LLM-free risk layer** resizes
-or rejects every one of them before anything reaches the broker. Execution goes
-through the official **Robinhood Trading MCP**, with a full SQLite audit trail
-and a global kill switch.
+or rejects every one of them before anything reaches the broker. Market data and
+execution go **directly** to the official **Robinhood Trading MCP** (no model in
+the loop), with a full SQLite audit trail and a global kill switch.
 
 ![The dashboard's Overview page](docs/img/overview.png)
 
@@ -110,8 +110,9 @@ Or use the dashboard (macOS: just double-click `start.command`):
 **Keys.** `ANTHROPIC_API_KEY` is the only one that really matters — without it
 the agents fall back to thin deterministic heuristics and everything scores a
 neutral 50. `ALPHAVANTAGE_API_KEY` (news) and `FRED_API_KEY` (macro) are
-optional. Robinhood uses **OAuth via the MCP server** — there is no broker
-password or API key in this repo.
+optional. Robinhood uses **OAuth** — run `python -m data.robinhood_mcp login`
+once (opens the browser; the session is stored in `.cache/`, gitignored). There
+is no broker password or API key in this repo.
 
 > **Run from the same environment you installed into.** Installing into `.venv`
 > but running from another Python (e.g. anaconda base) is the most common cause
@@ -328,7 +329,7 @@ Three independent backstops prevent trading the wrong account:
    **whole cycle**, exits included.
 
 Each account keeps its **own** equity history / drawdown high-water mark, and a
-**read-sanity gate** skips a live cycle if the (model-mediated) account read looks
+**read-sanity gate** skips a live cycle if the account read looks
 like it under-reported holdings — so a bad read never trades on stale positions.
 
 ---
@@ -737,8 +738,7 @@ miss it falls back to `yfinance`.
 Each source does what it's best at:
 
 - **Quotes + fundamentals** → Robinhood (compact, real-time, quota-free).
-- **Daily OHLCV series** → **yfinance**. Robinhood has the data, but its MCP is
-  LLM-mediated and a model can't reliably re-emit hundreds of bars as JSON.
+- **Daily OHLCV series** → **yfinance** (free, full lookback, cached 24h).
 - **News sentiment** → **Alpha Vantage** — the *only* AV endpoint used, so its
   25/day budget is spent on news alone.
 - **Macro** (rates/CPI/unemployment) → **FRED**.
@@ -798,8 +798,9 @@ arithmetic). Tuned for speed by default:
 - **Parallel research** (`research.concurrency: 5`).
 - **Fast LLM path** — agents use the Anthropic Messages API directly. Requires
   `ANTHROPIC_API_KEY`; without it they fall back to the slower SDK path.
-
-Only the execution layer (Robinhood, live/preview) uses the Agent SDK + MCP.
+- **No model in the plumbing** — market data and execution call the Robinhood
+  MCP directly ([data/robinhood_mcp.py](data/robinhood_mcp.py)); each call is a
+  sub-second tool call with zero token cost.
 
 ---
 
@@ -834,21 +835,17 @@ no numbers, so every score defaults to a neutral 50 — below the buy threshold
 
 ### "Could not read the account from the broker"
 
-The account read reaches Robinhood through the Agent SDK inheriting Claude Code's
-OAuth'd `robinhood-trading` connection. That session can lapse (it survives a day
-or so, then the background path stops returning data even while interactive
-Claude Code still works). Preview/live abort rather than falling back to a
-hypothetical book — that would be unsafe.
+The account read is a direct call to the Robinhood MCP using the OAuth session
+stored in `.cache/robinhood_oauth.json`. Tokens refresh automatically, but if
+Robinhood revokes the session the read fails fast. Preview/live abort rather
+than falling back to a hypothetical book — that would be unsafe.
 
 ```bash
 python orchestrator.py --check-broker      # tests the connection, prints the real error
-# if it reports "needs re-authentication":
-#   start an interactive `claude` session from this repo, run  /mcp,
-#   reconnect robinhood-trading, then re-run.
+python -m data.robinhood_mcp login         # re-authenticate in the browser
 ```
 
-Logged as `robinhood_mcp_no_response` (with the underlying error) vs
-`robinhood_read_unparseable` (rare, stochastic — just re-run). For **scheduled
+Logged as `robinhood_mcp_no_response` (with the underlying error). For **scheduled
 autonomous** runs, set `notifications.enabled: true` so a lapse is reported in
 the daily brief instead of silently skipping the run.
 

@@ -6,30 +6,20 @@ fundamentals Robinhood can supply** — from the connected **Robinhood Trading
 MCP**, which is real-time and quota-free. Alpha Vantage is left to do only what
 Robinhood has no tool for: **news sentiment** (and FRED still supplies macro).
 
-Robinhood data is read through the same LLM-mediated MCP bridge as the account
-read (``generate_json`` inheriting Claude Code's OAuth via
-``setting_sources=["local"]``). To keep that cheap and reliable we do **one
-batched prefetch per run** — a few multi-symbol tool calls up front — into an
-in-memory store, so the existing *synchronous* per-ticker provider methods just
-read the store (and transparently fall back to the wrapped provider on any miss,
-so the system degrades to its previous behaviour if a Robinhood read is thin).
+Robinhood data is read DIRECTLY from the MCP server through
+:class:`data.robinhood_mcp.RobinhoodMCP` — no model in the loop (the previous
+LLM-mediated bridge cost ~$0.03 and ~30s per call and failed 18% of the time).
+We do **one batched prefetch per run** — a few multi-symbol tool calls up
+front — into an in-memory store, so the existing *synchronous* per-ticker
+provider methods just read the store (and transparently fall back to the
+wrapped provider on any miss, so the system degrades to its previous behaviour
+if a Robinhood read is thin).
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from agents.llm import generate_json, usage_context
-
-_SERVER = "robinhood-trading"
-_TOOLS = [f"mcp__{_SERVER}"]
-_SYSTEM = (
-    "You are a read-only market-data bridge to the Robinhood Trading MCP. Use "
-    "ONLY the Robinhood MCP tools to fulfil the request. Call NO "
-    "buy/sell/place/submit/cancel/order tools. Do not invent data. After calling "
-    "the necessary tools, your FINAL message MUST be the requested STRICT JSON "
-    "object and nothing else — no prose, no markdown, and not a tool call."
-)
+from data.robinhood_mcp import RobinhoodMCP, RobinhoodMCPError
 
 # Robinhood's sector taxonomy (FactSet-style) -> the guardrail sector buckets
 # used across config.yaml `sectors:` and risk/max_sector_pct. Anything not mapped
@@ -78,12 +68,45 @@ def _batches(items: list, n: int):
         yield items[i:i + n]
 
 
+def quote_from_result(row: Any) -> dict | None:
+    """One ``get_equity_quotes`` result -> ``{ticker, price, prev_close}``.
+
+    Price is the regular-session last trade, falling back to the extended-hours
+    print when the regular one is missing (pre-market runs); prev_close is the
+    official prior close, falling back to the quote's own previous_close."""
+    if not isinstance(row, dict):
+        return None
+    q = row.get("quote") if isinstance(row.get("quote"), dict) else row
+    sym = str(q.get("symbol") or "").upper()
+    price = _f(q.get("last_trade_price")) or _f(q.get("last_non_reg_trade_price"))
+    if not sym or not price:
+        return None
+    close = row.get("close") if isinstance(row.get("close"), dict) else {}
+    prev = _f(close.get("price")) or _f(q.get("previous_close")) \
+        or _f(q.get("adjusted_previous_close")) or price
+    return {"ticker": sym, "price": price, "prev_close": prev}
+
+
+def profile_from_result(row: dict) -> dict:
+    """Trim one ``get_equity_fundamentals`` result to the fields
+    :meth:`RobinhoodDataProvider._compute_fundamentals` consumes."""
+    return {
+        "sector": row.get("sector"),
+        "industry": row.get("industry"),
+        "market_cap": row.get("market_cap"),
+        "pe_ratio": row.get("pe_ratio"),
+        "shares_outstanding": row.get("shares_outstanding"),
+        "week52_high": row.get("high_52_weeks"),
+        "week52_low": row.get("low_52_weeks"),
+    }
+
+
 class RobinhoodDataProvider:
     """Robinhood market data over a wrapped :class:`DataProvider` fallback."""
 
-    def __init__(self, inner, model: str, *, audit=None):
+    def __init__(self, inner, client: RobinhoodMCP, *, audit=None):
         self._inner = inner
-        self.model = model
+        self._rh = client
         self._audit = audit
         self._quotes: dict[str, dict] = {}
         self._fundamentals: dict[str, dict] = {}
@@ -116,16 +139,14 @@ class RobinhoodDataProvider:
             except Exception:
                 pass
 
-    async def _ask(self, instruction: str, max_turns: int = 8) -> Any:
-        self._log("INFO", "mcp_request",
-                  {"server": _SERVER, "kind": "market_data", "instruction": instruction[:300]})
-        with usage_context(agent="market_data"):
-            parsed, raw = await generate_json(
-                _SYSTEM, instruction, self.model,
-                allowed_tools=_TOOLS, max_turns=max_turns, setting_sources=["local"])
-        self._log("INFO", "mcp_response",
-                  {"parsed_ok": isinstance(parsed, dict), "len": len(raw or "")})
-        return parsed
+    async def _call(self, tool: str, args: dict) -> Any:
+        """One direct tool call; ``None`` on failure (logged, never raised —
+        a data read must not break the run; the wrapped provider fills in)."""
+        try:
+            return await self._rh.call(tool, args)
+        except RobinhoodMCPError as e:
+            self._log("WARN", "robinhood_call_failed", {"tool": tool, "error": str(e)[:300]})
+            return None
 
     # -- prefetch (batched, one pass per run) ------------------------------
     async def prefetch(self, tickers: list[str]) -> None:
@@ -133,13 +154,9 @@ class RobinhoodDataProvider:
         syms = [s for s in syms if s not in self._prefetched]
         if not syms:
             return
-        # Sequential (not concurrent) — the MCP bridge is LLM-mediated; a burst of
-        # parallel Agent-SDK queries is neither faster here nor more reliable.
-        # NOTE: daily SERIES is deliberately NOT prefetched from Robinhood. A
-        # get_equity_historicals result is hundreds of bars per symbol, and the
-        # model cannot reliably re-emit that volume as JSON (it returns empty), so
-        # series is served by yfinance via the wrapped provider instead. Only the
-        # compact quotes + fundamentals go through the MCP bridge.
+        # NOTE: daily SERIES is deliberately NOT prefetched from Robinhood —
+        # yfinance serves it free with the full lookback. Only the compact
+        # quotes + fundamentals come from Robinhood.
         for step in (self._prefetch_quotes, self._prefetch_fundamentals):
             try:
                 await step(syms)
@@ -153,51 +170,24 @@ class RobinhoodDataProvider:
 
     async def _prefetch_quotes(self, syms: list[str]) -> None:
         missing = [s for s in syms if s not in self._unavailable]
-        for _ in range(2):
-            if not missing:
-                return
-            instr = (
-                f"Call get_equity_quotes ONCE with symbols={json.dumps(missing)}. For "
-                "each symbol report its current price and prior close: use "
-                "quote.last_trade_price for price (fall back to "
-                "quote.last_non_reg_trade_price), and quote.previous_close (or "
-                "results[].close.price) for prev_close. A symbol absent from "
-                "results has no tradable instrument — OMIT it from your answer "
-                "and do NOT call the tool again to look for it. Return STRICT "
-                'JSON only, for the symbols results covers: {"SYM": '
-                '{"price": <float>, "prev_close": <float>}, ...}')
-            parsed = await self._ask(instr, max_turns=6)
-            if not isinstance(parsed, dict):
-                # Backend/transport failure — nothing was learned, so one retry
-                # of the same request is worthwhile.
+        # get_equity_quotes takes any number of symbols but omits the official
+        # closes above 20 — keep batches at 20 so prev_close is always present.
+        for batch in _batches(missing, 20):
+            data = await self._call("get_equity_quotes", {"symbols": batch})
+            rows = (data or {}).get("results") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                self._log("WARN", "robinhood_quotes_prefetch_failed", {"symbols": batch})
                 continue
-            for sym in list(missing):
-                row = parsed.get(sym) or parsed.get(sym.upper())
-                price = _f((row or {}).get("price"))
-                if price:
-                    self._quotes[sym] = {
-                        "price": price,
-                        "prev_close": _f(row.get("prev_close")) or price}
-            unresolved = [s for s in missing if s not in self._quotes]
-            if len(unresolved) == len(missing):
-                # NOTHING came back keyed by a requested symbol. Being a dict is
-                # not proof of a quotes payload — an error body, a wrapped
-                # envelope or a truncated response all parse as one, and none of
-                # them are evidence that the broker lacks these instruments.
-                # Retry instead of blacklisting the batch for the whole process.
-                self._log("WARN", "robinhood_quotes_unrecognised_response",
-                          {"symbols": missing, "response_keys": sorted(parsed)[:10]})
-                continue
+            for row in rows:
+                q = quote_from_result(row)
+                if q:
+                    self._quotes[q["ticker"]] = {"price": q["price"], "prev_close": q["prev_close"]}
+            # A symbol absent from a well-formed result has no tradable
+            # instrument at Robinhood (delisted, acquired, never carried).
+            unresolved = [s for s in batch if s not in self._quotes]
             if unresolved:
-                # At least one symbol resolved, so this IS a well-formed quotes
-                # payload — the symbols it omitted are ones Robinhood has no
-                # tradable instrument for. Re-asking cannot change that and only
-                # burns another LLM round-trip.
                 self._unavailable.update(unresolved)
-                self._log("WARN", "robinhood_quotes_unavailable",
-                          {"symbols": unresolved})
-            return
-        self._log("WARN", "robinhood_quotes_prefetch_failed", {"symbols": missing})
+                self._log("WARN", "robinhood_quotes_unavailable", {"symbols": unresolved})
 
     async def _prefetch_fundamentals(self, syms: list[str]) -> None:
         profiles = await self._fetch_profiles(syms)
@@ -210,39 +200,30 @@ class RobinhoodDataProvider:
     async def _fetch_profiles(self, syms: list[str]) -> dict[str, dict]:
         out: dict[str, dict] = {}
         for batch in _batches(syms, 10):     # get_equity_fundamentals: <=10 symbols/call
-            instr = (
-                f"Call get_equity_fundamentals with symbols={json.dumps(batch)}. For "
-                "EVERY symbol return ONLY these numeric/short fields (do NOT include "
-                "the description text): sector, industry, market_cap, pe_ratio, "
-                "shares_outstanding, week52_high (high_52_weeks), week52_low "
-                "(low_52_weeks). Return STRICT JSON only, covering every symbol: "
-                '{"SYM": {"sector":<str>,"industry":<str>,"market_cap":<f>,'
-                '"pe_ratio":<f>,"shares_outstanding":<f>,"week52_high":<f>,'
-                '"week52_low":<f>}, ...}')
-            parsed = await self._ask(instr, max_turns=6)
-            if isinstance(parsed, dict):
-                for sym in batch:
-                    row = parsed.get(sym) or parsed.get(sym.upper())
-                    if isinstance(row, dict):
-                        out[sym] = row
+            data = await self._call("get_equity_fundamentals", {"symbols": batch})
+            rows = (data or {}).get("results") if isinstance(data, dict) else None
+            for row in rows or []:
+                if isinstance(row, dict) and row.get("symbol"):
+                    out[str(row["symbol"]).upper()] = profile_from_result(row)
         return out
 
     async def _fetch_financials(self, syms: list[str]) -> dict[str, list]:
         out: dict[str, list] = {}
         for batch in _batches(syms, 20):     # get_financials: <=20 symbols/call
-            instr = (
-                f"Call get_financials with symbols={json.dumps(batch)}, "
-                'period="quarterly", limit=6. For EVERY symbol return its quarterly '
-                "financials MOST-RECENT-FIRST as a list of {revenue, gross_profit, "
-                "net_income, net_margin, fiscal_year, fiscal_quarter}. Return STRICT "
-                'JSON only, covering every symbol: {"SYM": [{"revenue":<f>,'
-                '"gross_profit":<f>,"net_income":<f>,"net_margin":<f>}, ...], ...}')
-            parsed = await self._ask(instr, max_turns=6)
-            if isinstance(parsed, dict):
-                for sym in batch:
-                    rows = parsed.get(sym) or parsed.get(sym.upper())
-                    if isinstance(rows, list):
-                        out[sym] = rows
+            data = await self._call("get_financials",
+                                    {"symbols": batch, "period": "quarterly", "limit": 6})
+            rows = (data or {}).get("results") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                continue
+            # `results` is positional (one entry per requested symbol, null when
+            # unresolved) but each entry also carries `symbol`; prefer that.
+            for i, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                sym = str(row.get("symbol") or (batch[i] if i < len(batch) else "")).upper()
+                fins = row.get("financials")
+                if sym and isinstance(fins, list):
+                    out[sym] = fins   # already most-recent-first
         return out
 
     # -- mapping helpers ---------------------------------------------------
@@ -313,9 +294,8 @@ class RobinhoodDataProvider:
         return self._inner.get_quote(t)
 
     def get_daily_series(self, ticker: str, lookback: int = 100) -> list[dict] | None:
-        # Series is intentionally NOT sourced from Robinhood: the MCP bridge is
-        # LLM-mediated and cannot reliably re-emit hundreds of OHLCV bars. The
-        # wrapped provider serves it from yfinance (free, full lookback).
+        # Series is intentionally NOT sourced from Robinhood: yfinance serves
+        # the full lookback free and is already cached for 24h; nothing to gain.
         return self._inner.get_daily_series(ticker.upper(), lookback)
 
     def get_fundamentals(self, ticker: str) -> dict:
