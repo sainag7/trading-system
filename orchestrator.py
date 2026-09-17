@@ -236,9 +236,14 @@ class Orchestrator:
             config.raw.get("notifications", {}),
             audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
         )
+        # One direct Robinhood MCP client shared by the data provider and the
+        # broker (no model in the loop — see data/robinhood_mcp.py). Built
+        # lazily so offline/test runs never touch the network.
+        self._rh_client = None
         # `provider` can be injected for tests; otherwise build the real one.
         self.provider = provider or build_provider(
-            config, audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det)
+            config, audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
+            robinhood_client=self.robinhood_client,
         )
         # Token/cost accounting: agents/llm.py emits one record per LLM call and
         # we persist it. A callback (rather than llm.py importing storage) keeps
@@ -261,13 +266,24 @@ class Orchestrator:
         return fresh.kill_switch_enabled
 
     # -- broker selection --------------------------------------------------
+    def robinhood_client(self):
+        """The shared direct MCP client (lazy). Non-interactive: a scheduled
+        run must fail fast with a hint rather than wait on a browser login."""
+        if self._rh_client is None:
+            from data.robinhood_mcp import RobinhoodMCP
+            self._rh_client = RobinhoodMCP(
+                self.cfg.execution.get("mcp_url"),
+                token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
+                interactive=False,
+                audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
+            )
+        return self._rh_client
+
     def _build_broker(self):
         # preview/live read from (and place to) the real Robinhood MCP, scoped to
         # the active account (defaults to `agentic` for trading modes).
-        ex = self.cfg.execution
         return RobinhoodMCPBroker(
-            mcp_url=ex.get("mcp_url"), model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
-            token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
+            self.robinhood_client(),
             account_number=self.cfg.account_number,
             audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
         )
@@ -324,12 +340,12 @@ class Orchestrator:
             return
         fail = getattr(broker, "last_read_failure", None) or {}
         if fail.get("kind") == "no_response":
-            print("❌ No data from the Robinhood MCP — the connection likely needs "
-                  "re-authentication. In an interactive `claude` session started from "
-                  "this repo, run `/mcp` and reconnect robinhood-trading, then retry.")
+            print("❌ Could not reach the Robinhood MCP — the stored OAuth session "
+                  "has probably lapsed. Run `python -m data.robinhood_mcp login` "
+                  "from this repo, then retry.")
         else:
             print("❌ Got a response but no valid account data — re-run; if it "
-                  "persists, reconnect robinhood-trading via `/mcp`.")
+                  "persists, check the audit log for the raw payload.")
         if fail.get("error"):
             print(f"   detail: {fail['error']}")
 
@@ -351,9 +367,7 @@ class Orchestrator:
         # Read-only broker for recommend/explain, scoped to the active account
         # (defaults to `individual` for advice modes).
         return RobinhoodMCPBroker(
-            mcp_url=self.cfg.execution.get("mcp_url"),
-            model=self.cfg.models.get("decision_agent", "claude-sonnet-4-6"),
-            token=self.cfg.env("ROBINHOOD_MCP_TOKEN"),
+            self.robinhood_client(),
             account_number=self.cfg.account_number,
             audit=lambda lvl, ev, det: self.db.audit(self.run_id, lvl, ev, det),
         )
@@ -389,9 +403,10 @@ class Orchestrator:
              configured ceiling (a cheap structural block against mis-routing an
              order into the large individual account).
           2. Read sanity — if the account previously held position value but this
-             read shows zero positions, the model-mediated read likely
-             under-reported; skip trading rather than risk over-concentrating a
-             name we already hold. Reads are safe to retry, so re-running is fine.
+             read shows zero positions, the read is suspect (a partial page,
+             a broker-side hiccup); skip trading rather than risk
+             over-concentrating a name we already hold. Reads are safe to
+             retry, so re-running is fine.
         """
         active = self.cfg.active_account or {}
         acct_no = self.cfg.account_number
@@ -483,18 +498,16 @@ class Orchestrator:
         if account is None:
             fail = getattr(broker, "last_read_failure", None) or {}
             if fail.get("kind") == "no_response":
-                msg = ("Robinhood MCP returned no data across "
-                       f"{fail.get('attempts', 3)} attempts — the background connection "
-                       "likely needs re-authentication. In an interactive `claude` session "
-                       "started from this repo, run `/mcp` and reconnect robinhood-trading, "
-                       "then re-run. (Preview/live never fall back to a hypothetical book.)")
+                msg = ("Could not reach the Robinhood MCP — the stored OAuth session "
+                       "has probably lapsed. Run `python -m data.robinhood_mcp login` "
+                       "from this repo, then re-run. (Preview/live never fall back to "
+                       "a hypothetical book.)")
                 if fail.get("error"):
                     msg += f"\n   detail: {fail['error']}"
             else:
-                msg = ("Could not read the account from the Robinhood MCP "
-                       f"(got a response but no valid account data across "
-                       f"{fail.get('attempts', 3)} attempts). Re-run; if it persists, "
-                       "reconnect robinhood-trading via `/mcp`.")
+                msg = ("Could not read the account from the Robinhood MCP (got a "
+                       "response but no valid account data). Re-run; if it persists, "
+                       "check the audit log for the raw payload.")
             db.audit(self.run_id, "ERROR", "account_read_failed",
                      {"mode": self.mode, **fail})
             print(f"❌ {msg}")
@@ -1322,9 +1335,8 @@ class Orchestrator:
             )
             # Drop plans for names this account no longer holds (a sell made
             # outside the system, or an exit whose fill landed after the poll
-            # window). Only against a read that returned holdings: the one known
-            # failure mode of the model-mediated read is UNDER-reporting, and an
-            # empty read must never be taken as "everything was sold".
+            # window). Only against a read that returned holdings: an empty
+            # read must never be taken as "everything was sold".
             if account.positions:
                 held = [t for t, p in account.positions.items() if p.shares > 1e-6]
                 pruned = self.db.prune_trade_plans(held, acct_no)
