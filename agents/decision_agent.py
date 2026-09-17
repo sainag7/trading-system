@@ -379,8 +379,13 @@ def _normalize(order: dict, meta: dict, strategy: dict) -> dict:
 async def run_decision(
     analysis: list[dict], account_summary: dict, limits: dict, strategy: dict,
     trades_remaining: int, model: str, *, db=None, run_id: str | None = None,
+    lessons: dict | None = None,
 ) -> dict:
-    """Produce the decision object (proposed order intents) for this cycle."""
+    """Produce the decision object (proposed order intents) for this cycle.
+
+    ``lessons`` (optional) is the review agent's playbook for this account:
+    evidence-backed notes distilled from the book's own closed trades. It is
+    context for the model's judgement; the guardrails after it are unchanged."""
     payload = {
         "analysis": analysis,
         "portfolio": account_summary,
@@ -388,6 +393,8 @@ async def run_decision(
         "strategy": strategy,
         "trades_remaining_today": trades_remaining,
     }
+    if lessons:
+        payload["lessons"] = lessons
     parsed, raw = await generate_json(SYSTEM_PROMPT, payload, model)
 
     # The prompt asks for a JSON list of intents; also accept a wrapped dict.

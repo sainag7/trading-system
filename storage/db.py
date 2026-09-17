@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS trades (
     broker_order_id  TEXT,
     client_order_id  TEXT,             -- idempotency key (run_id:ticker:side:qty)
     simulated     INTEGER,
-    detail        TEXT
+    detail        TEXT,
+    account       TEXT                 -- brokerage account (NULL=legacy; backfilled from pnl)
 );
 -- Idempotency: one trade per client_order_id. Lets begin_trade dedupe atomically.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_client_oid
@@ -145,11 +146,13 @@ CREATE TABLE IF NOT EXISTS runs (
     started_ts   TEXT NOT NULL,
     finished_ts  TEXT,
     mode         TEXT,
+    account      TEXT,                -- brokerage account the run acted on (NULL=legacy/single)
     notes        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trade_plans (
-    ticker         TEXT PRIMARY KEY,    -- one active plan per held name
+    ticker         TEXT NOT NULL,
+    account        TEXT NOT NULL DEFAULT '',  -- brokerage account that holds the position ('' = single-account)
     entry_date     TEXT,                -- date the position was opened (for time-stop)
     entry_price    REAL,
     stop_loss      REAL,                -- price level (raised as the trailing stop ratchets up)
@@ -157,8 +160,58 @@ CREATE TABLE IF NOT EXISTS trade_plans (
     max_hold_until TEXT,                -- ISO date swing time-stop
     thesis         TEXT,                -- original entry thesis (for the Monitor)
     peak_price     REAL,                -- highest price seen since entry (chandelier trail)
+    tp_taken       INTEGER DEFAULT 0,   -- 1 once the take-profit partial has been banked
+    scaled_out     INTEGER DEFAULT 0,   -- 1 once a graded (stop-trail) partial has fired
     run_id         TEXT,
-    updated_ts     TEXT
+    updated_ts     TEXT,
+    PRIMARY KEY (ticker, account)       -- one active plan per held name PER ACCOUNT
+);
+
+-- Post-close review agent: one row per review run.
+CREATE TABLE IF NOT EXISTS reviews (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    run_id         TEXT,
+    account        TEXT,
+    review_date    TEXT,                -- trading date reviewed (YYYY-MM-DD)
+    window_days    INTEGER,
+    model          TEXT,
+    scorecard_json TEXT,                -- deterministic scorecard (input to the model)
+    output_json    TEXT,                -- the model's structured review
+    markdown       TEXT                 -- rendered brief
+);
+
+-- Durable, evidence-backed rules the review agent maintains. Fed back into the
+-- decision / monitor prompts while status='active'.
+CREATE TABLE IF NOT EXISTS lessons (
+    id                 TEXT NOT NULL,
+    account            TEXT NOT NULL DEFAULT '',
+    text               TEXT NOT NULL,
+    evidence           TEXT,
+    confidence         INTEGER,         -- 0-100
+    applies_to         TEXT,            -- json list: ["decision","monitor"]
+    status             TEXT,            -- active|retired
+    created_ts         TEXT,
+    last_reinforced_ts TEXT,
+    times_reinforced   INTEGER DEFAULT 0,
+    source_run_id      TEXT,
+    PRIMARY KEY (id, account)
+);
+
+-- Parameter changes the review agent proposed, and what happened to them.
+CREATE TABLE IF NOT EXISTS proposals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    run_id       TEXT,
+    account      TEXT,
+    key          TEXT NOT NULL,         -- dotted config key, e.g. strategy.stop_atr_mult
+    current      REAL,
+    proposed     REAL,
+    applied      REAL,                  -- the value actually written (may be clamped)
+    evidence     TEXT,
+    n_trades     INTEGER,
+    status       TEXT,                  -- proposed|applied|rejected|dismissed
+    reason       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS llm_usage (
@@ -220,13 +273,78 @@ class Database:
         """Add columns introduced after the initial schema (no-op if present)."""
         for table, col, decl in [("trade_plans", "thesis", "TEXT"),
                                   ("trade_plans", "peak_price", "REAL"),
+                                  ("trade_plans", "account", "TEXT"),
+                                  ("trade_plans", "scaled_out", "INTEGER"),
                                   ("positions", "account", "TEXT"),
-                                  ("pnl", "account", "TEXT")]:
+                                  ("pnl", "account", "TEXT"),
+                                  ("runs", "account", "TEXT"),
+                                  ("trades", "account", "TEXT")]:
             try:
                 with self._cursor() as c:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        self._migrate_trade_plans_per_account()
+        self._backfill_accounts()
+
+    def _migrate_trade_plans_per_account(self) -> None:
+        """Rebuild ``trade_plans`` keyed by ``(ticker, account)``.
+
+        The table was keyed by ticker alone, so a run on one brokerage account
+        read and RATCHETED the other account's stops: the individual book's
+        advice run trailed its own GOOGL (avg cost $368.68) into the row the
+        agentic book used for a GOOGL bought at $344.94, leaving that position a
+        stop 0.65% below entry. SQLite cannot alter a primary key, so the table
+        is rebuilt once; legacy rows get ``account=''`` and are then attributed
+        to the account of the run that wrote them (``_backfill_accounts``).
+        """
+        with self._cursor() as c:
+            info = c.execute("PRAGMA table_info(trade_plans)").fetchall()
+            cols = {r["name"] for r in info}
+            pk = [r["name"] for r in sorted(info, key=lambda r: r["pk"]) if r["pk"]]
+            if ("account" in cols and "tp_taken" in cols and "scaled_out" in cols
+                    and pk == ["ticker", "account"]):
+                return
+            c.execute("ALTER TABLE trade_plans RENAME TO trade_plans_legacy")
+            c.execute("""CREATE TABLE trade_plans (
+                ticker TEXT NOT NULL, account TEXT NOT NULL DEFAULT '',
+                entry_date TEXT, entry_price REAL, stop_loss REAL, take_profit REAL,
+                max_hold_until TEXT, thesis TEXT, peak_price REAL,
+                tp_taken INTEGER DEFAULT 0, scaled_out INTEGER DEFAULT 0,
+                run_id TEXT, updated_ts TEXT,
+                PRIMARY KEY (ticker, account))""")
+            acct_expr = "COALESCE(account, '')" if "account" in cols else "''"
+            tp_expr = "COALESCE(tp_taken, 0)" if "tp_taken" in cols else "0"
+            so_expr = "COALESCE(scaled_out, 0)" if "scaled_out" in cols else "0"
+            c.execute(f"""INSERT OR IGNORE INTO trade_plans(ticker, account, entry_date,
+                entry_price, stop_loss, take_profit, max_hold_until, thesis, peak_price,
+                tp_taken, scaled_out, run_id, updated_ts)
+                SELECT ticker, {acct_expr}, entry_date, entry_price, stop_loss, take_profit,
+                       max_hold_until, thesis, peak_price, {tp_expr}, {so_expr},
+                       run_id, updated_ts
+                FROM trade_plans_legacy""")
+            c.execute("DROP TABLE trade_plans_legacy")
+
+    def _backfill_accounts(self) -> None:
+        """Attribute legacy rows to an account via the run that wrote them.
+
+        ``pnl`` has carried ``account`` since multi-account support landed and is
+        snapshotted at the start of every run, so ``run_id -> pnl.account`` is a
+        reliable map for ``runs``, ``trades`` and the rebuilt ``trade_plans``.
+        Rows whose run has no pnl snapshot stay unattributed. Idempotent."""
+        with self._cursor() as c:
+            c.execute("""UPDATE runs SET account = (
+                            SELECT account FROM pnl WHERE pnl.run_id = runs.run_id
+                              AND pnl.account IS NOT NULL ORDER BY pnl.id LIMIT 1)
+                         WHERE account IS NULL""")
+            c.execute("""UPDATE trades SET account = (
+                            SELECT account FROM pnl WHERE pnl.run_id = trades.run_id
+                              AND pnl.account IS NOT NULL ORDER BY pnl.id LIMIT 1)
+                         WHERE account IS NULL""")
+            c.execute("""UPDATE OR IGNORE trade_plans SET account = COALESCE((
+                            SELECT account FROM pnl WHERE pnl.run_id = trade_plans.run_id
+                              AND pnl.account IS NOT NULL ORDER BY pnl.id LIMIT 1), '')
+                         WHERE account = ''""")
 
     def close(self) -> None:
         self._conn.close()
@@ -242,11 +360,13 @@ class Database:
                 cur.close()
 
     # -- runs --------------------------------------------------------------
-    def start_run(self, run_id: str, mode: str, notes: str = "") -> None:
+    def start_run(self, run_id: str, mode: str, notes: str = "",
+                  account: str | None = None) -> None:
         with self._cursor() as c:
             c.execute(
-                "INSERT OR REPLACE INTO runs(run_id, started_ts, mode, notes) VALUES (?,?,?,?)",
-                (run_id, _now(), mode, notes),
+                "INSERT OR REPLACE INTO runs(run_id, started_ts, mode, account, notes) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, _now(), mode, account, notes),
             )
 
     def finish_run(self, run_id: str) -> None:
@@ -336,6 +456,7 @@ class Database:
     def begin_trade(
         self, *, client_order_id: str, run_id: str, mode: str, ticker: str,
         side: str, qty: float, price: float, notional: float,
+        account: str | None = None,
     ) -> tuple[int | None, bool, str]:
         """Reserve a trade row for ``client_order_id`` atomically.
 
@@ -345,10 +466,10 @@ class Database:
         with self._cursor() as c:
             c.execute(
                 """INSERT OR IGNORE INTO trades(ts, run_id, mode, ticker, side, qty,
-                   price, notional_usd, status, client_order_id, simulated)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   price, notional_usd, status, client_order_id, simulated, account)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (_now(), run_id, mode, ticker, side, qty, price, notional,
-                 "submitting", client_order_id, 0),
+                 "submitting", client_order_id, 0, account),
             )
             if c.rowcount == 1:
                 return c.lastrowid, True, "submitting"
@@ -437,20 +558,28 @@ class Database:
             )
 
     # -- trade plans (decision agent -> monitor agent) --------------------
+    @staticmethod
+    def _acct(account: str | None) -> str:
+        """Plans are keyed by ``(ticker, account)``; single-account mode uses ''."""
+        return str(account) if account else ""
+
     def upsert_trade_plan(
         self, *, ticker: str, run_id: str, entry_price: float | None = None,
         stop_loss: float | None = None, take_profit: float | None = None,
         max_hold_until: str | None = None, thesis: str | None = None,
-        peak_price: float | None = None,
+        peak_price: float | None = None, account: str | None = None,
     ) -> None:
-        """Record/refresh a position's exit plan. ``entry_date``, ``thesis`` and
-        ``peak_price`` are set once, on first open, so the Monitor's time-stop
-        measures from the real entry, the original thesis is preserved, and the
-        chandelier trail starts from the entry price."""
+        """Record/refresh a position's exit plan for ``account``. ``entry_date``,
+        ``thesis`` and ``peak_price`` are set once, on first open, so the
+        Monitor's time-stop measures from the real entry, the original thesis is
+        preserved, and the chandelier trail starts from the entry price. The plan
+        is keyed by the account that actually holds the shares."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        acct = self._acct(account)
         with self._cursor() as c:
             exists = c.execute(
-                "SELECT ticker FROM trade_plans WHERE ticker=?", (ticker,)
+                "SELECT ticker FROM trade_plans WHERE ticker=? AND account=?",
+                (ticker, acct),
             ).fetchone()
             if exists:
                 c.execute(
@@ -461,44 +590,303 @@ class Database:
                        entry_price=COALESCE(entry_price, ?),
                        thesis=COALESCE(thesis, ?),
                        peak_price=COALESCE(peak_price, ?),
-                       run_id=?, updated_ts=? WHERE ticker=?""",
+                       run_id=?, updated_ts=? WHERE ticker=? AND account=?""",
                     (stop_loss, take_profit, max_hold_until, entry_price, thesis,
-                     peak_price, run_id, _now(), ticker),
+                     peak_price, run_id, _now(), ticker, acct),
                 )
             else:
                 c.execute(
-                    """INSERT INTO trade_plans(ticker, entry_date, entry_price,
+                    """INSERT INTO trade_plans(ticker, account, entry_date, entry_price,
                        stop_loss, take_profit, max_hold_until, thesis, peak_price,
-                       run_id, updated_ts)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (ticker, today, entry_price, stop_loss, take_profit,
+                       tp_taken, scaled_out, run_id, updated_ts)
+                       VALUES (?,?,?,?,?,?,?,?,?,0,0,?,?)""",
+                    (ticker, acct, today, entry_price, stop_loss, take_profit,
                      max_hold_until, thesis, peak_price, run_id, _now()),
                 )
 
+    def mark_scaled_out(self, ticker: str, account: str | None = None) -> None:
+        """Flag that a graded (stop-trail) partial exit has fired on this
+        position. The Monitor reads it so the NEXT trailing-stop hit closes the
+        remainder in full instead of halving it again — a position halved on
+        every hit never actually exits, it just pays spread on ever-smaller stubs."""
+        with self._cursor() as c:
+            c.execute(
+                "UPDATE trade_plans SET scaled_out=1, updated_ts=? WHERE ticker=? AND account=?",
+                (_now(), ticker, self._acct(account)),
+            )
+
+    def mark_take_profit_taken(self, ticker: str, account: str | None = None) -> None:
+        """The take-profit partial has been banked: the Monitor must not fire it
+        again — the remainder rides the trailing stop only. Without this flag
+        HPE was halved on four consecutive touches of the same target."""
+        with self._cursor() as c:
+            c.execute(
+                "UPDATE trade_plans SET tp_taken=1, updated_ts=? WHERE ticker=? AND account=?",
+                (_now(), ticker, self._acct(account)),
+            )
+
+    def prune_trade_plans(self, held: Iterable[str], account: str | None) -> list[str]:
+        """Delete this account's plans for tickers no longer held; return them.
+
+        Catches a sell made outside the system, or an exit whose fill landed
+        after the poll window. Scoped to ``account`` on purpose: a plan is only
+        ever pruned against a read of the account that owns it, so a run on the
+        individual book can never discard the agentic book's plans. With
+        ``account`` None nothing is pruned."""
+        if account is None:
+            return []
+        keep = {str(t).upper() for t in held}
+        acct = self._acct(account)
+        with self._cursor() as c:
+            rows = c.execute(
+                "SELECT ticker FROM trade_plans WHERE account=?", (acct,)
+            ).fetchall()
+            stale = sorted(r["ticker"] for r in rows if r["ticker"] not in keep)
+            for t in stale:
+                c.execute("DELETE FROM trade_plans WHERE ticker=? AND account=?",
+                          (t, acct))
+        return stale
+
     def update_trail(self, ticker: str, *, stop_loss: float | None = None,
-                     peak_price: float | None = None) -> None:
+                     peak_price: float | None = None,
+                     account: str | None = None) -> None:
         """Ratchet a position's chandelier trail: raise ``stop_loss`` and
         ``peak_price`` but NEVER lower them (a trailing stop only moves up). Called
         each monitor cycle. ``MAX(existing, new)`` keeps the higher; when either
-        side is NULL the COALESCE chain falls back so nothing is clobbered."""
+        side is NULL the COALESCE chain falls back so nothing is clobbered.
+        Scoped to ``account`` — a run never touches another book's plan."""
         with self._cursor() as c:
             c.execute(
                 """UPDATE trade_plans SET
                    stop_loss  = COALESCE(MAX(stop_loss, ?), ?, stop_loss),
                    peak_price = COALESCE(MAX(peak_price, ?), ?, peak_price),
-                   updated_ts = ? WHERE ticker=?""",
-                (stop_loss, stop_loss, peak_price, peak_price, _now(), ticker),
+                   updated_ts = ? WHERE ticker=? AND account=?""",
+                (stop_loss, stop_loss, peak_price, peak_price, _now(), ticker,
+                 self._acct(account)),
             )
 
-    def get_trade_plans(self) -> dict[str, dict]:
-        """All stored exit plans, keyed by ticker."""
+    def get_trade_plans(self, account: str | None = None) -> dict[str, dict]:
+        """This account's stored exit plans, keyed by ticker."""
         with self._cursor() as c:
-            c.execute("SELECT * FROM trade_plans")
+            c.execute("SELECT * FROM trade_plans WHERE account=?", (self._acct(account),))
             return {row["ticker"]: dict(row) for row in c.fetchall()}
 
-    def delete_trade_plan(self, ticker: str) -> None:
+    def delete_trade_plan(self, ticker: str, account: str | None = None) -> None:
         with self._cursor() as c:
-            c.execute("DELETE FROM trade_plans WHERE ticker=?", (ticker,))
+            c.execute("DELETE FROM trade_plans WHERE ticker=? AND account=?",
+                      (ticker, self._acct(account)))
+
+    def recent_exits(self, account: str | None, days: int,
+                     *, exclude_triggers: tuple[str, ...] = ()) -> dict[str, dict]:
+        """Tickers this account SOLD (live, filled) in the last ``days`` calendar
+        days, keyed by ticker with the latest sell's ``ts`` and Monitor trigger.
+        Feeds the rebuy cooldown: NVDA was sold and rebought the next day three
+        times in two weeks, paying market-order spread for no net change."""
+        if days <= 0:
+            return {}
+        with self._cursor() as c:
+            c.execute(
+                """SELECT ticker, ts, detail FROM trades
+                   WHERE side='SELL' AND mode='live'
+                     AND status IN ('filled','submitted')
+                     AND (? IS NULL OR account = ?)
+                     AND substr(ts, 1, 10) >= date('now', ?)
+                   ORDER BY id""",
+                (account, account, f"-{int(days)} days"),
+            )
+            rows = c.fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            trig = None
+            try:
+                trig = (json.loads(r["detail"] or "{}") or {}).get("trigger")
+            except Exception:
+                pass
+            if trig and trig in exclude_triggers:
+                continue
+            out[r["ticker"]] = {"ts": r["ts"], "trigger": trig}
+        return out
+
+    # -- review agent: reviews / lessons / proposals ----------------------
+    def save_review(self, *, run_id: str, account: str | None, review_date: str,
+                    window_days: int, model: str | None, scorecard: Any,
+                    output: Any, markdown: str | None) -> int:
+        with self._cursor() as c:
+            c.execute(
+                """INSERT INTO reviews(ts, run_id, account, review_date, window_days,
+                   model, scorecard_json, output_json, markdown)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (_now(), run_id, account, review_date, int(window_days), model,
+                 _json(scorecard), _json(output), markdown),
+            )
+            return c.lastrowid
+
+    def _review_row(self, r: sqlite3.Row | None) -> dict | None:
+        if r is None:
+            return None
+        d = dict(r)
+        for k in ("scorecard_json", "output_json"):
+            try:
+                d[k[:-5]] = json.loads(d.pop(k) or "null")
+            except Exception:
+                d[k[:-5]] = None
+        return d
+
+    def latest_review(self, account: str | None = None) -> dict | None:
+        with self._cursor() as c:
+            if account is not None:
+                c.execute("SELECT * FROM reviews WHERE account=? ORDER BY id DESC LIMIT 1",
+                          (account,))
+            else:
+                c.execute("SELECT * FROM reviews ORDER BY id DESC LIMIT 1")
+            return self._review_row(c.fetchone())
+
+    def review_history(self, account: str | None = None, limit: int = 30) -> list[dict]:
+        """Recent reviews, newest first, WITHOUT the heavy json blobs."""
+        with self._cursor() as c:
+            if account is not None:
+                c.execute("""SELECT id, ts, run_id, account, review_date, window_days, model
+                             FROM reviews WHERE account=? ORDER BY id DESC LIMIT ?""",
+                          (account, int(limit)))
+            else:
+                c.execute("""SELECT id, ts, run_id, account, review_date, window_days, model
+                             FROM reviews ORDER BY id DESC LIMIT ?""", (int(limit),))
+            return [dict(r) for r in c.fetchall()]
+
+    def latest_playbook(self, account: str | None = None) -> str | None:
+        """The playbook text from the most recent review (rewritten in full each
+        review, so the latest one is the whole playbook)."""
+        rev = self.latest_review(account)
+        out = (rev or {}).get("output") or {}
+        pb = out.get("playbook") if isinstance(out, dict) else None
+        return str(pb).strip() if pb else None
+
+    def upsert_lessons(self, account: str | None, lessons: list[dict],
+                       source_run_id: str | None = None) -> dict:
+        """Merge the review agent's lessons into the store.
+
+        ``status: new`` inserts (or reinforces an existing id); ``reinforced``
+        bumps the counter and refreshes text/evidence/confidence; ``retired``
+        marks the lesson inactive. Returns counts. Ids are slugs the model
+        chooses; the ``(id, account)`` key is what makes a lesson reinforceable
+        across days instead of duplicated."""
+        acct = self._acct(account)
+        counts = {"new": 0, "reinforced": 0, "retired": 0, "skipped": 0}
+        now = _now()
+        with self._cursor() as c:
+            for l in lessons or []:
+                lid = str(l.get("id") or "").strip().lower().replace(" ", "-")[:80]
+                text = str(l.get("text") or "").strip()
+                if not lid or not text:
+                    continue
+                status = str(l.get("status") or "new").lower()
+                conf = int(max(0, min(100, float(l.get("confidence") or 0))))
+                applies = _json(l.get("applies_to") or ["decision"])
+                evidence = str(l.get("evidence") or "")[:1000]
+                row = c.execute("SELECT * FROM lessons WHERE id=? AND account=?",
+                                (lid, acct)).fetchone()
+                if status == "retired":
+                    if row and row["status"] != "retired":
+                        c.execute("UPDATE lessons SET status='retired', last_reinforced_ts=? "
+                                  "WHERE id=? AND account=?", (now, lid, acct))
+                        counts["retired"] += 1
+                    continue
+                if row and row["status"] == "retired":
+                    # Retired stays retired. A person (or an earlier review) took
+                    # this lesson out of force; the model re-emitting the same id
+                    # must not quietly put it back. It can write a NEW id if the
+                    # evidence really has changed.
+                    counts["skipped"] += 1
+                    continue
+                if row:
+                    c.execute(
+                        """UPDATE lessons SET text=?, evidence=?, confidence=?, applies_to=?,
+                           status='active', last_reinforced_ts=?,
+                           times_reinforced=times_reinforced+1, source_run_id=?
+                           WHERE id=? AND account=?""",
+                        (text[:600], evidence, conf, applies, now, source_run_id, lid, acct))
+                    counts["reinforced"] += 1
+                else:
+                    c.execute(
+                        """INSERT INTO lessons(id, account, text, evidence, confidence,
+                           applies_to, status, created_ts, last_reinforced_ts,
+                           times_reinforced, source_run_id)
+                           VALUES (?,?,?,?,?,?,'active',?,?,0,?)""",
+                        (lid, acct, text[:600], evidence, conf, applies, now, now,
+                         source_run_id))
+                    counts["new"] += 1
+        return counts
+
+    def active_lessons(self, account: str | None = None, limit: int = 8) -> list[dict]:
+        """Active lessons, most confident / most reinforced first."""
+        with self._cursor() as c:
+            c.execute(
+                """SELECT * FROM lessons WHERE account=? AND status='active'
+                   ORDER BY confidence DESC, times_reinforced DESC, last_reinforced_ts DESC
+                   LIMIT ?""", (self._acct(account), int(limit)))
+            rows = [dict(r) for r in c.fetchall()]
+        for r in rows:
+            try:
+                r["applies_to"] = json.loads(r.get("applies_to") or "[]")
+            except Exception:
+                r["applies_to"] = []
+        return rows
+
+    def all_lessons(self, account: str | None = None) -> list[dict]:
+        with self._cursor() as c:
+            c.execute("""SELECT * FROM lessons WHERE account=?
+                         ORDER BY status ASC, confidence DESC, last_reinforced_ts DESC""",
+                      (self._acct(account),))
+            rows = [dict(r) for r in c.fetchall()]
+        for r in rows:
+            try:
+                r["applies_to"] = json.loads(r.get("applies_to") or "[]")
+            except Exception:
+                r["applies_to"] = []
+        return rows
+
+    def retire_lesson(self, lesson_id: str, account: str | None = None) -> bool:
+        with self._cursor() as c:
+            c.execute("UPDATE lessons SET status='retired', last_reinforced_ts=? "
+                      "WHERE id=? AND account=?", (_now(), lesson_id, self._acct(account)))
+            return c.rowcount > 0
+
+    def save_proposal(self, *, run_id: str | None, account: str | None, key: str,
+                      current: float | None, proposed: float | None,
+                      applied: float | None, evidence: str | None, n_trades: int | None,
+                      status: str, reason: str | None = None) -> int:
+        with self._cursor() as c:
+            c.execute(
+                """INSERT INTO proposals(ts, run_id, account, key, current, proposed,
+                   applied, evidence, n_trades, status, reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (_now(), run_id, account, key, current, proposed, applied,
+                 (evidence or "")[:1000], n_trades, status, reason),
+            )
+            return c.lastrowid
+
+    def proposals(self, account: str | None = None, limit: int = 50) -> list[dict]:
+        with self._cursor() as c:
+            if account is not None:
+                c.execute("SELECT * FROM proposals WHERE account=? ORDER BY id DESC LIMIT ?",
+                          (account, int(limit)))
+            else:
+                c.execute("SELECT * FROM proposals ORDER BY id DESC LIMIT ?", (int(limit),))
+            return [dict(r) for r in c.fetchall()]
+
+    def get_proposal(self, proposal_id: int) -> dict | None:
+        with self._cursor() as c:
+            c.execute("SELECT * FROM proposals WHERE id=?", (int(proposal_id),))
+            r = c.fetchone()
+            return dict(r) if r else None
+
+    def mark_proposal(self, proposal_id: int, status: str, *,
+                      applied: float | None = None, reason: str | None = None) -> None:
+        with self._cursor() as c:
+            c.execute(
+                "UPDATE proposals SET status=?, applied=COALESCE(?, applied), "
+                "reason=COALESCE(?, reason) WHERE id=?",
+                (status, applied, reason, int(proposal_id)))
 
     def get_latest_research(self) -> dict[str, dict]:
         """Most recent research object per ticker (for the Monitor's thesis-break

@@ -16,6 +16,7 @@
 #               read-only, trades nothing
 #   preview   : print/notify planned orders, require explicit confirmation
 #   live      : place real orders through the Robinhood Trading MCP
+#   review    : post-close learning pass (see `review:` below); read-only
 # ----------------------------------------------------------------------------
 mode: recommend
 
@@ -75,6 +76,18 @@ strategy:
   default_stop_loss_pct: 0.12        # legacy/fallback stop (used only when ATR is unavailable)
   default_take_profit_pct: 0.20      # legacy/fallback target (monitor fallback only)
   max_holding_days: 60               # time-based exit if thesis hasn't played out
+  # The smallest position worth HOLDING is a per-account RISK setting
+  # (`accounts.<role>.risk.min_position_usd` / `min_position_pct`), not a
+  # strategy knob: it scales with the book. It bounds opens after the cash
+  # sweep, and a graded (half) exit whose remainder would fall under it closes
+  # the whole position instead.
+  #
+  # No rebuy of a name this account sold in the last N calendar days (0 = off).
+  # The same-cycle sell-and-rebuy is filtered separately; this covers the
+  # next-day version — NVDA was sold and rebought on 8/27→8/28, 8/31 and 9/03,
+  # paying a market-order round trip of spread each time for no change in view.
+  # A banked take-profit partial is not an exit of the idea and starts no cooldown.
+  rebuy_cooldown_days: 3
 
   # -- Methodology: momentum + quality factor model with volatility-based risk --
   # Master switch. "momentum_quality" (default) uses the factor scoring + ATR
@@ -202,6 +215,9 @@ models:
   monitor_agent: "claude-haiku-4-5-20251001"
   # Deep-research briefings (--mode explain): one read-heavy call per run.
   explain_agent: "claude-sonnet-4-6"
+  # Post-close review (--mode review): one call per trading day that turns the
+  # deterministic scorecard into lessons, a playbook and parameter proposals.
+  review_agent: "claude-sonnet-4-6"
 
 # ----------------------------------------------------------------------------
 # Research performance. The per-ticker numbers (technicals/fundamentals/news
@@ -236,7 +252,11 @@ data:
   use_alphavantage_series: false
   alphavantage:
     daily_request_budget: 25         # free-tier hard cap; provider self-throttles
-    min_seconds_between_calls: 13    # ~5 calls/min on free tier
+    # Alpha Vantage's stated free-tier pace is 1 request per second; 13s dated
+    # from the old 5-calls/minute tier. Calls are serialised across the research
+    # threads at this spacing, so 20 tickers cost ~40s on the first run of the
+    # day (the second run reads the 24h cache).
+    min_seconds_between_calls: 2
   use_yfinance_fallback: true        # yfinance serves quotes/series when needed (free)
   use_fred: true                     # macro context (rates, etc.) when configured
 
@@ -299,25 +319,40 @@ accounts:
     # (the base $50 min-trade would otherwise reject every order) while keeping
     # every percentage ceiling explicit.
     risk:
-      min_trade_usd: 1          # allow small/fractional orders (a floor, not a risk ceiling)
-      # SIZING IS THE DECISION AGENT'S CALL ON THIS ACCOUNT, ON PURPOSE.
-      # Every percentage ceiling below is set to "no cap" so the agent's own
-      # conviction sizing reaches the broker unmodified. A fixed fraction of
-      # equity (formerly 0.30 -> $30 on a $100 book) silently resized the agent's
-      # judgement down to a number with nothing to do with its conviction.
+      # Allow small/fractional orders (a floor, not a risk ceiling). $5 rather
+      # than $1: below a few dollars the market-order spread is the whole trade.
+      # Sells are exempt, so a dust stub can always be closed.
+      min_trade_usd: 5
+      # The smallest position worth HOLDING: the larger of $10 and 5% of equity.
+      # Distinct from min_trade_usd (the smallest ORDER). Enforced AFTER the cash
+      # sweep, so a buy the idle cash can lift over the floor is lifted, and only
+      # a buy the money genuinely cannot make meaningful is dropped — the cash
+      # then waits for a day it can matter. A partial exit whose remainder would
+      # fall under this floor is taken in full instead. Before this the book
+      # bought $1.76 of GOOGL, proposed $0.45 of AAPL, and trimmed HPE down to a
+      # $0.97 stub the broker refused.
+      min_position_usd: 10
+      min_position_pct: 0.05
+      # SIZING IS STILL THE DECISION AGENT'S CALL — within one ceiling.
+      # The per-trade percentage cap stays off so the agent's conviction sizing
+      # reaches the broker unmodified; every cap now TRIMS to the room left
+      # rather than rejecting, so a ceiling no longer throws a good idea away.
       #
-      # These were ALSO the workaround for a ceiling rejecting an oversized buy
-      # outright instead of trimming it. Every cap now trims to the room left and
-      # rejects only when there is none, so that second reason is gone — but the
-      # sizing argument above stands on its own, and these stay at "no cap".
+      # The per-name cap is back ON PURPOSE. It was "no cap" while caps still
+      # rejected outright; with trimming that reason is gone, and the ledger
+      # made the case for it: on 2026-09-04 the agent put $140 (54% of the book)
+      # into NVDA and that one leg lost -$13.13 — more than the account's entire
+      # realized loss across 13 closed trades. At 35% one name can never be
+      # more than about a third of the book, and a $260 account still fits
+      # three to five real positions.
       #
-      # What still bounds this account: `per_trade_max_usd`, available buying
-      # power, `max_equity_guard` above, and the kill switch. This is a
-      # deliberately unconstrained $100 sandbox — the individual account is
-      # untouched and keeps the strict base limits.
+      # What still bounds this account: `max_position_pct`, `per_trade_max_usd`,
+      # `min_position_*`, available buying power, `max_equity_guard` above, and
+      # the kill switch. The individual account is untouched and keeps the
+      # strict base limits.
       per_trade_max_pct: 1.0    # no per-trade percentage cap
       per_trade_max_usd: 500    # absolute ceiling; only binds once equity > $500
-      max_position_pct: 1.0     # no per-name cap — one name may take the whole book
+      max_position_pct: 0.35    # one name may take at most ~a third of the book
       min_cash_reserve_pct: 0.0 # no cash floor — the book may run fully invested
       # NO position-count cap: the decision agent decides how many names to hold,
       # based on how many candidates actually clear the buy threshold. A fixed
@@ -344,6 +379,41 @@ accounts:
 # ----------------------------------------------------------------------------
 recommend:
   hypothetical_cash: 10000.0
+
+# ----------------------------------------------------------------------------
+# Post-close REVIEW AGENT (--mode review). Runs once after the close, reads
+# the day's decisions and every closed trade in the ledger, and learns from
+# the outcomes. Read-only — it never places an order.
+#
+# Two halves, same split as the rest of the system:
+#   * A DETERMINISTIC scorecard (agents/review_agent.py): FIFO round trips with
+#     R-multiples, forward returns on every buy/hold/pass, behaviour metrics
+#     (concentration, churn, dust orders, take-profit re-fires) and hit rates by
+#     score bucket / setup / exit trigger. Pure Python, unit-tested.
+#   * ONE model call that turns the scorecard into lessons (fed into the
+#     decision and monitor prompts the next morning), a playbook, and parameter
+#     proposals.
+#
+# Proposals are applied ONLY inside the numeric bounds below, only for the
+# whitelisted `strategy:` keys, by at most one `step` per review, and only once
+# `min_closed_trades` closed round trips exist — a dozen trades cannot tell
+# signal from noise, so until then proposals are recorded and shown in the
+# dashboard for a human to apply. `risk:` limits are never touched by this
+# agent, whatever it proposes.
+# ----------------------------------------------------------------------------
+review:
+  window_days: 60             # trailing window the scorecard covers
+  forward_horizons: [1, 5, 10, 20]   # trading days for the forward-return scorecard
+  auto_apply: true            # apply in-bounds proposals automatically (else: record only)
+  min_closed_trades: 20       # closed round trips required before any auto-apply
+  max_lessons_in_prompt: 8    # active lessons handed to the decision/monitor agents
+  tunable:                    # strategy keys the agent may move, with hard bounds
+    strategy.stop_atr_mult:     {min: 1.5, max: 4.0, step: 0.5}
+    strategy.trail_atr_mult:    {min: 2.0, max: 5.0, step: 0.5}
+    strategy.target_r_multiple: {min: 1.5, max: 4.0, step: 0.5}
+    strategy.min_score_to_buy:  {min: 60,  max: 80,  step: 5}
+    strategy.min_score_to_add:  {min: 65,  max: 85,  step: 5}
+    strategy.max_holding_days:  {min: 20,  max: 90,  step: 10}
 
 # ----------------------------------------------------------------------------
 # Storage / audit

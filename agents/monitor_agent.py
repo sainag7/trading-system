@@ -11,7 +11,9 @@ and chooses one action: ``hold`` / ``exit_full`` / ``exit_partial``.
 
 Exit when ANY of these trigger (capital protection is the priority, so the hard
 rules are deterministic and can never be suppressed by the LLM):
-  * price <= ``stop_loss``            -> exit_full   (cut losses)
+  * price <= ``stop_loss``            -> exit_full   (cut losses); with graded
+                                         stops an intact uptrend scales out to
+                                         half ONCE, then exits in full next hit
   * ``max_hold_until`` date passed    -> exit_full   (swing time-stop)
   * thesis broken                     -> exit_full   (explain which signal)
       - composite score <= exit threshold
@@ -20,10 +22,14 @@ rules are deterministic and can never be suppressed by the LLM):
   * price >= ``take_profit``          -> exit_partial (lock gains, trail the rest)
   * otherwise                         -> hold
 
+A partial exit is only a partial if what it leaves is worth holding: when the
+remainder would be under ``strategy.min_position_usd`` the exit is taken in
+full, so the book never accumulates $2 stubs that pay spread on every touch.
+
 Exits are emitted as SELL order intents and go through the SAME deterministic
 risk guardrails and executor as entries. The LLM may add nuance (e.g. spotting
 a bad-earnings thesis break the rules missed) but the deterministic exits are
-always included.
+always included, and a rule's full exit is never downgraded to a partial.
 """
 from __future__ import annotations
 
@@ -62,6 +68,7 @@ def _deterministic_exits(positions: list[dict], strategy: dict) -> list[dict]:
     today = _today()
     default_exit_below = strategy.get("exit_below_score", 35)
     graded = bool(strategy.get("graded_stops", True))
+    default_floor = float(strategy.get("min_position_usd", 0) or 0)
 
     for p in positions:
         price = p.get("current_price") or p.get("price") or 0.0
@@ -78,16 +85,38 @@ def _deterministic_exits(positions: list[dict], strategy: dict) -> list[dict]:
         sentiment = p.get("sentiment_score")
         half = round(shares / 2, 6)
 
+        # A partial exit only makes sense if what it leaves behind is a position
+        # worth holding. Below the floor, the remainder is a stub that pays a
+        # market-order spread on every later touch and can never be sized into
+        # anything — HPE was halved on 9/4, 9/10 and 9/14 down to $1.76 before
+        # this rule existed. So: a partial whose remainder would be dust, or any
+        # exit on a position that already IS dust, closes the whole thing.
+        floor = float(p.get("min_position_usd", default_floor) or 0)
+        remainder_is_dust = (shares - half) * price < floor
+
         # 1) STOP (trailing) — protect capital first. Graded: a broken DOWNTREND
         # (below the 200-SMA, or a large loss) is a full exit; a still-intact
         # UPTREND merely pulling back to its trailing stop scales out to half and
         # keeps trailing the rest — the difference between dumping NBIS at -42%
-        # (correct) and knifing a healthy pullback (churn).
+        # (correct) and knifing a healthy pullback (churn). "Keep trailing the
+        # rest" means exactly one scale-out: the next stop hit closes the
+        # remainder, otherwise the position halves forever and never leaves.
         if stop and price <= stop + 1e-9:
             up_pnl = p.get("unrealized_pnl_pct")
             uptrend_intact = bool(p.get("above_sma200")) and (p.get("ret_3m") or 0) > 0
             modest_loss = up_pnl is None or up_pnl > -8
-            if graded and uptrend_intact and modest_loss:
+            pullback = graded and uptrend_intact and modest_loss
+            already_scaled = bool(p.get("scaled_out"))
+            if pullback and already_scaled:
+                exits.append(_exit(p, "exit_full", None, "stop_loss",
+                    f"price ${price:.2f} hit the trailing stop ${stop:.2f} again after "
+                    "the position was already scaled out once — close the remainder", 0.9))
+            elif pullback and remainder_is_dust:
+                exits.append(_exit(p, "exit_full", None, "stop_loss",
+                    f"price ${price:.2f} hit the trailing stop ${stop:.2f}; a half-trim "
+                    f"would leave under ${floor:,.0f} — close in full rather than "
+                    "leave a stub", 0.9))
+            elif pullback:
                 exits.append(_exit(p, "exit_partial", half, "stop_trail",
                     f"price ${price:.2f} hit the trailing stop ${stop:.2f} but the uptrend "
                     "is intact — trim to half and keep trailing the rest", 0.7))
@@ -121,24 +150,49 @@ def _deterministic_exits(positions: list[dict], strategy: dict) -> list[dict]:
                                f"broke below 50-day SMA (${sma50:.2f}) on elevated volume ({vol:.1f}x avg)", 0.75))
             continue
 
-        # 4) TAKE-PROFIT — lock gains, trail the remainder.
-        if take and price >= take - 1e-9:
-            exits.append(_exit(p, "exit_partial", half, "take_profit",
-                               f"price ${price:.2f} >= target ${take:.2f} — lock gains, trail the remainder", 0.6))
+        # 4) TAKE-PROFIT — lock gains ONCE, then trail the remainder. The flag is
+        # what makes "trail the remainder" true: without it this rule re-fired on
+        # every later run the price stayed above target and halved HPE four
+        # times (0.25 sh -> 0.0157 sh) before the broker refused the dust. And
+        # when the remainder itself would be dust, take the whole gain instead.
+        if take and price >= take - 1e-9 and not p.get("tp_taken"):
+            if remainder_is_dust:
+                exits.append(_exit(p, "exit_full", None, "take_profit",
+                                   f"price ${price:.2f} >= target ${take:.2f} — a half-trim "
+                                   f"would leave under ${floor:,.0f}; take the full gain", 0.6))
+            else:
+                exits.append(_exit(p, "exit_partial", half, "take_profit",
+                                   f"price ${price:.2f} >= target ${take:.2f} — lock gains, trail the remainder", 0.6))
             continue
     return exits
 
 
+def _drop_repeat_take_profit(exits: list[dict], positions: list[dict]) -> list[dict]:
+    """Remove model-emitted take-profit exits on positions whose take-profit
+    has already been banked. The deterministic rule already skips them; this
+    keeps the union from letting the model re-fire what the rule retired."""
+    taken = {p["ticker"] for p in positions if p.get("tp_taken")}
+    return [e for e in exits
+            if not (e.get("ticker") in taken
+                    and str(e.get("trigger", "")).lower() == "take_profit")]
+
+
 async def run_monitor(
     positions: list[dict], strategy: dict, model: str,
-    *, db=None, run_id: str | None = None,
+    *, db=None, run_id: str | None = None, lessons: dict | None = None,
 ) -> dict:
-    """Return exit/hold decisions for open positions."""
+    """Return exit/hold decisions for open positions.
+
+    ``lessons`` (optional) is the review agent's playbook for this account —
+    evidence-backed notes from its own track record — passed through to the
+    model as context, never as a rule that can override the hard exits."""
     if not positions:
         return {"exits": [], "holds": [], "notes": "no open positions"}
 
     deterministic = _deterministic_exits(positions, strategy)
     payload = {"positions": positions, "strategy": strategy}
+    if lessons:
+        payload["lessons"] = lessons
     parsed, raw = await generate_json(SYSTEM_PROMPT, payload, model)
 
     if not isinstance(parsed, dict) or "exits" not in parsed:
@@ -148,7 +202,7 @@ async def run_monitor(
         # Safety net: union the deterministic hard exits with the LLM's, so the
         # model can NEVER suppress a triggered stop/time/thesis exit. The LLM may
         # still add an exit the rules missed (e.g. a bad-earnings thesis break).
-        exits = list(parsed.get("exits") or [])
+        exits = _drop_repeat_take_profit(list(parsed.get("exits") or []), positions)
         seen = {e.get("ticker") for e in exits}
         for d in deterministic:
             if d["ticker"] not in seen:
@@ -162,10 +216,19 @@ async def run_monitor(
             e.setdefault("side", "SELL")
             e.setdefault("current_price", price_by.get(t))
             action = str(e.get("action", "")).lower()
+            det = det_by.get(t, {})
             if action not in ("exit_full", "exit_partial"):
                 # If a deterministic rule fired for this name, defer to it.
-                action = det_by.get(t, {}).get("action", "exit_full")
+                action = det.get("action", "exit_full")
                 e["action"] = action
+            elif action == "exit_partial" and det.get("action") == "exit_full":
+                # Downgrading a hard full exit to a half-trim is suppressing it.
+                # The rules decided the whole position goes; the model's partial
+                # does not get to keep a stub alive.
+                action = "exit_full"
+                e["action"] = action
+                e["trigger"] = det.get("trigger", e.get("trigger"))
+                e["reason"] = det.get("reason", e.get("reason"))
             # exit_full sells all held (shares=None); exit_partial defaults to half.
             if action == "exit_full":
                 e["shares"] = None

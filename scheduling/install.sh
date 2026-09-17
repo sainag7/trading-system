@@ -4,10 +4,12 @@
 #   ./scheduling/install.sh                 # advice job only (individual, read-only)
 #   ./scheduling/install.sh --enable-live   # + the AUTONOMOUS live-trading job (agentic)
 #
-# Two jobs, both fire on weekdays; the orchestrator's market-day gate no-ops on
+# Three jobs, all fire on weekdays; the orchestrator's market-day gate no-ops on
 # NYSE holidays:
 #   * individual advice  — 10:00 ET — recommend mode, READ-ONLY, never trades.
 #   * agentic autonomous — 10:05 ET — live mode on the $100 account (--enable-live).
+#   * agentic review     — 16:30 ET — post-close learning pass on the agentic
+#                                     book (--enable-live); read-only, never trades.
 #
 # Schedule times are expressed in MARKET TIME (US/Eastern) and converted to this
 # Mac's local timezone at install, because launchd fires on local time. Getting
@@ -26,11 +28,15 @@ RUN_SH="$REPO_DIR/scheduling/run.sh"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 LABEL_ADVICE="com.trading-system.individual-advice"
 LABEL_LIVE="com.trading-system.agentic-live"
+LABEL_REVIEW="com.trading-system.agentic-review"
 
 # Target times in MARKET TIME (ET). 10:00 ET is 30 minutes after the open, which
-# lets the opening auction settle before the daily cycle reads prices.
+# lets the opening auction settle before the daily cycle reads prices. 16:30 ET
+# is half an hour after the close, so the review sees the day's final prints
+# and its lessons are in place before the next morning's run.
 ET_HOUR_ADVICE=10; ET_MIN_ADVICE=0
 ET_HOUR_LIVE=10;   ET_MIN_LIVE=5
+ET_HOUR_REVIEW=16; ET_MIN_REVIEW=30
 
 # Convert an ET wall-clock time to this Mac's local wall clock. Echoes "H M".
 et_to_local () {
@@ -49,6 +55,7 @@ PY
 
 read -r HOUR_ADVICE MIN_ADVICE <<<"$(et_to_local $ET_HOUR_ADVICE $ET_MIN_ADVICE)"
 read -r HOUR_LIVE   MIN_LIVE   <<<"$(et_to_local $ET_HOUR_LIVE   $ET_MIN_LIVE)"
+read -r HOUR_REVIEW MIN_REVIEW <<<"$(et_to_local $ET_HOUR_REVIEW $ET_MIN_REVIEW)"
 
 LOCAL_TZ="$(date +%Z)"
 printf 'Market time %02d:%02d ET  ->  %02d:%02d %s (this Mac)\n' \
@@ -107,6 +114,12 @@ if [ "$ENABLE_LIVE" = "1" ]; then
       "$HOUR_LIVE" "$MIN_LIVE" "$LOCAL_TZ"
     write_plist "$LABEL_LIVE" "$HOUR_LIVE" "$MIN_LIVE" \
       --mode live --yes --account agentic
+    # The post-close review learns from the book that trades, so it ships with
+    # the live job. Read-only: it writes lessons and a report, never an order.
+    printf "Installing agentic review job (post-close, %02d:%02d %s, weekdays)...\n" \
+      "$HOUR_REVIEW" "$MIN_REVIEW" "$LOCAL_TZ"
+    write_plist "$LABEL_REVIEW" "$HOUR_REVIEW" "$MIN_REVIEW" \
+      --mode review --account agentic
   else
     echo "Confirmation not given — live job NOT installed."
   fi

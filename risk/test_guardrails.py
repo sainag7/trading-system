@@ -1060,3 +1060,125 @@ def test_a_trim_below_the_minimum_trade_is_still_rejected():
     )
     assert res.rejected
     assert any("minimum trade" in r for r in res.reasons)
+
+
+# ===========================================================================
+# min_position — the smallest position worth HOLDING (applied after the sweep)
+# ===========================================================================
+def _agentic_limits(**overrides) -> RiskLimits:
+    """The agentic-account shape after 2026-09-15: 35% per-name cap, the
+    minimum-position floor at max($10, 5% of equity), sweep on."""
+    base = dict(
+        max_positions=None, max_position_pct=0.35, max_sector_pct=1.0,
+        per_trade_max_usd=500.0, per_trade_max_pct=1.0, min_cash_reserve_pct=0.0,
+        min_trade_usd=1.0, min_position_usd=10.0, min_position_pct=0.05,
+        daily_max_trades=5, sweep_cash_to_buys=True,
+    )
+    base.update(overrides)
+    return default_limits(**base)
+
+
+def test_min_position_floor_is_the_larger_of_usd_and_pct():
+    from risk.guardrails import min_position_floor
+    lim = _agentic_limits()
+    assert min_position_floor(lim, 100.0) == pytest.approx(10.0)    # $10 > 5%
+    assert min_position_floor(lim, 264.20) == pytest.approx(13.21)  # 5% > $10
+    assert min_position_floor(default_limits(), 264.20) == 0.0      # off by default
+
+
+def test_dust_open_is_rejected_after_the_sweep_cannot_lift_it():
+    """The 2026-09-14 GOOGL buy: $1.76 was the entire deployable balance."""
+    acct = account(equity=256.61, cash=1.76, buying_power=1.76)
+    results = validate_batch(
+        [buy(ticker="GOOGL", usd=1.94, price=346.12, sector="Communication")],
+        acct, _agentic_limits(), sweep=True,
+    )
+    (res,) = results
+    assert res.rejected
+    assert any(c.name == "min_position" and not c.passed for c in res.checks)
+    assert any("minimum position" in r for r in res.reasons)
+    assert res.approved_usd == 0.0 and res.approved_shares == 0.0
+
+
+def test_sweep_lifts_a_small_proposal_over_the_floor_first():
+    """A $5 proposal with $100 idle is not dust — the sweep raises it, and only
+    THEN is the floor checked. Order of operations is the whole point."""
+    acct = account(equity=260.0, cash=100.0, buying_power=100.0)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=5.0, price=10.0, sector="A")],
+        acct, _agentic_limits(), sweep=True,
+    )
+    (res,) = results
+    assert res.approved
+    # Capped by the 35% per-name ceiling ($91), not by the $100 of cash.
+    assert res.approved_usd == pytest.approx(91.0, abs=0.05)
+    assert any(c.name == "min_position" and c.passed for c in res.checks)
+
+
+def test_floor_never_touches_sells_or_trims():
+    acct = account(equity=260.0, cash=0.0, buying_power=0.0,
+                   positions=pos(ticker="HPE", shares=0.0313, avg_cost=48.08,
+                                 market_value=1.76))
+    results = validate_batch([sell(ticker="HPE", shares=0.0313, price=62.09)],
+                             acct, _agentic_limits(), sweep=True)
+    assert results[0].approved
+
+
+def test_cash_freed_by_a_dropped_dust_buy_is_reswept_into_survivors():
+    """Two buys, $30 idle: the tiny one is dropped, its share flows to the other."""
+    acct = account(equity=260.0, cash=30.0, buying_power=30.0)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=25.0, price=10.0, sector="A"),
+         buy(ticker="BBB", usd=3.0, price=10.0, sector="B")],   # dust
+        acct, _agentic_limits(), sweep=True,
+    )
+    aaa, bbb = results
+    assert bbb.rejected and any(c.name == "min_position" for c in bbb.checks)
+    assert aaa.approved and aaa.approved_usd == pytest.approx(30.0, abs=0.05)
+
+
+def test_an_add_below_the_floor_passes_when_the_position_already_clears_it():
+    """The floor is on the RESULTING position, so a $2 add to a $40 holding is
+    fine — it is the $2 open of a brand-new name that is dust."""
+    acct = account(equity=260.0, cash=2.0, buying_power=2.0,
+                   positions=pos(ticker="NTAP", shares=0.2, avg_cost=194.0,
+                                 market_value=40.0))
+    results = validate_batch([buy(ticker="NTAP", usd=2.0, price=200.0, sector="Technology")],
+                             acct, _agentic_limits(), sweep=True)
+    assert results[0].approved
+
+
+# ===========================================================================
+# 35% per-name cap on the agentic book — the $140 NVDA add
+# ===========================================================================
+def test_the_54_percent_nvda_add_is_trimmed_to_the_cap():
+    """2026-09-04: $140 into NVDA on a $282 book. With the cap, the add is
+    trimmed to the room left under 35% — not rejected, not placed in full."""
+    acct = account(equity=281.99, cash=140.0, buying_power=140.0,
+                   positions=pos(ticker="NVDA", shares=0.1097, avg_cost=227.91,
+                                 market_value=25.0, sector="Technology"))
+    results = validate_batch(
+        [buy(ticker="NVDA", usd=140.0, price=232.15, sector="Technology")],
+        acct, _agentic_limits(), sweep=True,
+    )
+    (res,) = results
+    assert res.approved and res.resized
+    room = 0.35 * 281.99 - 25.0
+    assert res.approved_usd <= room + 1e-6
+    assert res.approved_usd == pytest.approx(room, abs=232.15 * 1e-6 + 0.01)
+    assert any("position cap" in r for r in res.reasons)
+
+
+def test_the_sweep_cannot_push_a_name_past_the_cap():
+    """Idle cash is only distributed up to each name's own headroom."""
+    acct = account(equity=260.0, cash=200.0, buying_power=200.0)
+    results = validate_batch(
+        [buy(ticker="AAA", usd=50.0, price=10.0, sector="A"),
+         buy(ticker="BBB", usd=50.0, price=10.0, sector="B")],
+        acct, _agentic_limits(), sweep=True,
+    )
+    for r in results:
+        assert r.approved
+        assert r.approved_usd <= 0.35 * 260.0 + 1e-6
+    # $200 idle, but two names can absorb at most 2 × $91; the rest stays cash.
+    assert sum(r.approved_usd for r in results) == pytest.approx(182.0, abs=0.1)

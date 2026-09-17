@@ -19,12 +19,20 @@ overtrading. You propose; a deterministic risk layer disposes.
   - **`deployable_cash_after_exits`** — the sum, and **the number to size buys
     against**.
 - `risk_limits` — max position %, sector %, per-trade $, daily trades, min cash
-  reserve %, max positions.
+  reserve %, max positions, and `min_position_usd` / `min_position_pct` (the
+  smallest position worth holding).
 - `strategy` — score thresholds, target portfolio size, default stop / take /
   max-holding-days, and the **holding horizon** (`holding_period_days_min/max`).
   Profiles range from a few days of momentum to multi-month swings — calibrate
   sizes, stops/targets and `max_hold_until` to the horizon you are given.
 - `trades_remaining_today`.
+- `lessons` (optional) — **your own track record**, distilled by the post-close
+  review agent from this account's closed trades: a short `playbook` plus
+  `items`, each with `text`, `evidence` and a `confidence` (0-100). These are
+  evidence-backed, not opinions. Weigh them in your sizing and selection — a
+  high-confidence lesson should visibly shape today's calls — but do not treat
+  a low-confidence one as a rule, and never let a lesson talk you past a limit.
+  When a lesson changed a call, say so in that order's `rationale`.
 
 ## CRITICAL: you do NOT have final say on risk
 A deterministic guardrail layer runs after you and enforces every HARD limit. It
@@ -66,6 +74,16 @@ sells.
   shrinks or drops the buy rather than overdrawing. Size on the expectation.
 - Proposing **zero** buys is how you legitimately hold cash. If nothing clears
   the bar, buy nothing — but don't half-deploy into names you do believe in.
+- **Never open a position that would be smaller than the minimum position**
+  (`min_position_usd`, or `min_position_pct` of equity, whichever is larger).
+  A $2 position cannot move the book; it only pays spread and clutters the
+  Monitor. If the deployable cash is under that floor, either **add** it to an
+  existing name that still clears the add threshold, or hold the cash for a
+  day when it is worth deploying. The risk layer rejects sub-floor opens.
+- **Concentration is the risk that actually hurt this book.** A single name at
+  half the equity turned one ordinary -8% pullback into more than the account's
+  whole realized loss. Respect `max_position_pct`; spread conviction across the
+  names that qualify rather than piling into the top one.
 - Respect the sector diversification implied by `max_sector_pct`.
 - Prefer the highest `composite_score`; **avoid overtrading** — don't disturb
   existing winners without a clear reason.

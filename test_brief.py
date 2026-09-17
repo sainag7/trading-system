@@ -228,3 +228,68 @@ def test_pnl_shown_when_cost_basis_is_real(tmp_path):
 def test_no_run_returns_none(tmp_path):
     db = _make_db(tmp_path, holdings=[], verdicts=[])
     assert render_brief(db, run_id="does-not-exist", out_dir=tmp_path / "r") is None
+
+
+# --------------------------------------------------------------------------- #
+# The two display bugs from the 2026-09 briefs
+# --------------------------------------------------------------------------- #
+def _with_pnl(db, drawdown_pct_stored: float):
+    c = sqlite3.connect(db)
+    c.execute("insert into pnl (run_id, equity, cash, buying_power, peak_equity, "
+              "drawdown_pct, account) values (?,?,?,?,?,?,?)",
+              (RUN, 258.74, 152.05, 152.05, 282.46, drawdown_pct_stored, "individual"))
+    c.commit(); c.close()
+
+
+def test_drawdown_is_stored_in_percent_and_rendered_once(tmp_path):
+    """pnl.drawdown_pct holds 8.397 for an 8.4% drawdown; the brief printed
+    "839.7%" and a 'buys are blocked' banner for two weeks."""
+    db = _make_db(tmp_path, holdings=[("NTAP", 0.23, 194.37, 45.4)],
+                  verdicts=[{"ticker": "NTAP", "action": "hold"}])
+    _with_pnl(db, 8.397)
+    text = render_brief(db, run_id=RUN, out_dir=tmp_path / "r").read_text()
+    assert "drawdown 8.4% from peak" in text
+    assert "839" not in text
+    assert "Drawdown halt territory" not in text
+
+
+def test_halt_banner_only_at_the_configured_limit(tmp_path):
+    db = _make_db(tmp_path, holdings=[("NTAP", 0.23, 194.37, 45.4)],
+                  verdicts=[{"ticker": "NTAP", "action": "hold"}])
+    _with_pnl(db, 16.0)   # 16% > the 15% halt
+    text = render_brief(db, run_id=RUN, out_dir=tmp_path / "r").read_text()
+    assert "Drawdown halt territory" in text and "16.0%" in text
+
+
+def test_partial_exit_promoted_to_full_renders_as_sell(tmp_path):
+    """The monitor said exit_partial, the guardrail row says exit_full (the
+    remainder would have been dust): the brief must say SELL, not TRIM."""
+    db = _make_db(tmp_path, holdings=[("HPE", 0.0313, 48.08, 1.75)],
+                  verdicts=[{"ticker": "HPE", "action": "hold"}],
+                  exits=[{"ticker": "HPE", "action": "exit_partial", "trigger": "take_profit",
+                          "reason": "at target", "shares": 0.0156}])
+    c = sqlite3.connect(db)
+    c.execute("insert into decisions (run_id, ticker, side, action, approved, approved_usd, "
+              "resized, reasons) values (?,?,?,?,?,?,?,?)",
+              (RUN, "HPE", "SELL", "exit_full", 1, 1.75, 0, '["approved"]'))
+    c.commit(); c.close()
+    text = render_brief(db, run_id=RUN, out_dir=tmp_path / "r").read_text()
+    assert "| **HPE** | SELL |" in text
+    assert "closing in full" in text
+
+
+def test_each_holding_is_listed_once_even_with_two_snapshots(tmp_path):
+    """A trading run snapshots positions before AND after executing. The brief
+    must show the last snapshot per name, not both."""
+    db = _make_db(tmp_path, holdings=[("SCCO", 0.30799, 211.05, 65.0)],
+                  verdicts=[{"ticker": "SCCO", "action": "hold"}])
+    c = sqlite3.connect(db)
+    # the post-run snapshot, with the real market value
+    c.execute("insert into positions (run_id,ticker,shares,avg_cost,market_value,sector,"
+              "account) values (?,?,?,?,?,?,?)",
+              (RUN, "SCCO", 0.30799, 211.05, 58.07, "Tech", "individual"))
+    c.commit(); c.close()
+    text = render_brief(db, run_id=RUN, out_dir=tmp_path / "r").read_text()
+    assert text.count("**SCCO**") == 1
+    assert "$58.07" in text and "$65.00" not in text
+    assert "positions (1)" in text

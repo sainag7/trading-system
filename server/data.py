@@ -479,3 +479,105 @@ def usage(days: int = 30) -> dict:
 def _today() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# --- review agent (Learning tab) ----------------------------------------------
+def _review_account(account: str | None) -> tuple[str | None, str]:
+    """Resolve a role or number to ``(number, label)``; defaults to agentic."""
+    cfg = load_config()
+    accts = cfg.accounts or {}
+    role = account or ("agentic" if "agentic" in accts else None)
+    if role in accts:
+        number = str((accts[role] or {}).get("number") or "") or None
+        return number, f"{role} ({number})" if number else role
+    return account, _account_label(cfg, account)
+
+
+def review(account: str | None = None) -> dict:
+    """Everything the Learning tab shows: the latest review, the lessons in
+    force, proposals and their fates, and the review history."""
+    d = db()
+    cfg = load_config()
+    number, label = _review_account(account)
+    latest = d.latest_review(number)
+    lessons = d.all_lessons(number)
+    for l in lessons:
+        l["created_display"] = F.fmt_ts(l.get("created_ts")) if l.get("created_ts") else ""
+        l["reinforced_display"] = (F.fmt_ts(l.get("last_reinforced_ts"))
+                                   if l.get("last_reinforced_ts") else "")
+    proposals = d.proposals(number)
+    for p in proposals:
+        p["ts_display"] = F.fmt_ts(p.get("ts")) if p.get("ts") else ""
+    history = d.review_history(number)
+    for h in history:
+        h["ts_display"] = F.fmt_ts(h.get("ts")) if h.get("ts") else ""
+    rv = cfg.review or {}
+    scorecard = (latest or {}).get("scorecard") or {}
+    return {
+        "account": number,
+        "account_label": label,
+        "latest": ({k: latest.get(k) for k in ("id", "ts", "run_id", "review_date",
+                                                "window_days", "model")}
+                   | {"ts_display": F.fmt_ts(latest["ts"]) if latest.get("ts") else "",
+                      "output": latest.get("output") or {}}) if latest else None,
+        "scorecard": scorecard,
+        "lessons": lessons,
+        "active_count": sum(1 for l in lessons if l.get("status") == "active"),
+        "proposals": proposals,
+        "history": history,
+        "settings": {
+            "auto_apply": bool(rv.get("auto_apply", False)),
+            "min_closed_trades": int(rv.get("min_closed_trades", 20) or 0),
+            "window_days": int(rv.get("window_days", 60) or 60),
+            "tunable": rv.get("tunable") or {},
+            "model": (cfg.models or {}).get("review_agent"),
+        },
+        "n_closed": int(scorecard.get("n_closed") or 0),
+        "has_data": latest is not None,
+    }
+
+
+def apply_proposal(proposal_id: int) -> dict:
+    """Apply a recorded proposal by hand (the dashboard's Apply button). The
+    bounds and whitelist still apply; only the trade-count gate is waived —
+    that gate exists for the AUTOMATIC path, a human clicking is the review."""
+    from agents.review_agent import bound_proposal
+    d = db()
+    p = d.get_proposal(proposal_id)
+    if not p:
+        return {"ok": False, "error": "no such proposal"}
+    if p.get("status") == "applied":
+        return {"ok": False, "error": "already applied"}
+    cfg = load_config()
+    tunable = (cfg.review or {}).get("tunable") or {}
+    key = str(p["key"])
+    section, _, leaf = key.partition(".")
+    current = (cfg.raw.get(section) or {}).get(leaf) if section else None
+    value, why = bound_proposal(key, float(p["proposed"]), current, tunable)
+    if why:
+        d.mark_proposal(proposal_id, "rejected", reason=why)
+        return {"ok": False, "error": why}
+    res = config_io.apply_overrides({section: {leaf: value}})
+    if not res.get("ok"):
+        d.mark_proposal(proposal_id, "rejected", reason=f"write failed: {res.get('error')}")
+        return {"ok": False, "error": res.get("error")}
+    d.mark_proposal(proposal_id, "applied", applied=value,
+                    reason=f"applied by hand from the dashboard ({current} -> {value})")
+    d.audit(f"dashboard-{_today()}", "INFO", "review_param_applied",
+            {"key": key, "current": current, "applied": value, "proposal_id": proposal_id,
+             "source": "dashboard"})
+    return {"ok": True, "key": key, "applied": value}
+
+
+def dismiss_proposal(proposal_id: int) -> dict:
+    d = db()
+    if not d.get_proposal(proposal_id):
+        return {"ok": False, "error": "no such proposal"}
+    d.mark_proposal(proposal_id, "dismissed", reason="dismissed from the dashboard")
+    return {"ok": True}
+
+
+def retire_lesson(lesson_id: str, account: str | None = None) -> dict:
+    number, _ = _review_account(account)
+    ok = db().retire_lesson(lesson_id, number)
+    return {"ok": ok} if ok else {"ok": False, "error": "no such lesson"}

@@ -28,7 +28,7 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 # config.yaml at load time so the commented base file is never rewritten.
 LOCAL_CONFIG_NAME = "config.local.yaml"
 
-VALID_MODES = ("recommend", "explain", "preview", "live")
+VALID_MODES = ("recommend", "explain", "preview", "live", "review")
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,15 @@ class RiskLimits:
     min_cash_reserve_pct: float = 0.10
     max_account_drawdown_halt_pct: float = 0.15
     min_trade_usd: float = 50.0
+    # Smallest position worth HOLDING, as the larger of a dollar floor and a
+    # fraction of equity. Distinct from min_trade_usd (the smallest order worth
+    # sending): a $1.76 buy is a valid order but a meaningless position — it
+    # can never move the book, yet it costs a spread, a monitor slot and a line
+    # in every brief. A buy that would leave the resulting position under this
+    # floor is rejected AFTER the cash sweep has had its chance to raise it, so
+    # the floor only bites when the money genuinely isn't there. 0 = off.
+    min_position_usd: float = 0.0
+    min_position_pct: float = 0.0
     allow_fractional_shares: bool = True
     # Scale approved buys up to consume the deployable cash (see
     # ``risk.guardrails.sweep_to_budget``). Off unless a config enables it.
@@ -81,6 +90,8 @@ class RiskLimits:
                 d.get("max_account_drawdown_halt_pct", 0.15)
             ),
             min_trade_usd=float(d.get("min_trade_usd", 50.0)),
+            min_position_usd=float(d.get("min_position_usd", 0.0) or 0.0),
+            min_position_pct=float(d.get("min_position_pct", 0.0) or 0.0),
             allow_fractional_shares=bool(d.get("allow_fractional_shares", True)),
             sweep_cash_to_buys=bool(d.get("sweep_cash_to_buys", False)),
             no_trade_list=no_trade,
@@ -215,6 +226,11 @@ class Config:
     @property
     def recommend(self) -> dict[str, Any]:
         return self.raw.get("recommend", {"hypothetical_cash": 10000.0})
+
+    @property
+    def review(self) -> dict[str, Any]:
+        """The post-close review agent's settings (``review:`` block)."""
+        return self.raw.get("review", {})
 
     @property
     def db_path(self) -> Path:

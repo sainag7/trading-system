@@ -13,6 +13,7 @@ import { Trade } from "./views/Trade";
 import { Automation } from "./views/Automation";
 import { Activity } from "./views/Activity";
 import { Usage } from "./views/Usage";
+import { Learning } from "./views/Learning";
 import { Settings } from "./views/Settings";
 
 const validView = (h: string): View => {
@@ -84,6 +85,7 @@ function ViewSwitch({ view, onNavigate }: { view: View; onNavigate: (v: View) =>
     case "trade": return <Trade />;
     case "automation": return <Automation />;
     case "activity": return <Activity />;
+    case "learning": return <Learning />;
     case "usage": return <Usage />;
     case "settings": return <Settings />;
   }
